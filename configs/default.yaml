@@ -1,5 +1,5 @@
 data:
-  mesh_file: "mesh/plate_shell_n510.msh"
+  mesh_file: "mesh/beam_401.msh"
   fem_degree: 1 # Degree of the finite element space 
 
 material:
@@ -20,7 +20,7 @@ training:
   learning_rate: 0.005
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"
-  skip_training: false
+  skip_training: true
   lbfgs_start_epoch: 0  # Epoch to switch to LBFGS
   lbfgs_learning_rate: 1.0  # Learning rate for LBFGS
 

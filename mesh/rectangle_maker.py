@@ -440,12 +440,12 @@ if __name__ == '__main__':
     import sys
     import os
 
-    mesh_type = "shell"
+    mesh_type = "beam"
 
     if mesh_type == "beam":
         gmsh.initialize(sys.argv)
         gmsh.model.add("beam")
-        create_beam(0, 0, 1, 1, 0, 0.1, 0.1)
+        create_beam(0, 0, 5, 1, 0, 1, 0.3)
         gmsh.finalize()
     elif mesh_type == "plate":
         n_simulations = 1

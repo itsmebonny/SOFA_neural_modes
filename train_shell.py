@@ -7,7 +7,6 @@ from torch.utils.tensorboard import SummaryWriter
 import math
 import glob
 import json
-import datetime
 import matplotlib.pyplot as plt
 import pyvista
 from dolfinx import mesh, fem, plot, io, default_scalar_type
@@ -447,13 +446,12 @@ class Routine:
     
 
     def compute_linear_modes(self):
-        
         """Compute linear modes using specialized MITC shell elements"""
         def eps_m_voigt(u):
             """Return membrane strain directly in Voigt notation"""
             e = ufl.sym(ufl.grad(u))
             return ufl.as_vector([e[0, 0], e[1, 1], 2*e[0, 1]])
-    
+
         def eps_b_voigt(r):
             """Return bending strain directly in Voigt notation"""
             e = ufl.sym(ufl.grad(r))
@@ -490,26 +488,11 @@ class Routine:
             return ufl.sym(ufl.grad(r))
         
         # 4. Improved transverse shear strain - key for MITC formulation
-        # Replace the eps_s function with this corrected version:
         def eps_s(u, r):
-            """Transverse shear strain for MITC shell elements
-            
-            This version correctly handles the shape difference between
-            rotation vectors and displacement gradients.
-            """
-            # Extract components for direct component-wise comparison
-            # In shell theory, shear strain measures the difference between:
-            # 1. The rotation vector
-            # 2. The displacement gradient in the corresponding direction
-            
-            # For thin shells, we need the difference between:
+            """Transverse shear strain for MITC shell elements"""
             grad_u = ufl.grad(u)
-            
-            # Calculate the shear strain vector (2 components)
             gamma_x = r[0] + grad_u[1, 0]  # rotation_x + ∂u_y/∂x
             gamma_y = r[1] + grad_u[0, 1]  # rotation_y + ∂u_x/∂y
-            
-            # Return as a vector
             return ufl.as_vector([gamma_x, gamma_y])
         
         # 5. Define material matrices in Voigt notation
@@ -535,18 +518,13 @@ class Routine:
         
         # Membrane energy
         a_m = ufl.inner(ufl.dot(Dm, eps_m_voigt(u_disp)), eps_m_voigt(v_disp)) * ufl.dx
-    
-        # Similarly fix the bending energy term
-        Db = D * ufl.as_matrix([
-            [1, nu, 0],
-            [nu, 1, 0],
-            [0, 0, (1-nu)/2]
-        ])
         
+        # Bending energy term
         a_b = ufl.inner(ufl.dot(Db, eps_b_voigt(u_rot)), eps_b_voigt(v_rot)) * ufl.dx
             
         # Shear energy (reduced for thin shells to avoid locking)
         a_s = G_corr * t * ufl.inner(eps_s(u_disp, u_rot), eps_s(v_disp, v_rot)) * ufl.dx        
+        
         # Drilling stiffness (stabilization term)
         a_d = drill_factor * ufl.inner(u_rot[0], v_rot[0]) * ufl.dx
         
@@ -554,27 +532,40 @@ class Routine:
         a = a_m + a_b + a_s + a_d
         
         # Mass matrix with proper rotational inertia
-        # For thin shells, rotational inertia is proportional to t³/12
         rot_inertia_factor = t**2/12.0  # Physically correct factor
-        
         M_form = self.rho * t * (ufl.inner(u_disp, v_disp) * ufl.dx + 
                             rot_inertia_factor * ufl.inner(u_rot, v_rot) * ufl.dx)
         
+        # Create Dirichlet boundary condition for x_min edge
+        # First locate the x_min nodes
+        x_coordinates = self.domain.geometry.x
+        x_min = np.min(x_coordinates[:, 0])
+        x_min_tol = 1e-10  # Tolerance for identifying boundary nodes
+        
+        # Create boundary condition function
+        def x_min_boundary(x):
+            return np.isclose(x[0], x_min, atol=x_min_tol)
+        
+        # Create boundary condition
+        boundary_dofs = fem.locate_dofs_geometrical(self.V, x_min_boundary)
+        fixed_value = np.zeros(4)  # Fix all 4 components (displacements and rotations)
+        bc = fem.dirichletbc(fixed_value, boundary_dofs, self.V)
         
         # Assemble matrices
         print("Assembling A matrix")
-        A = fem.petsc.assemble_matrix(fem.form(a))
+        A = fem.petsc.assemble_matrix(fem.form(a), bcs=[bc])
         A.assemble()
         print("Assembling M matrix")
         M = fem.petsc.assemble_matrix(fem.form(M_form))
         M.assemble()
         print("Matrices assembled")
         
-        
         # Setup eigensolver
         print("Setting up eigensolver with robust settings for Neo-Hookean materials...")
         eigensolver = SLEPc.EPS().create(self.domain.comm)
         eigensolver.setOperators(A, M)
+    
+    # The rest of your code remains the same...
 
         # Use KRYLOVSCHUR for better convergence with difficult materials
         eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
@@ -666,7 +657,7 @@ class Routine:
         # Calculate characteristic length (average of dimensions)
         char_length = max(x_range, y_range)
         # Safety factor to avoid extreme deformations
-        safety_factor = 0.5
+        safety_factor = 0.2
         
         return char_length * safety_factor
 

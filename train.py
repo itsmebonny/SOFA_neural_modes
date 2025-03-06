@@ -2128,8 +2128,24 @@ class Routine:
                 a_form = inner(sigma(u_tr), epsilon(u_test)) * dx
                 m_form = self.rho * inner(u_tr, u_test) * dx
 
+            x_coordinates = self.domain.geometry.x
+            x_min = np.min(x_coordinates[:, 0])
+            x_min_tol = 1e-10  # Tolerance for identifying boundary nodes
+            
+            # Create boundary condition function
+            def x_min_boundary(x):
+                return np.isclose(x[0], x_min, atol=x_min_tol)
+            
+            # Create a function for the fixed values
+            u_fixed = fem.Function(self.V)
+            u_fixed.x.array[:] = 0.0  # Set all values to zero
+            
+            # Create boundary condition using the function
+            boundary_dofs = fem.locate_dofs_geometrical(self.V, x_min_boundary)
+            bc = fem.dirichletbc(u_fixed, boundary_dofs)
+            
             print("Assembling A matrix")
-            A = assemble_matrix_petsc(form(a_form))
+            A = assemble_matrix_petsc(form(a_form), bcs=[bc])
             A.assemble()
             self.A = A
             
