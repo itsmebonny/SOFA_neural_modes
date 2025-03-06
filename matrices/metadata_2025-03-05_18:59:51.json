@@ -1,0 +1,8 @@
+{
+  "timestamp": "20250305_185951",
+  "mesh_file": "mesh/beam_615.msh",
+  "young_modulus": 5000,
+  "poisson_ratio": 0.25,
+  "density": 10,
+  "size": 1845
+}

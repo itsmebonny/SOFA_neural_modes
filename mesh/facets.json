@@ -1,0 +1,71 @@
+{
+    "beam": {
+        "volume": {
+            "tag": 1,
+            "dimension": 3,
+            "description": "Main volume of the beam"
+        },
+        "bottom": {
+            "tag": 2,
+            "dimension": 2,
+            "description": "Bottom surface (z=z_min)"
+        },
+        "top": {
+            "tag": 3,
+            "dimension": 2,
+            "description": "Top surface (z=z_max)"
+        },
+        "front": {
+            "tag": 4,
+            "dimension": 2,
+            "description": "Front surface (y=y_min)"
+        },
+        "back": {
+            "tag": 5,
+            "dimension": 2,
+            "description": "Back surface (y=y_max)"
+        },
+        "right": {
+            "tag": 6,
+            "dimension": 2,
+            "description": "Right surface (x=x_max)"
+        },
+        "left": {
+            "tag": 7,
+            "dimension": 2,
+            "description": "Left surface (x=x_min)"
+        }
+    },
+    "plate_with_hole": {
+        "volume": {
+            "tag": 1,
+            "dimension": 3,
+            "description": "Main volume of the plate"
+        },
+        "bottom": {
+            "tag": 2,
+            "dimension": 2,
+            "description": "Bottom surface (z=0)"
+        },
+        "top": {
+            "tag": 3,
+            "dimension": 2,
+            "description": "Top surface (z=thickness)"
+        },
+        "left": {
+            "tag": 4,
+            "dimension": 2,
+            "description": "Left boundary (x=0)"
+        },
+        "right": {
+            "tag": 5,
+            "dimension": 2,
+            "description": "Right boundary (x=length)"
+        },
+        "hole": {
+            "tag": 6,
+            "dimension": 2,
+            "description": "Circular hole surface"
+        }
+    }
+}

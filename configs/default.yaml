@@ -1,0 +1,32 @@
+data:
+  mesh_file: "mesh/plate_shell_n510.msh"
+  fem_degree: 1 # Degree of the finite element space 
+
+material:
+  youngs_modulus: 1000
+  poissons_ratio: 0.45
+  density: 1000
+
+physics:
+  gravity: 0.4
+
+model:
+  latent_dim: 5
+  hid_layers: 16
+  hid_dim: 64
+
+training:
+  num_epochs: 8
+  learning_rate: 0.005
+  checkpoint_dir: "checkpoints"
+  tensorboard_dir: "tensorboard"
+  skip_training: false
+  lbfgs_start_epoch: 0  # Epoch to switch to LBFGS
+  lbfgs_learning_rate: 1.0  # Learning rate for LBFGS
+
+
+  # In configs/default.yaml
+matrices:
+  use_sofa_matrices: false
+  matrices_path: "matrices"
+  timestamp: null  # Set to specific timestamp or null for latest
