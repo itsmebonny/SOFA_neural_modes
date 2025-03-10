@@ -2626,7 +2626,7 @@ class Routine:
         # Calculate characteristic length (average of dimensions)
         char_length = max(x_range, y_range, z_range)
         # Safety factor to avoid extreme deformations
-        safety_factor = 0.75
+        safety_factor = 1
         
       
         
@@ -2817,7 +2817,7 @@ class Routine:
                 # Compute the linear component and neural model prediction
                 linear_contribution = (self.linear_modes[:, mode_idx] * val)
                 y = self.model(z)
-                u_total = y + linear_contribution
+                u_total = y +  linear_contribution
                 u_total_np = u_total.detach().cpu().numpy()
                 
                 # Create a function in the original function space

@@ -11,7 +11,7 @@ physics:
   gravity: 0.4
 
 model:
-  latent_dim: 5
+  latent_dim: 6
   hid_layers: 16
   hid_dim: 64
 
@@ -20,7 +20,7 @@ training:
   learning_rate: 0.005
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"
-  skip_training: true
+  skip_training: TRUE
   lbfgs_start_epoch: 0  # Epoch to switch to LBFGS
   lbfgs_learning_rate: 1.0  # Learning rate for LBFGS
 
