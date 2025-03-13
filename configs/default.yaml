@@ -1,32 +1,47 @@
-data:
-  mesh_file: "mesh/beam_401.msh"
-  fem_degree: 1 # Degree of the finite element space 
+# Mesh configuration
+mesh:
+  filename: "mesh/beam_401.msh"
+  fem_degree: 1  # Degree of the finite element space
 
+# Material properties
 material:
-  youngs_modulus: 1000
-  poissons_ratio: 0.45
-  density: 1000
+  youngs_modulus: 10000
+  poissons_ratio: 0.40
+  density: 2
+  volume: 5.0
 
+# Physics simulation parameters
 physics:
-  gravity: 0.4
+  gravity: [0, -9.8, 0]  # Format as array for proper SOFA integration
+  dt: 0.01
+  rayleigh_stiffness: 0.1
+  rayleigh_mass: 0.1
+  solver_iterations: 1000
+  solver_tolerance: 1e-10
+  solver_threshold: 1e-10
 
+# Constraint parameters
+constraints:
+  fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]
+
+# Neural model configuration
 model:
-  latent_dim: 6
-  hid_layers: 16
+  latent_dim: 3
+  hid_layers: 5
   hid_dim: 64
 
+# Training parameters
 training:
-  num_epochs: 8
+  num_epochs: 5
   learning_rate: 0.005
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"
-  skip_training: TRUE
+  skip_training: false
   lbfgs_start_epoch: 0  # Epoch to switch to LBFGS
   lbfgs_learning_rate: 1.0  # Learning rate for LBFGS
 
-
-  # In configs/default.yaml
+# Matrix handling configuration
 matrices:
-  use_sofa_matrices: false
+  use_sofa_matrices: true
   matrices_path: "matrices"
   timestamp: null  # Set to specific timestamp or null for latest

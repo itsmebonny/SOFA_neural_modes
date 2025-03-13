@@ -11,6 +11,9 @@ from dolfinx.fem import form
 
 from ufl import TrialFunction, TestFunction, inner, dx, grad, sym, Identity, div
 
+import traceback
+from scipy import sparse
+
 
 
 
@@ -1281,78 +1284,7 @@ class PabloNeoHookeanEnergy(torch.nn.Module):
             0.5 * self.lmbda * (J * J - 1) * torch.transpose(inv_F, 0, 1)
         
         return P
-    
-    def visualize_deformation(self, u_tensor, scale_factor=1.0):
-        """
-        Helper method to visualize deformation with stress/strain coloring
-        
-        Args:
-            u_tensor: Displacement field [num_nodes * 3]
-            scale_factor: Scale factor for displacement visualization
-        
-        Returns:
-            pyvista plotter object
-        """
-        try:
-            import pyvista as pv
-            from dolfinx import plot
-        except ImportError:
-            print("Visualization requires pyvista and dolfinx.plot")
-            return None
-        
-        # Ensure tensor is numpy array
-        if torch.is_tensor(u_tensor):
-            u_np = u_tensor.detach().cpu().numpy()
-        else:
-            u_np = u_tensor
-        
-        # Compute strains and stresses
-        result = self.compute_strains_stresses(u_tensor)
-        stresses = result['stresses']
-        
-        # Compute von Mises stress for each element
-        von_mises = []
-        for e in range(stresses.shape[0]):
-            for q in range(stresses.shape[1]):
-                s = stresses[e, q]  # [s_xx, s_yy, s_zz, s_xy, s_yz, s_zx]
-                
-                # Reconstruct stress tensor
-                stress_tensor = torch.zeros((3, 3), device=stresses.device)
-                stress_tensor[0, 0] = s[0]  # s_xx
-                stress_tensor[1, 1] = s[1]  # s_yy
-                stress_tensor[2, 2] = s[2]  # s_zz
-                stress_tensor[0, 1] = stress_tensor[1, 0] = s[3]  # s_xy
-                stress_tensor[1, 2] = stress_tensor[2, 1] = s[4]  # s_yz
-                stress_tensor[0, 2] = stress_tensor[2, 0] = s[5]  # s_zx
-                
-                # Compute von Mises stress
-                deviatoric = stress_tensor - torch.trace(stress_tensor)/3 * torch.eye(3, device=stress_tensor.device)
-                vm = torch.sqrt(1.5 * torch.sum(deviatoric * deviatoric)).item()
-                von_mises.append(vm)
-        
-        # Create a mesh with deformation
-        topology, cell_types, x = plot.vtk_mesh(self.domain)
-        grid = pv.UnstructuredGrid(topology, cell_types, x)
-        
-        # Add displacement
-        u_reshaped = u_np.reshape((-1, 3))
-        grid.point_data["displacement"] = u_reshaped
-        grid["displacement_magnitude"] = np.linalg.norm(u_reshaped, axis=1)
-        
-        # Warp the mesh
-        warped = grid.copy()
-        warped.points += u_reshaped * scale_factor
-        
-        # Add stress data
-        if len(von_mises) == self.num_elements:
-            warped.cell_data["von_mises_stress"] = np.array(von_mises)
-            
-        # Create plotter
-        plotter = pv.Plotter()
-        plotter.add_mesh(warped, scalars="von_mises_stress", cmap="jet", show_edges=True)
-        plotter.add_scalar_bar("von Mises Stress")
-        
-        return plotter
+
 
 
 class StVenantKirchhoffEnergy(torch.nn.Module):
@@ -1828,78 +1760,7 @@ class StVenantKirchhoffEnergy(torch.nn.Module):
         S = self.lambda_ * trE * I + 2 * self.mu * E
         
         return S
-    
-    def visualize_deformation(self, u_tensor, scale_factor=1.0):
-        """
-        Helper method to visualize deformation with stress/strain coloring
-        
-        Args:
-            u_tensor: Displacement field [num_nodes * 3]
-            scale_factor: Scale factor for displacement visualization
-        
-        Returns:
-            pyvista plotter object
-        """
-        try:
-            import pyvista as pv
-            from dolfinx import plot
-        except ImportError:
-            print("Visualization requires pyvista and dolfinx.plot")
-            return None
-        
-        # Ensure tensor is numpy array
-        if torch.is_tensor(u_tensor):
-            u_np = u_tensor.detach().cpu().numpy()
-        else:
-            u_np = u_tensor
-        
-        # Compute strains and stresses
-        result = self.compute_strains_stresses(u_tensor)
-        stresses = result['stresses']
-        
-        # Compute von Mises stress for each element
-        von_mises = []
-        for e in range(stresses.shape[0]):
-            for q in range(stresses.shape[1]):
-                s = stresses[e, q]  # [s_xx, s_yy, s_zz, s_xy, s_yz, s_zx]
-                
-                # Reconstruct stress tensor
-                stress_tensor = torch.zeros((3, 3), device=stresses.device)
-                stress_tensor[0, 0] = s[0]  # s_xx
-                stress_tensor[1, 1] = s[1]  # s_yy
-                stress_tensor[2, 2] = s[2]  # s_zz
-                stress_tensor[0, 1] = stress_tensor[1, 0] = s[3]  # s_xy
-                stress_tensor[1, 2] = stress_tensor[2, 1] = s[4]  # s_yz
-                stress_tensor[0, 2] = stress_tensor[2, 0] = s[5]  # s_zx
-                
-                # Compute von Mises
-                deviatoric = stress_tensor - torch.trace(stress_tensor)/3 * torch.eye(3, device=stress_tensor.device)
-                vm = torch.sqrt(1.5 * torch.sum(deviatoric * deviatoric)).item()
-                von_mises.append(vm)
-        
-        # Create a mesh with deformation
-        topology, cell_types, x = plot.vtk_mesh(self.domain)
-        grid = pv.UnstructuredGrid(topology, cell_types, x)
-        
-        # Add displacement
-        u_reshaped = u_np.reshape((-1, 3))
-        grid.point_data["displacement"] = u_reshaped
-        grid["displacement_magnitude"] = np.linalg.norm(u_reshaped, axis=1)
-        
-        # Warp the mesh
-        warped = grid.copy()
-        warped.points += u_reshaped * scale_factor
-        
-        # Add stress data
-        if len(von_mises) == self.num_elements:
-            warped.cell_data["von_mises_stress"] = np.array(von_mises)
-            
-        # Create plotter
-        plotter = pv.Plotter()
-        plotter.add_mesh(warped, scalars="von_mises_stress", cmap="jet", show_edges=True)
-        plotter.add_scalar_bar("von Mises Stress")
-        
-        return plotter
+
 
 
 # Add this class near the top of your file, after imports
@@ -1959,20 +1820,20 @@ class Routine:
         print(f"Using device: {self.device}")
 
         # Load mesh from file
-        filename = cfg['data']['mesh_file']
+        # Modified to match default.yaml structure
+        filename = cfg.get('mesh', {}).get('filename', cfg.get('data', {}).get('mesh_file', 'mesh/beam_401.msh'))
         print(f"Loading mesh from file: {filename}")
         self.domain, self.cell_tags, self.facet_tags = gmshio.read_from_msh(filename, MPI.COMM_WORLD, gdim=3)
         print("Mesh loaded successfully.")
 
-        # Define function space
+        # Define function space - handle both key structures
         print("Defining function space...")
-        self.fem_degree = cfg['data'].get('fem_degree', 1)  # Default to 1 if not specified
+        self.fem_degree = cfg.get('mesh', {}).get('fem_degree', 
+                        cfg.get('data', {}).get('fem_degree', 1))  # Default to 1 if not specified
         print(f"Using FEM degree: {self.fem_degree}")
         self.V = fem.functionspace(self.domain, ("Lagrange", self.fem_degree, (self.domain.geometry.dim, )))
         print("Function space defined.")
         print(f"Function space dimension: {self.V.dofmap.index_map.size_global * 3}")
-
-     
 
         # Define material properties
         print("Defining material properties...")
@@ -1986,57 +1847,81 @@ class Routine:
         self.lambda_ = self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu))  # First Lamé parameter
         print(f"mu = {self.mu}, lambda = {self.lambda_}")
 
-        # Gravity and scaling
-        self.g = cfg['physics']['gravity']
+        # Gravity and scaling - Handle both formats
+        gravity = cfg['physics']['gravity']
+        if isinstance(gravity, list):
+            self.g = gravity  # It's already a list
+        else:
+            self.g = [0, float(gravity), 0]  # Convert scalar to 3D vector
         print(f"g = {self.g}")
 
- 
-
-        # self.energy_calculator = TorchElasticEnergy(
-        # self.domain, 
-        # self.fem_degree, 
-        # self.E, 
-        # self.nu,
-        # precompute_matrices=True,
-        # device=self.device
-        # ).to(self.device)
-
-        self.energy_calculator = PabloNeoHookeanEnergy(
-        self.domain, 
-        self.fem_degree, 
-        self.E, 
-        self.nu,
-        precompute_matrices=True,
-        device=self.device
-    ).to(self.device)
+        # Choose energy calculator based on config or default to PabloNeoHookeanEnergy
+        energy_type = cfg.get('physics', {}).get('energy_type', 'neohookean')
+        if energy_type == 'elastic':
+            self.energy_calculator = TorchElasticEnergy(
+                self.domain, self.fem_degree, self.E, self.nu,
+                precompute_matrices=True, device=self.device
+            ).to(self.device)
+        elif energy_type == 'stvk':
+            self.energy_calculator = StVenantKirchhoffEnergy(
+                self.domain, self.fem_degree, self.E, self.nu,
+                precompute_matrices=True, device=self.device
+            ).to(self.device)
+        else:  # Default to neo-Hookean
+            self.energy_calculator = PabloNeoHookeanEnergy(
+                self.domain, self.fem_degree, self.E, self.nu,
+                precompute_matrices=True, device=self.device
+            ).to(self.device)
 
         self.scale = self.compute_safe_scaling_factor()
         print(f"Scaling factor: {self.scale}")
 
-
-        # In __init__ method of Routine class:
+        # Load neural network
         print("Loading neural network...")
         self.latent_dim = cfg['model']['latent_dim']
         self.num_modes = self.latent_dim  # Make them the same
-        output_dim = self.V.dofmap.index_map.size_global * self.domain.geometry.dim  # Full DOF space size
-        hid_layers = cfg['model'].get('hid_layers', 2)  # Default to 2 hidden layers if not specified
-        hid_dim = cfg['model'].get('hid_dim', 64)      # Default to 64 neurons per layer if not specified
+        output_dim = self.V.dofmap.index_map.size_global * self.domain.geometry.dim
+        hid_layers = cfg['model'].get('hid_layers', 2)
+        hid_dim = cfg['model'].get('hid_dim', 64)
         print(f"Output dimension: {output_dim}")
         print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
         self.model = Net(self.latent_dim, output_dim, hid_layers, hid_dim).to(device).double()
 
-
-
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
-        # Load linear eigenmodes (replace with your actual loading)
+        # Load linear modes
         print("Loading linear eigenmodes...")
-        self.linear_modes = self.compute_linear_modes()
+        
+        # Check matrices configuration
+        use_sofa = cfg.get('matrices', {}).get('use_sofa_matrices', False)
+        matrices_path = cfg.get('matrices', {}).get('matrices_path', 'matrices')
+        timestamp = cfg.get('matrices', {}).get('timestamp', None)
+        
+        if use_sofa:
+            print(f"Using SOFA matrices from path: {matrices_path}")
+            self.linear_modes = self.compute_linear_modes()
+        else:
+            print("Using FEniCS-generated matrices")
+            self.linear_modes = self.compute_linear_modes()
+        
         self.linear_modes = torch.tensor(self.linear_modes, device=self.device).double()
         print("Linear eigenmodes loaded.")
 
-        # Tensorboard
-        self.writer = SummaryWriter(os.path.join(cfg['training']['checkpoint_dir'], cfg['training']['tensorboard_dir']))
+        # Tensorboard setup
+        checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
+        tensorboard_dir = cfg.get('training', {}).get('tensorboard_dir', 'tensorboard')
+        self.writer = SummaryWriter(os.path.join(checkpoint_dir, tensorboard_dir))
+
+        # Setup optimizers
+        lr = cfg.get('training', {}).get('learning_rate', 0.005)
+        self.optimizer_adam = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer_lbfgs = torch.optim.LBFGS(
+            self.model.parameters(), 
+            lr=cfg.get('training', {}).get('lbfgs_learning_rate', 1.0),
+            max_iter=20,
+            line_search_fn="strong_wolfe"
+        )
+        self.scheduler = LBFGSScheduler(self.optimizer_lbfgs)
 
         self.reset()
         print("Routine initialized.")
@@ -2059,15 +1944,17 @@ class Routine:
         print("Computing linear modes...")
         
         # Try to load SOFA matrices first
-        M, A = self.load_sofa_matrices()
+        M, A, eigenvalues, eigenvectors = self.load_sofa_matrices()
         
-        if M is not None and A is not None:
-            print("Using SOFA-generated matrices for linear modes computation")
+        if M is not None and A is not None and eigenvalues is not None and eigenvectors is not None:
+            print("Using SOFA-generated matrices and modes for linear modes computation")
             # Store matrices in self for later use
             self.M = M
             self.A = A
+            self.eigenvalues = eigenvalues
+            linear_modes = eigenvectors
         else:
-            print("No pre-computed matrices found, assembling matrices from FEniCS...")
+            print("No pre-computed matrices or modes found, assembling matrices from FEniCS...")
             # Get domain extents
             x_coords = self.domain.geometry.x
             x_min = x_coords[:, 0].min()
@@ -2154,93 +2041,166 @@ class Routine:
             M.assemble()
             self.M = M
         
-        print("Matrices assembled")
+            print("Matrices assembled")
 
-        # Setup eigensolver
-        # In the compute_linear_modes method, replace the eigensolver setup with:
+            # Setup eigensolver
+            # In the compute_linear_modes method, replace the eigensolver setup with:
 
-        # Setup eigensolver with more robust settings for thin geometries
-        print("Setting up eigensolver with robust settings for Neo-Hookean materials...")
-        eigensolver = SLEPc.EPS().create(self.domain.comm)
-        eigensolver.setOperators(A, M)
-
-        # Use KRYLOVSCHUR for better convergence with difficult materials
-        eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-        eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-        eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_MAGNITUDE)
-
-        # More robust shift strategy for thin domains
-        st = eigensolver.getST()
-        st.setType(SLEPc.ST.Type.SINVERT)
-        st.setShift(1e-5)  # Very small shift for thin geometries
-
-        # Much larger subspace for difficult problems
-        eigensolver.setDimensions(nev=self.latent_dim, ncv=min(self.latent_dim*10, A.getSize()[0]))
-
-        # Increase iteration count and lower tolerance
-        eigensolver.setTolerances(tol=1e-3, max_it=5000)
-
-        # Add convergence monitoring
-        eigensolver.setConvergenceTest(SLEPc.EPS.Conv.REL)
-
-        # Extract eigenvectors
-        print("Extracting eigenvectors...")
-        nconv = eigensolver.getConverged()
-        print(f"Number of converged eigenvalues: {nconv}")
-
-        # Implement fallback if no convergence
-        # In the compute_linear_modes method, update the fallback section:
-
-        if nconv == 0:
-            print("WARNING: No eigenvalues converged. Trying fallback method...")
-            # Try again with shift-and-invert and more aggressive parameters
-            eigensolver.reset()
-            
-            # Need to set operators again after reset
+            # Setup eigensolver with more robust settings for thin geometries
+            print("Setting up eigensolver with robust settings for Neo-Hookean materials...")
+            eigensolver = SLEPc.EPS().create(self.domain.comm)
             eigensolver.setOperators(A, M)
-            
-            # Use more robust settings for challenging problems
+
+            # Use KRYLOVSCHUR for better convergence with difficult materials
+            eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
             eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-            eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)  # Use KRYLOVSCHUR instead of LAPACK
-            
-            # Critical: When using SINVERT, must set target and use TARGET_MAGNITUDE
-            eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-            eigensolver.setTarget(0.0)  # Target eigenvalues near zero
-            
-            # Get a new ST object after reset
+            eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_MAGNITUDE)
+
+            # More robust shift strategy for thin domains
             st = eigensolver.getST()
             st.setType(SLEPc.ST.Type.SINVERT)
-            st.setShift(1.0)
-            
-            eigensolver.setDimensions(nev=self.latent_dim, ncv=min(self.latent_dim*5, A.getSize()[0]))
-            eigensolver.setTolerances(tol=5e-3, max_it=10000)
-            
-            # Add this line to make the solver more robust
-            eigensolver.setConvergenceTest(SLEPc.EPS.Conv.ABS)
-            
-            eigensolver.solve()
+            st.setShift(1e-5)  # Very small shift for thin geometries
+
+            # Much larger subspace for difficult problems
+            eigensolver.setDimensions(nev=self.latent_dim, ncv=min(self.latent_dim*10, A.getSize()[0]))
+
+            # Increase iteration count and lower tolerance
+            eigensolver.setTolerances(tol=1e-3, max_it=5000)
+
+            # Add convergence monitoring
+            eigensolver.setConvergenceTest(SLEPc.EPS.Conv.REL)
+
+            # Extract eigenvectors and eigenvalues
+            print("Extracting eigenvectors and eigenvalues...")
             nconv = eigensolver.getConverged()
-            print(f"Fallback method found {nconv} converged eigenvalues")
-
-        # Add safety check before extracting modes
-        modes = []
-        for i in range(min(self.latent_dim, nconv)):
-            vr = A.createVecRight()
-            eigensolver.getEigenvector(i, vr)
-            modes.append(vr.array[:])
-
-        # Handle case when no modes are found
-        if len(modes) == 0:
-            print("ERROR: No modes could be computed. Using random initialization.")
-            # Create random modes as fallback - better than crashing
-            random_modes = np.random.rand(A.getSize()[0], self.latent_dim)
-            # Make them mass-orthogonal
-            return random_modes
-
-        linear_modes = np.column_stack(modes)
+            print(f"Number of converged eigenvalues: {nconv}")
+            
+            # Initialize arrays to store both
+            modes = []
+            eigenvalues = []
+            
+            for i in range(min(self.latent_dim, nconv)):
+                # Extract eigenvector
+                vr = A.createVecRight()
+                eigensolver.getEigenvector(i, vr)
+                modes.append(vr.array[:])
+                
+                # Extract eigenvalue (store for scaling)
+                eigenvalue = eigensolver.getEigenvalue(i)
+                eigenvalues.append(eigenvalue.real)  # Keep only real part
+            
+            # Store eigenvalues for later use in scaling
+            self.eigenvalues = np.array(eigenvalues)
+            print(f"Eigenvalues: {self.eigenvalues}")
+            
+            # Handle case when no modes are found
+            if len(modes) == 0:
+                print("ERROR: No modes could be computed. Using random initialization.")
+                # Create random modes and eigenvalues as fallback
+                random_modes = np.random.rand(A.getSize()[0], self.latent_dim)
+                self.eigenvalues = np.ones(self.latent_dim)  # Default eigenvalues
+                return random_modes
+            
+            linear_modes = np.column_stack(modes)
         print(f"Shape of linear_modes: {linear_modes.shape}")
         return linear_modes
+        
+    def load_sofa_matrices(self, matrices_path=None, timestamp=None):
+        """
+        Load mass and stiffness matrices from SOFA export with robust format handling
+        """
+        print("Attempting to load SOFA matrices and modes...")
+        if matrices_path is None:
+            matrices_path = 'matrices'
+        
+        if not os.path.exists(matrices_path):
+            print(f"Matrices path does not exist: {matrices_path}")
+            return None, None, None, None
+        
+        # Find the latest matrices if timestamp not specified
+        if timestamp is None:
+            mass_files = glob.glob(f'{matrices_path}/mass_matrix_*.npy')
+            if not mass_files:
+                print(f"No mass matrices found in {matrices_path}")
+                return None, None, None, None
+            
+            # Get latest file by timestamp
+            latest_file = max(mass_files, key=os.path.getctime)
+            timestamp = latest_file.split('mass_matrix_')[1].split('.npy')[0]
+            print(f"Using latest matrices with timestamp {timestamp}")
+        
+        # Load matrices
+        mass_matrix_file = f'{matrices_path}/mass_matrix_{timestamp}.npy'
+        stiff_matrix_file = f'{matrices_path}/stiffness_matrix_{timestamp}.npy'
+        eigenvalues_file =  f'{matrices_path}/{timestamp}/eigenvalues_{timestamp}.npy'
+        eigenvectors_file = f'{matrices_path}/{timestamp}/eigenvectors_{timestamp}.npy'
+        
+        if not os.path.exists(mass_matrix_file) or not os.path.exists(stiff_matrix_file) or not os.path.exists(eigenvalues_file) or not os.path.exists(eigenvectors_file):
+            print(f"Matrix or mode files for timestamp {timestamp} not found")
+            return None, None, None, None
+        
+        print(f"Loading matrices from {mass_matrix_file} and {stiff_matrix_file}")
+        print(f"Loading modes from {eigenvalues_file} and {eigenvectors_file}")
+        
+        try:
+            mass_matrix = np.load(mass_matrix_file, allow_pickle=True)
+            stiff_matrix = np.load(stiff_matrix_file, allow_pickle=True)
+            eigenvalues = np.load(eigenvalues_file, allow_pickle=True)
+            eigenvectors = np.load(eigenvectors_file, allow_pickle=True)
+            
+            # Handle 0-dimensional array (scalar container)
+            if isinstance(mass_matrix, np.ndarray) and mass_matrix.ndim == 0:
+                print("Detected 0-dimensional array. Extracting contained object...")
+                mass_matrix = mass_matrix.item()
+                stiff_matrix = stiff_matrix.item()
+            
+            # Ensure matrices are in CSR format for efficiency
+            if not isinstance(mass_matrix, sparse.csr_matrix):
+                if hasattr(mass_matrix, 'tocsr'):
+                    mass_matrix = mass_matrix.tocsr()
+                    stiff_matrix = stiff_matrix.tocsr()
+                    print("Converted matrices to CSR format")
+                else:
+                    raise TypeError(f"Cannot convert {type(mass_matrix)} to CSR format")
+            
+            print(f"Matrix shapes: Mass {mass_matrix.shape}, Stiffness {stiff_matrix.shape}")
+            print(f"Mode shapes: Eigenvalues {eigenvalues.shape}, Eigenvectors {eigenvectors.shape}")
+            
+            return mass_matrix, stiff_matrix, eigenvalues, eigenvectors
+        
+        except Exception as e:
+            print(f"Error loading SOFA matrices: {e}")
+            traceback.print_exc()
+            return None, None, None, None
 
+    def compute_eigenvalue_based_scale(self, mode_index=None):
+        """
+        Compute scaling factor for latent variables based on eigenvalues
+        
+        Args:
+            mode_index: Specific mode index to get scaling for, or None for all modes
+            
+        Returns:
+            Scaling factor or array of scaling factors
+        """
+        if not hasattr(self, 'eigenvalues') or self.eigenvalues is None:
+            print("Warning: No eigenvalues available, using default scaling")
+            return self.compute_safe_scaling_factor()
+        
+        # Check if we have all eigenvalues needed
+        if mode_index is not None and mode_index >= len(self.eigenvalues):
+            print(f"Warning: Requested mode {mode_index} exceeds available eigenvalues")
+            return self.compute_safe_scaling_factor()
+        
+        # For neo-Hookean materials, scale is inversely proportional to sqrt(eigenvalue)
+        # This is because energy is proportional to eigenvalue * displacement^2
+        if mode_index is not None:
+            # Return scale for specific mode
+            return 1.0 / np.sqrt(max(1e-8, self.eigenvalues[mode_index]))
+        else:
+            # Return array of scales for all modes
+            return 1.0 / np.sqrt(np.maximum(1e-8, self.eigenvalues))
+        
 
     def train(self, num_epochs=1000):
         """
@@ -2310,8 +2270,9 @@ class Routine:
         while iteration < num_epochs:  # Set a maximum iteration count or use other stopping criteria
             # Generate random latent vectors and linear displacements
             with torch.no_grad():
-                # Generate latent vectors with scaling (-0.625 to 0.625)
-                z = torch.rand(batch_size, L, device=self.device) * self.scale * 2 - self.scale
+                # Generate latent vectors 
+                deformation_scale = 2#min(0.1 * iteration / num_epochs, 1.0) * self.scale
+                z = torch.rand(batch_size, L, device=self.device) * deformation_scale * 2 - deformation_scale
                 z[rest_idx, :] = 0  # Set rest shape latent to zero
                 
                 # Compute linear displacements
@@ -2366,23 +2327,29 @@ class Routine:
                 # Compute origin constraint for rest shape
                 origin = torch.sum(y[rest_idx]**2)
                 
-                # Total loss with much stronger weights for constraints
-                loss = energy + 0.5 * ortho + 0.1 * origin
-                
-                # Store values for use outside closure
-                energy_val = energy.item()
+                vol_loss, vol_stats = self.compute_volume_preservation_loss(
+                    batch_u=u_total_batch, 
+                    weight=0.5  # Fixed weight, adjust based on your needs
+                )
+
+                # Update the total loss
+                loss = energy + 0.5 * ortho + 0.1 * origin + vol_loss
+
+                # Print stats periodically
+                if iteration % print_every == 0:
+                    print(f"[Iter {iteration}] Energy: {energy.item():.6f}, Ortho: {ortho.item():.6f}, "
+                          f"Origin: {origin.item():.6f}, Vol: {vol_loss.item():.6f}")
+                    print(f"J stats: min={vol_stats['min_J']:.3f}, mean={vol_stats['mean_J']:.3f}, "
+                        f"max={vol_stats['max_J']:.3f}, inverted={vol_stats['inverted_elements']}")
+                    print(f"Max displacements: linear={max_linear:.6f}, total={max_total:.6f}, correction={max_correction:.6f}")            
+                loss.backward()
+
+                                # Add these lines before return loss
+                energy_val = energy.item()  # Convert tensor to Python scalar
                 ortho_val = ortho.item()
                 origin_val = origin.item()
                 loss_val = loss.item()
-                
-                # Print components periodically
-                if iteration % print_every == 0:
-                    print(f"[Iter {iteration}] Energy: {energy_val:.6f}, "
-                        f"Ortho: {ortho_val:.6e}, Origin: {origin_val:.6e}")
-                    print(f"===> Max linear: {max_linear:.4f}, "
-                        f"Max correction: {max_correction:.4f}, Max total: {max_total:.4f}")
-                
-                loss.backward()
+
                 return loss
             
             # Perform optimization step
@@ -2400,6 +2367,9 @@ class Routine:
             # Save checkpoint if this is the best model so far
             if loss_val < best_loss:
                 best_loss = loss_val
+                # Estimate checkpoint size
+                checkpoint_size = self.estimate_checkpoint_size()
+                print(f"Estimated checkpoint size: {checkpoint_size:.2f} MB")
                 checkpoint = {
                     'epoch': iteration,
                     'model_state_dict': self.model.state_dict(),
@@ -2408,7 +2378,9 @@ class Routine:
                 }
                 patience = 0
                 torch.save(checkpoint, os.path.join('checkpoints', 'best.pt'))
+                print(f"============ BEST MODEL UPDATED ============")
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
+                print(f"============================================")
             
             # Save periodic checkpoint
             if iteration % checkpoint_every == 0:
@@ -2433,6 +2405,151 @@ class Routine:
         
         print(f"Training complete. Best loss: {best_loss:.8e}")
         return best_loss
+    
+
+    def compute_volume_preservation_loss(self, batch_F=None, batch_u=None, weight=1.0):
+        """
+        Compute volume preservation loss based on deformation gradient determinants.
+        Works with either precomputed deformation gradients or displacement fields.
+        """
+        device = self.device
+        dtype = torch.float64
+        
+        # Get batch size and element count
+        if batch_F is not None:
+            # Use provided deformation gradients
+            batch_size = batch_F.shape[0]
+            num_elements = batch_F.shape[1]
+        else:
+            # Compute deformation gradients from displacements
+            if not isinstance(batch_u, torch.Tensor):
+                batch_u = torch.tensor(batch_u, device=device, dtype=dtype)
+                
+            batch_size = batch_u.shape[0]
+            # Get num_elements from energy_calculator instead of self
+            num_elements = self.energy_calculator.num_elements
+            
+            # Process in smaller batches for memory efficiency
+            batch_F = []
+            batch_chunk_size = min(16, batch_size)  # Process 16 samples at once max
+            
+            for i in range(0, batch_size, batch_chunk_size):
+                end_idx = min(i + batch_chunk_size, batch_size)
+                sub_batch_F = self._compute_batch_deformation_gradients(batch_u[i:end_idx])
+                batch_F.append(sub_batch_F)
+                
+            batch_F = torch.cat(batch_F, dim=0)
+
+
+        # Compute determinant of F for each element in the batch
+        # Shape: [batch_size, num_elements]
+        J = torch.linalg.det(batch_F)
+        
+        # Compute volume preservation loss: (J - 1)²
+        # This penalizes both compression (J < 1) and expansion (J > 1)
+        vol_loss = (J - 1.0)**2
+        
+        # Add a barrier term to prevent negative J (inverted elements)
+        # Use a smooth barrier that rises quickly as J approaches 0
+        barrier = torch.where(
+            J > 0,
+            torch.zeros_like(J),
+            10000.0 * torch.abs(J)  # Strong penalty for negative J
+        )
+        
+        # Combine both terms and take mean over all elements and batch samples
+        combined_loss = weight * (torch.mean(vol_loss) + torch.mean(barrier))
+        
+        # Return statistics for monitoring
+        with torch.no_grad():
+            stats = {
+                'mean_J': torch.mean(J).item(),
+                'min_J': torch.min(J).item(),
+                'max_J': torch.max(J).item(),
+                'inverted_elements': torch.sum(J <= 0).item(),
+                'vol_loss': combined_loss.item()
+            }
+            
+        return combined_loss, stats
+
+    def _compute_batch_deformation_gradients(self, batch_u):
+        """
+        Efficiently compute deformation gradients for a batch of displacement fields
+        """
+        batch_size = batch_u.shape[0]
+        
+        # Use energy calculator attributes for ALL mesh data
+        energy_calc = self.energy_calculator
+        num_elements = energy_calc.num_elements
+        num_nodes = energy_calc.num_nodes
+        elements = energy_calc.elements
+        coordinates = energy_calc.coordinates
+        
+        # Reshape displacement vectors to [batch_size, num_nodes, 3]
+        u = batch_u.reshape(batch_size, num_nodes, 3)
+        
+        # Initialize storage for deformation gradients
+        batch_F = torch.zeros((batch_size, num_elements, 3, 3), 
+                            device=self.device, dtype=torch.float64)
+        
+        # Process elements in batches to control memory usage
+        batch_elements = 1000  # Process 1000 elements at once
+        
+        for e_start in range(0, num_elements, batch_elements):
+            e_end = min(e_start + batch_elements, num_elements)
+            e_slice = slice(e_start, e_end)
+            
+            # Use energy_calc.elements instead of self.elements
+            elem_nodes = elements[e_slice].long()  # [num_batch_elements, nodes_per_element]
+            
+            # Use energy_calc.coordinates instead of self.coordinates
+            elem_coords = coordinates[elem_nodes]  # [num_batch_elements, nodes_per_elem, 3]
+            
+            # Get displacements for these elements for the entire batch
+            elem_disps = u[:, elem_nodes]  # [batch_size, num_batch_elements, nodes_per_elem, 3]
+            
+            # Process each quadrature point
+            q_idx = 0  # Use first quadrature point for volume calculation
+            
+            # Use attributes from energy calculator instead of self
+            if hasattr(energy_calc, 'dN_dx_all'):
+                # Use precomputed derivatives if available
+                elem_dN_dx = energy_calc.dN_dx_all[e_slice, q_idx]
+                
+                # Compute F for all elements in this batch at once using broadcasting
+                F = torch.eye(3, device=self.device, dtype=torch.float64)
+                F = F.reshape(1, 1, 3, 3).expand(batch_size, e_end-e_start, 3, 3).clone()
+                
+                # Add displacement gradient: F += u_i ⊗ ∇N_i
+                for n in range(elem_nodes.shape[1]):
+                    node_disps = elem_disps[:, :, n, :]
+                    node_dN_dx = elem_dN_dx[:, n, :]
+                    F += torch.einsum('bei,ej->beij', node_disps, node_dN_dx)
+                    
+                # Store results for this batch of elements
+                batch_F[:, e_slice] = F
+            else:
+                # Compute on-the-fly if derivatives not precomputed
+                for b in range(batch_size):
+                    for e_idx, e in enumerate(range(e_start, e_end)):
+                        e_coords = elem_coords[e_idx]
+                        e_disps = elem_disps[b, e_idx]
+                        
+                        # Use energy_calc.quadrature_points
+                        qp = energy_calc.quadrature_points[q_idx]
+                        
+                        # Use energy_calc._compute_derivatives instead of self._compute_derivatives
+                        dN_dx, _ = energy_calc._compute_derivatives(e_coords, qp)
+                        
+                        # Compute F for this element
+                        F = torch.eye(3, device=self.device, dtype=torch.float64)
+                        for n in range(elem_nodes.shape[1]):
+                            F += torch.outer(e_disps[n], dN_dx[n])
+                        
+                        # Store result
+                        batch_F[b, e] = F
+        
+        return batch_F
     
     def visualize_stresses(self, latent_vector):
         """Visualize von Mises stresses for a given latent vector"""
@@ -2475,92 +2592,7 @@ class Routine:
   
 
 
-    def evaluate_generalization(self, num_samples=10):
-        """Evaluate the generalization capability by sampling different latent variables"""
-        print("\nEvaluating generalization capability...")
-        
-        # Compute ground truth solutions for different force configurations
-        force_configs = []
-        ground_truths = []
-        
-        for i in range(num_samples):
-            # Create different force configurations by scaling the base forces
-            scale = 0.5 + i * 0.5  # 0.5, 1.0, 1.5, ...
-            force_magnitudes = [scale * 1e4, -scale * 4e4, -scale * 3e4, scale * 1e4]
-            
-            # Solve for this configuration
-            print(f"\nSolving for force configuration {i+1}/{num_samples} (scale={scale})...")
-            gt = self.solve_static(force_magnitudes=force_magnitudes)
-            
-            force_configs.append(force_magnitudes)
-            ground_truths.append(gt)
-        
-        # Evaluate neural network predictions for each configuration
-        rmse_values = []
-        energy_diff_values = []
-        
-        for i, (force_config, gt) in enumerate(zip(force_configs, ground_truths)):
-            print(f"\nEvaluating configuration {i+1}/{num_samples}...")
-            
-            # Find latent vector that best approximates this configuration
-            z = self.compute_modal_coordinates(
-                gt.x.array,
-                self.linear_modes,
-                self.M
-            )
-
-            # Convert z to a PyTorch tensor
-            z = torch.tensor(z, device=self.device, dtype=torch.float64)
-            
-            # Compute prediction using this latent vector
-            l = (self.linear_modes @ z.unsqueeze(1)).squeeze(1)
-            y = self.model(z)
-            u_total = l + y
-            u_total_np = u_total.detach().cpu().numpy()
-            
-            # Calculate metrics
-            gt_array = gt.x.array
-            error = u_total_np - gt_array
-            rmse = np.sqrt(np.mean(error**2))
-            
-            u_fenics = fem.Function(self.V)
-            u_fenics.x.array[:] = u_total_np
-            
-            gt_energy = fem.assemble_scalar(fem.form(0.5 * ufl.inner(self.sigma(gt), 
-                                                                self.epsilon(gt)) * ufl.dx))
-            pred_energy = fem.assemble_scalar(fem.form(0.5 * ufl.inner(self.sigma(u_fenics), 
-                                                                self.epsilon(u_fenics)) * ufl.dx))
-            energy_diff = abs(gt_energy - pred_energy) / gt_energy
-            
-            rmse_values.append(rmse)
-            energy_diff_values.append(energy_diff)
-            
-            print(f"Configuration {i+1}: RMSE = {rmse:.6e}, Rel. Energy Diff = {energy_diff:.6f}")
-        
-        # Print summary statistics
-        print("\n----- Generalization Evaluation Summary -----")
-        print(f"Average RMSE: {np.mean(rmse_values):.6e}")
-        print(f"Average Relative Energy Difference: {np.mean(energy_diff_values):.6f}")
-        print("-------------------------------------------\n")
-        
-        # Create visualization of results
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1)
-        plt.plot(range(1, num_samples+1), rmse_values, 'o-')
-        plt.title('RMSE for Different Configurations')
-        plt.xlabel('Configuration')
-        plt.ylabel('RMSE')
-        plt.grid(True)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(range(1, num_samples+1), energy_diff_values, 'o-')
-        plt.title('Relative Energy Difference')
-        plt.xlabel('Configuration')
-        plt.ylabel('Relative Energy Diff')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.show()
+    
 
     def optimize_latent_for_target(self, target, num_iters=100):
         """Find the latent vector that best approximates a target solution"""
@@ -2657,25 +2689,29 @@ class Routine:
             torch.save(checkpoint, os.path.join(checkpoint_dir, 'best.pt'))
 
     def load_checkpoint(self, checkpoint_path):
-        """Load model from checkpoint
-        
-        Args:
-            checkpoint_path: Path to checkpoint file
-        """
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint {checkpoint_path} not found")
-            return
-        
-        print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # Load model parameters
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        
-        print(f"Loaded model from epoch {checkpoint['epoch']+1} with loss {checkpoint['loss']:.6e}")
-        return checkpoint['loss']
+        """Load model from checkpoint with robust error handling"""
+        try:
+            print(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model parameters
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Try to load optimizer states if they exist
+            if 'optimizer_adam_state_dict' in checkpoint:
+                self.optimizer_adam.load_state_dict(checkpoint['optimizer_adam_state_dict'])
+            
+            if 'optimizer_lbfgs_state_dict' in checkpoint:
+                self.optimizer_lbfgs.load_state_dict(checkpoint['optimizer_lbfgs_state_dict'])
+            
+            print(f"Successfully loaded model from epoch {checkpoint.get('epoch', 0)+1}")
+            return checkpoint.get('loss', float('inf'))
+        except (RuntimeError, EOFError, AttributeError) as e:
+            print(f"Error loading checkpoint: {str(e)}")
+            print("Checkpoint file appears to be corrupted. Starting with fresh model.")
+            return float('inf')
     
-    def visualize_latent_dimensions(self, dim1=0, dim2=1, num_points=3, fixed_value=0.0):
+    def visualize_latent_dimensions(self, dim1=0, dim2=1, num_points=3):
         """Visualize neural modes across a grid of two latent dimensions"""
         print(f"Visualizing neural modes for dimensions {dim1} and {dim2}...")
         
@@ -2688,7 +2724,7 @@ class Routine:
         u_linear = fem.Function(V_viz)
         
         # Compute scale for latent vectors
-        scale = self.compute_safe_scaling_factor()  * 1.5  # Larger scale for better visualization
+        scale = self.compute_safe_scaling_factor()    # Larger scale for better visualization
         values = np.linspace(-scale, scale, num_points)
         
         # Create plotter with subplots
@@ -2699,7 +2735,7 @@ class Routine:
             row_idx = num_points - 1 - i  # Reverse order for proper cartesian layout
             for j, val2 in enumerate(values):
                 # Create latent vector with fixed values except for the two selected dims
-                z = torch.full((self.latent_dim,), fixed_value, device=self.device)
+                z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
                 z[dim1] = val1
                 z[dim2] = val2
                 
@@ -2769,6 +2805,27 @@ class Routine:
         plotter.show()
         print("Visualization complete.")
 
+    def estimate_checkpoint_size(self):
+        """Estimate the size of the checkpoint file that will be saved"""
+        # Get model size
+        model_size = 0
+        for param in self.model.parameters():
+            model_size += param.nelement() * param.element_size()
+        
+        # Get optimizer size
+        optimizer_size = 0
+        for buffer in self.optimizer_adam.state.values():
+            if isinstance(buffer, torch.Tensor):
+                optimizer_size += buffer.nelement() * buffer.element_size()
+        
+        # Total size in bytes
+        total_size = model_size + optimizer_size
+        
+        # Convert to human-readable format
+        size_in_mb = total_size / (1024 * 1024)
+        
+        return size_in_mb
+
     def visualize_latent_space(self, num_samples=5, scale=None, modes_to_show=None):
         """
         Visualize the effect of each latent dimension independently.
@@ -2809,7 +2866,7 @@ class Routine:
         for i, mode_idx in enumerate(modes_to_show):
             for j, val in enumerate(values):
                 # Create a zero latent vector
-                z = torch.rand(self.latent_dim, device=self.device, dtype=torch.float64)
+                z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
                 
                 # Set only the current mode to the current value
                 z[mode_idx] = val
@@ -2845,7 +2902,7 @@ class Routine:
                 
                 # Add mesh to plot
                 plotter.add_mesh(warped, scalars="displacement_magnitude", 
-                            cmap="coolwarm", show_edges=True)
+                            cmap="viridis", show_edges=True)
                 
                 # Add value label
                 plotter.add_text(f"z{mode_idx}={val:.2f}", position="lower_right", 
@@ -2879,94 +2936,7 @@ class Routine:
         return plotter  # Return plotter in case further customization is needed
     
     
-    def load_sofa_matrices(self, matrices_path=None, timestamp=None):
-        """
-        Load mass and stiffness matrices from SOFA export
-        
-        Args:
-            matrices_path: Path to the matrices directory
-            timestamp: Specific timestamp to load, or None for latest
-        
-        Returns:
-            Tuple of (mass_matrix, stiffness_matrix) as PETSc matrices, or (None, None) if loading fails
-        """
-        print("Attempting to load SOFA matrices...")
-        if matrices_path is None:
-            matrices_path = 'matrices'
-        
-        if not os.path.exists(matrices_path):
-            print(f"Error: Matrices directory {matrices_path} not found")
-            return None, None
-        
-        # Find the latest matrices if timestamp not specified
-        if timestamp is None:
-            mass_files = glob.glob(f'{matrices_path}/mass_matrix_*.npy')
-            if not mass_files:
-                print(f"Error: No mass matrices found in {matrices_path}")
-                return None, None
-                
-            # Get latest file by timestamp
-            latest_file = max(mass_files, key=os.path.getctime)
-            timestamp = latest_file.split('mass_matrix_')[1].split('.npy')[0]
-            print(f"Using latest matrices with timestamp {timestamp}")
-        
-        # Load matrices
-        mass_matrix_file = f'{matrices_path}/mass_matrix_{timestamp}.npy'
-        stiff_matrix_file = f'{matrices_path}/stiffness_matrix_{timestamp}.npy'
-        
-        if not os.path.exists(mass_matrix_file) or not os.path.exists(stiff_matrix_file):
-            print(f"Error: Matrix files for timestamp {timestamp} not found")
-            return None, None
-            
-        print(f"Loading SOFA matrices from {mass_matrix_file} and {stiff_matrix_file}")
-        
-        # Add allow_pickle=True to handle object arrays from SOFA
-        mass_matrix_obj = np.load(mass_matrix_file, allow_pickle=True)
-        stiff_matrix_obj = np.load(stiff_matrix_file, allow_pickle=True)
-        
-        # Convert from SOFA format to dense numpy arrays
-        # This handles both cases: if they're already arrays or if they're special objects
-        try:
-            if hasattr(mass_matrix_obj, 'todense'):  # If it's a sparse matrix
-                mass_matrix_np = mass_matrix_obj.todense()
-            else:  # If it's already a numpy array or can be converted
-                mass_matrix_np = np.array(mass_matrix_obj, dtype=np.float64)
-                
-            if hasattr(stiff_matrix_obj, 'todense'):
-                stiff_matrix_np = stiff_matrix_obj.todense()
-            else:
-                stiff_matrix_np = np.array(stiff_matrix_obj, dtype=np.float64)
-                
-            print(f"Matrix shapes: Mass {mass_matrix_np.shape}, Stiffness {stiff_matrix_np.shape}")
-        except Exception as e:
-            print(f"Error converting matrices to numpy arrays: {e}")
-            return None, None
-        
-        # Load metadata if available
-        metadata_file = f'{matrices_path}/metadata_{timestamp}.json'
-        if os.path.exists(metadata_file):
-            with open(metadata_file, 'r') as f:
-                metadata = json.load(f)
-                print(f"Loaded matrices metadata: {metadata}")
-        
-        # Convert numpy arrays to PETSc matrices
-        try:
-            A = PETSc.Mat().createDense([stiff_matrix_np.shape[0], stiff_matrix_np.shape[1]])
-            A.setUp()
-            A.setValues(range(stiff_matrix_np.shape[0]), range(stiff_matrix_np.shape[1]), stiff_matrix_np)
-            A.assemble()
-            
-            M = PETSc.Mat().createDense([mass_matrix_np.shape[0], mass_matrix_np.shape[1]])
-            M.setUp()
-            M.setValues(range(mass_matrix_np.shape[0]), range(mass_matrix_np.shape[1]), mass_matrix_np)
-            M.assemble()
-            
-            print(f"Successfully converted matrices to PETSc format: M({M.size}), A({A.size})")
-            return M, A
-        except Exception as e:
-            print(f"Error converting to PETSc format: {e}")
-            return None, None
-
+    
 
 def main():
     print("Starting main function...")
@@ -3025,10 +2995,10 @@ def main():
     # Add latent space visualization
     print("\nVisualizing latent space dimensions...")
     # Visualize first two dimensions by default
-    engine.visualize_latent_dimensions(dim1=0, dim2=2, num_points=5, fixed_value=3.0)
+    engine.visualize_latent_dimensions(dim1=1, dim2=2, num_points=5)
     
     # Optionally visualize other dimension pair
-    engine.visualize_latent_dimensions(dim1=2, dim2=1, num_points=5, fixed_value=-3.0)
+    engine.visualize_latent_dimensions(dim1=0, dim2=2, num_points=5)
 
     print("\nVisualizing latent space modes...")
     # Visualize all latent dimensions

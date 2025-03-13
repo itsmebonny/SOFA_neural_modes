@@ -1,0 +1,8 @@
+{
+  "timestamp": "20250313_233912",
+  "mesh_file": "mesh/beam_401.msh",
+  "young_modulus": 10000,
+  "poisson_ratio": 0.4,
+  "density": 10.0,
+  "size": 1203
+}

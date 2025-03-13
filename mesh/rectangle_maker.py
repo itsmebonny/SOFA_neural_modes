@@ -445,7 +445,7 @@ if __name__ == '__main__':
     if mesh_type == "beam":
         gmsh.initialize(sys.argv)
         gmsh.model.add("beam")
-        create_beam(0, 0, 5, 1, 0, 1, 0.3)
+        create_beam(0, 0, 5, 1, 0, 1, 0.15)
         gmsh.finalize()
     elif mesh_type == "plate":
         n_simulations = 1
