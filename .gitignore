@@ -2,3 +2,9 @@
 /checkpoints
 /modal_results
 /matrices
+/validation_results
+
+cantilever_modal.py
+neohookean.cpp
+pablo_loss.py
+twisting_beam.py

@@ -1,14 +1,14 @@
 # Mesh configuration
 mesh:
-  filename: "mesh/beam_401.msh"
+  filename: "mesh/beam_732.msh"
   fem_degree: 1  # Degree of the finite element space
 
 # Material properties
 material:
   youngs_modulus: 10000
-  poissons_ratio: 0.40
-  density: 2
-  volume: 5.0
+  poissons_ratio: 0.45
+  density: 1000
+  volume: 10.0
 
 # Physics simulation parameters
 physics:
@@ -26,9 +26,10 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 3
-  hid_layers: 5
-  hid_dim: 64
+  latent_dim: 5
+  hid_layers: 32
+  hid_dim: 32
+  use_modal_derivatives: true
 
 # Training parameters
 training:
