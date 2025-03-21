@@ -3,6 +3,7 @@
 /modal_results
 /matrices
 /validation_results
+/force_inference
 
 cantilever_modal.py
 neohookean.cpp

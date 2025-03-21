@@ -16,7 +16,7 @@ from dolfinx.nls.petsc import NewtonSolver
 
 
 class DynamicValidator:
-    """
+    """ 
     Validates neural plates model with dynamic simulation using finite difference method.
     Can apply stretching force to test beam deformation.
     """

@@ -26,33 +26,53 @@ PETSc and SLEPc
 PyVista for visualization
 GMSH (optional, for mesh generation)
 
-### Setup
-
-Clone the repository:
-
-Install Python dependencies:
-
-Ensure SOFA is properly installed and environment variables are set
-
 ## Workflow Usage
 
 1. Generate Matrices in SOFA
-Run the SOFA simulation to generate matrices:
 
-This creates mass and stiffness matrices in the matrices directory with a timestamp.
+```bash
+python scripts/generate_matrices.py --mesh models/beam.vtk --material neo-hookean
+```
 
-2. Train Neural Model
-Train a neural network model using the generated matrices:
+This creates mass and stiffness matrices in the `matrices` directory with a timestamp.
+
+1. Train Neural Model
+
+```bash
+python scripts/train_model.py --config configs/default.yaml
+```
 
 To use a specific matrix set, provide the timestamp:
 
-3. Validate Model
+```bash
+python scripts/train_model.py --config configs/default.yaml --matrix-timestamp 20230915_123456
+```
 
-Validate the trained model with dynamic simulations:
+1. Validate Model
+
+```bash
+python scripts/validate_model.py --model-path models/trained_model.pth --test-case beam_bending
+```
 
 ## Configuration
 
-Modify default.yaml to set:
+Modify `configs/default.yaml` to set:
+
+```yaml
+material:
+  young_modulus: 1000.0
+  poisson_ratio: 0.3
+
+network:
+  hidden_layers: [64, 32, 16]
+  activation: "relu"
+  latent_dim: 8
+
+training:
+  epochs: 1000
+  learning_rate: 0.001
+  batch_size: 32
+```
 
 Material properties (Young's modulus, Poisson ratio)
 Neural network architecture (hidden layers, dimensions)
@@ -68,4 +88,3 @@ Linear modes
 Neural mode predictions
 Latent space exploration
 Stress fields
-
