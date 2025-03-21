@@ -20,10 +20,10 @@ import scipy.sparse as sp
 # --------------------
 # Mesh options
 use_gmsh = True  # Toggle between gmsh (.msh) and box mesh
-mesh_file = "mesh/beam_1059.msh"  # Path to .msh file if use_gmsh is True
+mesh_file = "mesh/beam_732.msh"  # Path to .msh file if use_gmsh is True
 # Material properties
 
-E, nu = 10000, 0.4  # Example values for soft tissue
+E, nu = 10000, 0.499  # Example values for soft tissue
 rho = 1000
 
 # Lame's constants

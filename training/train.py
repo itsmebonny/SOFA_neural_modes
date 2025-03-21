@@ -1572,7 +1572,7 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 5
+                deformation_scale_init = 0.5
                 deformation_scale_final = 20
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
@@ -1580,6 +1580,7 @@ class Routine:
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)
                 mode_scales = mode_scales * current_scale
+                mode_scales[-1] *= 2  # Increase scale for last mode
 
                 # Generate samples with current scale
                 z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
@@ -1652,7 +1653,7 @@ class Routine:
                     avg_neural_ratio = sum(r['neural_volume_ratio'] for r in volume_results) / len(volume_results)
                     
                     # Compute volume preservation penalty (squared deviation from 1.0)
-                    vol_penalty = 100.0 * torch.mean((torch.tensor(
+                    vol_penalty = 1000.0 * torch.mean((torch.tensor(
                         [r['neural_volume_ratio'] for r in volume_results], 
                         device=self.device, dtype=torch.float64) - 1.0)**2)
 

@@ -993,8 +993,8 @@ class DynamicValidator:
         domain = self.routine.domain
         
         # Material parameters - match twisting_beam.py exactly
-        E = 1.0e5
-        nu = 0.45
+        E = 10000
+        nu = 0.49
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
         
