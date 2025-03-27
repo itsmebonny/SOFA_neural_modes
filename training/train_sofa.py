@@ -14,6 +14,7 @@ from ufl import TrialFunction, TestFunction, inner, dx, grad, sym, Identity, div
 import traceback
 from scipy import sparse
 
+from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy
 
 
 
@@ -89,8 +90,8 @@ class Net(torch.nn.Module):
         
         self.layers = torch.nn.ModuleList(layers)
 
-        self.layers[-1].weight.data.fill_(0.0)
-        self.layers[-1].bias.data.fill_(0.0)
+        # self.layers[-1].weight.data.fill_(0.0)
+        # self.layers[-1].bias.data.fill_(0.0)
         
     def forward(self, x):
         # Handle both single vectors and batches
@@ -1827,31 +1828,23 @@ class Routine:
         print(f"g = {self.g}")
 
         # Choose energy calculator based on config or default to PabloNeoHookeanEnergy
-        energy_type = cfg.get('physics', {}).get('energy_type', 'neohookean')
-        if energy_type == 'stvk':
-            self.energy_calculator = StVenantKirchhoffEnergy(
-                self.domain, self.fem_degree, self.E, self.nu,
-                precompute_matrices=True, device=self.device
-            ).to(self.device)
-        else:  # Default to neo-Hookean
-            self.energy_calculator = PabloNeoHookeanEnergy(
-                self.domain, self.fem_degree, self.E, self.nu,
-                precompute_matrices=True, device=self.device
-            ).to(self.device)
-
+        self.energy_calculator = ModularNeoHookeanEnergy(
+                        self.domain, self.fem_degree, self.E, self.nu,
+                        precompute_matrices=True, device=self.device
+                    ).to(self.device)
         self.scale = self.compute_safe_scaling_factor()
         print(f"Scaling factor: {self.scale}")
 
         # Load neural network
         print("Loading neural network...")
         self.latent_dim = cfg['model']['latent_dim']
-        self.num_modes = self.latent_dim  # Make them the same
+        self.num_modes = self.latent_dim  - 6
         output_dim = self.V.dofmap.index_map.size_global * self.domain.geometry.dim
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
         print(f"Output dimension: {output_dim}")
         print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        self.model = Net(self.latent_dim, output_dim, hid_layers, hid_dim).to(device).double()
+        self.model = Net(self.num_modes, output_dim, hid_layers, hid_dim).to(device).double()
 
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
@@ -1871,6 +1864,7 @@ class Routine:
             self.linear_modes = self.compute_linear_modes()
         
         self.linear_modes = torch.tensor(self.linear_modes, device=self.device).double()
+        print(f"Linear modes shape: {self.linear_modes.shape}")
         print("Linear eigenmodes loaded.")
 
         # Tensorboard setup
@@ -2036,7 +2030,7 @@ class Routine:
         X = X.view(1, -1).expand(batch_size, -1)
         
         # Use a subset of linear modes (you might need to adjust indices)
-        L = self.latent_dim  # Use at most 3 linear modes
+        L = self.num_modes  # Use at most 3 linear modes
         linear_modes = self.linear_modes[:, :L]  # Use the first L modes
         
         # Setup iteration counter and best loss tracking
@@ -2101,7 +2095,7 @@ class Routine:
                 deformation_scale_init = 0.5
                 deformation_scale_final = 3
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)
@@ -2160,7 +2154,7 @@ class Routine:
                     batch_size = u_total_batch.shape[0]
                     if batch_size > 1:
                         # Use batch processing for multiple samples
-                        energies = self.energy_calculator.compute_batch_energy(u_total_batch)
+                        energies = self.energy_calculator(u_total_batch)
                         energy = torch.mean(energies)  # Average energy across batch
                     else:
                         # Use single-sample processing
@@ -2197,7 +2191,7 @@ class Routine:
 
                     # Add incentive for beneficial nonlinearity (energy improvement term)
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
-                    energy_linear = self.energy_calculator.compute_batch_energy(u_linear_only).mean()
+                    energy_linear = self.energy_calculator(u_linear_only).mean()
                     energy_improvement = (energy_linear - energy)
                     nonlinear_weight = torch.clamp(normalized_energy, min=0.1, max=10.0)
                     nonlinear_reward = nonlinear_weight * torch.clamp(energy_improvement, min=0) 
@@ -2231,7 +2225,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss =  div_p_weight * log_scaled_div_p + ortho + origin + energy_scaling 
+                    loss =  energy + ortho + origin  
 
                     loss.backward()
 

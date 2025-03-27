@@ -6,7 +6,7 @@ mesh:
 # Material properties
 material:
   youngs_modulus: 10000
-  poissons_ratio: 0.49
+  poissons_ratio: 0.35
   density: 1000
   volume: 10.0
 
@@ -26,7 +26,7 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 5
+  latent_dim: 30
   hid_layers: 32
   hid_dim: 32
   use_modal_derivatives: true

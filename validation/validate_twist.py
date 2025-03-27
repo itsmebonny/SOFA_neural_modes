@@ -407,6 +407,22 @@ class DynamicValidator:
             # Check if we have FEM solution for this step
             has_fem_solution = step < len(self.fem_solution_history)
             
+            # Calculate energies for comparison
+            nn_energy = self.compute_energy(z).item()
+            
+            # Get FEM energy if available
+            if has_fem_solution:
+                # Use the previously computed FEM energy if available
+                if hasattr(self, 'fem_energy_history') and step < len(self.fem_energy_history):
+                    fem_energy = self.fem_energy_history[step]
+                else:
+                    # Compute it now if not already computed
+                    u_fem = fem.Function(self.routine.V)
+                    u_fem.x.array[:] = self.fem_solution_history[step]
+                    fem_energy = self.compute_neohookean_energy(u_fem)
+            else:
+                fem_energy = None
+                
             # Clear the plotter
             self.plotter.clear()
             
@@ -414,7 +430,7 @@ class DynamicValidator:
             self.plotter.subplot(0, 0)
             self.plotter.add_mesh(nn_warped, scalars="displacement_magnitude", cmap="viridis", show_edges=True, clim=[0, 1])
             
-            self.plotter.add_title("Neural Network Solution")
+            self.plotter.add_title(f"Neural Network Solution (Energy: {nn_energy:.4e})", font_size=10)
             
             # Add FEM solution if available (right)
             self.plotter.subplot(0, 1)
@@ -426,29 +442,49 @@ class DynamicValidator:
                 fem_warped = fem_grid.warp_by_vector("displacement", factor=1.0)
                 
                 self.plotter.add_mesh(fem_warped, scalars="displacement_magnitude", cmap="viridis", show_edges=True)
-                self.plotter.add_title("FEM Reference Solution")
+                self.plotter.add_title(f"FEM Reference Solution (Energy: {fem_energy:.4e})", font_size=10)
                 
                 # Compute error metrics
                 error = u.cpu().numpy() - self.fem_solution_history[step]
                 error_norm = np.linalg.norm(error) / np.linalg.norm(self.fem_solution_history[step])
                 max_error = np.max(np.abs(error))
                 
-                # Add global title with error metrics
-                self.plotter.add_text(f"Time: {t:.3f}s, Step: {step}, Rel. Error: {error_norm:.4f}, Max Error: {max_error:.4e}", 
-                                    position="upper_edge", font_size=14, color='white')
+                # Calculate energy difference and ratio
+                energy_diff = abs(nn_energy - fem_energy)
+                energy_ratio = nn_energy / fem_energy if fem_energy > 0 else float('inf')
+                
+                # Add global title with error metrics and energy comparison
+                self.plotter.add_text(
+                    f"Time: {t:.3f}s, Step: {step}, Torque: {torque_magnitude:.2e}\n" 
+                    f"Rel. Error: {error_norm:.4f}, Max Error: {max_error:.4e}\n"
+                    f"Energy Diff: {energy_diff:.4e}, Energy Ratio: {energy_ratio:.4f}", 
+                    position="lower_left", font_size=10, color='black'
+                )
             else:
                 # Display a message in the right subplot when FEM solution is not yet available
                 self.plotter.add_text("FEM solution not yet available", position="center", font_size=14, color='white')
                 self.plotter.add_title("FEM Reference Solution (Processing...)")
+                
+                # Add neural network energy information
+                self.plotter.add_text(
+                    f"Time: {t:.3f}s, Step: {step}, Torque: {torque_magnitude:.2e}\n" 
+                    f"Neural Network Energy: {nn_energy:.4e}", 
+                    position="lower_left", font_size=10, color='black'
+                )
             
             # Write the frame to the GIF file
             self.plotter.write_frame()
             
             if step % 10 == 0:  # Log less frequently
                 self.logger.info(f"Visualization frame added for step {step}, t={t:.3f}s")
+                if has_fem_solution:
+                    self.logger.info(f"  NN Energy: {nn_energy:.6e}, FEM Energy: {fem_energy:.6e}, Ratio: {energy_ratio:.4f}")
                 
         except Exception as e:
             self.logger.error(f"Error in visualization for step {step}: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
 
 
     # Modify visualize_results to include error metrics compared to FEM
