@@ -9,3 +9,7 @@ cantilever_modal.py
 neohookean.cpp
 pablo_loss.py
 twisting_beam.py
+
+*.gif
+*.png
+*.jpg
