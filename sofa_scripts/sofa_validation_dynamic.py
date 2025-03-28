@@ -523,7 +523,7 @@ class AnimationStepController(Sofa.Core.Controller):
         print("Optimizer for latent variables initialized")
         
     def compute_elastic_energy(self, displacements):
-        """Compute the elastic energy for given displacements using PabloNeoHookeanEnergy if available"""
+        """Compute the elastic energy for given displacements"""
         # Initialize energy calculator if needed
         if self.energy_calculator is None:
             self.initialize_energy_calculator()
@@ -554,7 +554,6 @@ class AnimationStepController(Sofa.Core.Controller):
             
             return energy
         else:
-            # Use the PabloNeoHookeanEnergy to compute the energy
             # Convert to tensor if not already
             if not torch.is_tensor(displacements):
                 displacements_tensor = torch.tensor(displacements.flatten(), 
@@ -858,13 +857,11 @@ class AnimationStepController(Sofa.Core.Controller):
         return mechanical_object.position.value.copy()
     
     def initialize_energy_calculator(self):
-        """Initialize the energy calculator using PabloNeoHookeanEnergy from train.py"""
         if self.energy_calculator is not None:
             return  # Already initialized
             
         try:
             # Import the energy calculator class from train.py
-            from training.train import PabloNeoHookeanEnergy
             
             # Create a dummy domain structure with the necessary attributes
             class DummyDomain:
@@ -967,8 +964,9 @@ class AnimationStepController(Sofa.Core.Controller):
             dummy_domain = DummyDomain(coordinates, elements)
             
             # Create energy calculator with lower batch size and more error checking
+            from tests.solver import ModularNeoHookeanEnergy
             device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-            self.energy_calculator = PabloNeoHookeanEnergy(
+            self.energy_calculator = ModularNeoHookeanEnergy(
                 domain=dummy_domain,
                 degree=1,
                 E=self.young_modulus,
@@ -977,7 +975,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 device=device,
                 batch_size=1  # Use very small batch size for safety
             )
-            print("Energy calculator initialized using PabloNeoHookeanEnergy")
+            print("Energy calculator initialized using ModularNeoHookeanEnergy")
             return True
         except Exception as e:
             print(f"Failed to initialize energy calculator: {str(e)}")

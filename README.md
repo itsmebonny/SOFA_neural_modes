@@ -1,90 +1,77 @@
 # SOFA Neural Modes
 
-A computational framework that connects SOFA simulations with neural network-based reduced order models for fast and accurate mechanical simulations.
+A framework that combines SOFA simulations with neural networks to learn nonlinear deformation modes for fast mechanical simulations.
 
-## Project Overview
+## Overview
 
-SOFA Neural Modes creates a seamless workflow between SOFA (Simulation Open Framework Architecture) and FEniCS/DOLFINx-based neural networks for mechanical simulations. The framework exports mass and stiffness matrices from SOFA, computes linear modes in FEniCS, and trains neural networks to predict nonlinear deformations.
+The main scripts are:
 
-## Key Features
+1. **Linear Mode Visualization** (`sofa_linear_modes_viz.py`)
+   - Computes and visualizes linear modes directly in SOFA
+   - Exports mass and stiffness matrices for further processing
+   - Provides real-time visualization of mode shapes
 
-Matrix Export: Generate and export mass and stiffness matrices from SOFA simulations with metadata
-Seamless Transfer: Automatic loading of matrices between SOFA and FEniCS
-Linear Mode Computation: Efficient computation of linear modes using SLEPc eigensolvers
-Neural Network Training: Train models with different hyperelastic energy formulations
-Advanced Visualization: Tools for visualizing deformations, modes, and stress fields
-Multiple Energy Models: Support for Neo-Hookean, Saint Venant-Kirchhoff, and other material models
+2. **Neural Network Training** (`train.py`)
+   - Automatically generates linear modes using FEniCSx.
+   - Trains a neural network to capture nonlinear deformation modes.
+   - Uses the exported matrices from SOFA to compute linear basis
+   - Supports different hyperelastic energy formulations
+   - Includes visualization tools for latent space exploration
 
-## Installation
+3. **Model Validation** (`validate_twist.py`)
+   - Validates the trained model against full FEM simulation
+   - Implements twisting beam test case with dynamic loading
+   - Provides side-by-side comparison visualization
+   - Computes error metrics and energy preservation
 
-### Prerequisites
+## Quick Start for Linear Modes Visualization
 
-SOFA (v21.12 or newer)
-FEniCS/DOLFINx
-PyTorch (1.10+)
-PETSc and SLEPc
-PyVista for visualization
-GMSH (optional, for mesh generation)
 
-## Workflow Usage
-
-1. Generate Matrices in SOFA
-
+1. Generate linear modes:
 ```bash
-python scripts/generate_matrices.py --mesh models/beam.vtk --material neo-hookean
+python sofa_linear_modes_viz.py --gui
+```
+## Quick Start for Neural Network Training (here linear modes are automatically generated)
+
+1. Train the neural model:
+```bash
+python train.py 
 ```
 
-This creates mass and stiffness matrices in the `matrices` directory with a timestamp.
-
-1. Train Neural Model
-
+2. Validate the model:
 ```bash
-python scripts/train_model.py --config configs/default.yaml
-```
-
-To use a specific matrix set, provide the timestamp:
-
-```bash
-python scripts/train_model.py --config configs/default.yaml --matrix-timestamp 20230915_123456
-```
-
-1. Validate Model
-
-```bash
-python scripts/validate_model.py --model-path models/trained_model.pth --test-case beam_bending
+python validate_twist.py 
 ```
 
 ## Configuration
 
-Modify `configs/default.yaml` to set:
+The model behavior can be controlled through `configs/default.yaml`:
 
 ```yaml
 material:
-  young_modulus: 1000.0
-  poisson_ratio: 0.3
+  youngs_modulus: 1000.0
+  poissons_ratio: 0.3
 
-network:
-  hidden_layers: [64, 32, 16]
-  activation: "relu"
+model:
   latent_dim: 8
+  hid_layers: 2
+  hid_dim: 64
 
 training:
-  epochs: 1000
+  num_epochs: 1000
   learning_rate: 0.001
-  batch_size: 32
 ```
 
-Material properties (Young's modulus, Poisson ratio)
-Neural network architecture (hidden layers, dimensions)
-Training parameters (epochs, learning rate)
-Mesh file paths
-Physics parameters (gravity, etc.)
+## Results Visualization
 
-## Visualization Examples
+The framework includes visualization tools for:
+- Linear mode shapes in SOFA
+- Neural network training progress
+- Latent space exploration
+- Dynamic validation comparison
+- Energy preservation analysis
 
-The framework includes tools for visualizing:
-
-Linear modes
-Neural mode predictions
-Latent space exploration
-Stress fields
+Visualization results are saved to:
+- Linear modes: `modal_data/`
+- Training progress: `tensorboard/`
+- Validation results: `validation_results/`

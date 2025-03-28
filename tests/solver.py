@@ -65,7 +65,7 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
         self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = dtype
         
-        # Material properties (exactly as in Pablo's code)
+        # Material properties 
         self.E = E
         self.nu = nu
         self.mu = self.E / (2 * (1 + self.nu))  # Shear modulus
@@ -241,7 +241,7 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
     
     def forward(self, u_tensor):
         """
-        PyTorch forward method - computes total energy (same signature as Pablo's implementation)
+        PyTorch forward method - computes total energy
         
         Args:
             u_tensor: Displacement field [num_nodes*dim] or [batch_size, num_nodes*dim]
@@ -340,7 +340,6 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
         Returns:
             Energy density per batch sample
         """
-        # EXACTLY match Pablo's implementation from pablo_loss.py
         # Original implementation:
         # return 0.5 * mu * (IC - 3 - 2 * torch.log(J)) \
         #    + 0.25 * lmbd * (J ** 2 - 1 - 2 * torch.log(J))
@@ -352,11 +351,11 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
         # IC = tr(C) = F_ji·F_ji
         IC = torch.einsum('...ji,...ji->...', F, F)
         
-        # Safe log for stability (exactly as Pablo's implementation)
+        # Safe log for stability 
         safe_J = torch.clamp(J, min=1e-10)
         log_J = torch.log(safe_J)
         
-        # Neo-Hookean energy exactly matching Pablo's formula
+        # Neo-Hookean energy 
         W = 0.5 * self.mu * (IC - 3.0 - 2.0 * log_J) + \
             0.25 * self.lmbda * (J ** 2 - 1.0 - 2.0 * log_J)
         
@@ -415,7 +414,6 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
         Returns:
             Divergence of P tensor [batch_size, num_nodes, 3] or [num_nodes, 3]
         """
-        # Similar to compute_gradient but returns in Pablo's expected format
         
         # Handle input dimensionality
         is_batch = displacement_batch.dim() > 1
@@ -504,14 +502,14 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
                 grad_u = torch.einsum('benj,eni->beij', element_disps, dN_dx)
                 F += grad_u
                 
-                # Compute PK1 tensor using Pablo's formula
+                # Compute PK1 tensor 
                 for b in range(batch_size):
                     for e in range(batch_size_actual):
                         # Determinant and inverse
                         J = torch.linalg.det(F[b, e])
                         inv_F = torch.linalg.inv(F[b, e])
                         
-                        # First Piola-Kirchhoff stress tensor (Pablo's formula)
+                        # First Piola-Kirchhoff stress tensor 
                         # P = mu * (F - F^-T) + 0.5 * lambda * (J^2 - 1) * F^-T
                         P = self.mu * (F[b, e] - inv_F.transpose(0, 1)) + \
                             0.5 * self.lmbda * (J**2 - 1.0) * inv_F.transpose(0, 1)
@@ -524,7 +522,6 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
     def compute_volume_comparison(self, u_linear, u_total):
         """
         Compare volumes between original mesh, linear modes prediction, and neural network prediction.
-        Required for compatibility with Pablo's implementation.
         
         Args:
             u_linear: Linear displacement field
@@ -619,8 +616,6 @@ class ModularNeoHookeanEnergy(torch.nn.Module):
 class NeoHookeanEnergyModel(EnergyModel):
     """
     Modular Neo-Hookean energy model compatible with ModernFEMSolver.
-    Implements the same formulation as PabloNeoHookeanEnergy but with
-    a cleaner interface following the EnergyModel abstract class.
     """
     
     def __init__(self, coordinates, elements, young_modulus, poisson_ratio, 
@@ -752,7 +747,7 @@ class NeoHookeanEnergyModel(EnergyModel):
             dN_dxi = torch.zeros((8, 3), dtype=self.dtype, device=element_coords.device)
             
             # First derivatives with respect to xi, eta, zeta
-            # ... [derivatives computation code - same as in PabloNeoHookeanEnergy] ...
+            # ... ...
             
             # Jacobian calculation
             J = torch.matmul(element_coords.T, dN_dxi)

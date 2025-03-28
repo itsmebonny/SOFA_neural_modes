@@ -651,18 +651,7 @@ class Routine:
                     origin = torch.sum(y[rest_idx]**2)
 
 
-                    displacement_magnitude = torch.norm(l, dim=1, keepdim=True)
-                    displacement_magnitude_mean = torch.mean(displacement_magnitude)
-
-                    # 1. Scale-normalized energy: E/|u|²
-                    # This measures energy efficiency rather than raw energy
-                    # For linear elasticity, this should be constant (scale-invariant)
-                    scale_factor = torch.clamp(displacement_magnitude_mean, min=1e-6)**2
-                    normalized_energy = energy / scale_factor
-
-                
-                    # 2. Energy with physically expected scaling
-                    # For Neo-Hookean materials, energy scales approximately with |u|²
+                 
 
                     energy_scaling = torch.log10(energy + 1)
 
@@ -670,17 +659,12 @@ class Routine:
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
                     energy_linear = self.energy_calculator(u_linear_only).mean()
                     energy_improvement = (energy_linear - energy)
-                    nonlinear_weight = torch.clamp(normalized_energy, min=0.1, max=10.0)
-                    nonlinear_reward = nonlinear_weight * torch.clamp(energy_improvement, min=0) 
-
-
-
+                   
                     # Get the raw div(P) tensor
                     raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
                     raw_div_p_L2_mean = torch.mean(torch.norm(raw_div_p, dim=2))
 
-                    # Apply tanh transformation
                     div_p_magnitude = torch.norm(raw_div_p, dim=2, keepdim=True)
                     div_p_direction = raw_div_p / (div_p_magnitude + 1e-8)
 
@@ -691,7 +675,6 @@ class Routine:
                     log_scaled_div_p_tensor = log_div_p_magnitude * div_p_direction
 
                     # log_Scaled_div_p is a tensor of shape [batch_size, num_nodes, 3]
-                    #let's do a mean over the nodes and the batch and resh
 
                     log_scaled_div_p = torch.mean(torch.norm(log_scaled_div_p_tensor, dim=2))
 
@@ -727,7 +710,7 @@ class Routine:
                         
                         # Energy metrics section
                         print(f"│ ENERGY METRICS:")
-                        print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Normalized Energy:':<20} {normalized_energy.item():<12.6f}")
+                        print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Linear Energy:':<20} {energy_linear.item():<12.6f}")
                         print(f"│ {'Energy Improvement:':<20} {energy_improvement.item():<12.6f} │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
                         
                         # Constraint metrics section
@@ -759,7 +742,6 @@ class Routine:
                         print(f"{sep_line}\n")
                     
 
-                                    # Add these lines before return loss
                     energy_val = energy.item()  # Convert tensor to Python scalar
                     ortho_val = ortho.item()
                     origin_val = origin.item()
@@ -770,7 +752,7 @@ class Routine:
                 # Perform optimization step
                 optimizer.step(closure)
 
-                scheduler.step(loss_val)  # Use the loss value to determine if we should reduce LR
+                scheduler.step(loss_val)  
 
             if iteration % 1 == 0:  # Update visualization every 5 iterations
                 pass

@@ -698,6 +698,164 @@ class DynamicValidator:
             
             return z.detach()
         
+    def plot_energy_vs_torque(self, save_path=None):
+        """
+        Create a plot comparing neural network energy and FEM energy against applied torque.
+        Uses the stored energy histories directly rather than recomputing them.
+        
+        Args:
+            save_path: Optional path to save the figure (defaults to output_dir/energy_torque_comparison.png)
+        """
+        try:
+            import matplotlib.pyplot as plt
+            
+            # Default save location if not specified
+            if save_path is None:
+                save_path = os.path.join(self.output_dir, "energy_torque_comparison.png")
+            
+            # Collect data for plotting
+            time_points = []
+            torque_values = []
+            
+            # Calculate time points and torque values
+            if hasattr(self, 'fem_energy_history') and self.fem_energy_history:
+                num_steps = len(self.fem_energy_history)
+                self.logger.info(f"Found {num_steps} FEM energy entries")
+                
+                for i in range(num_steps):
+                    t = (i+1) * self.dt
+                    time_points.append(t)
+                    
+                    # Calculate applied torque at this time
+                    torque = self.torque_magnitude
+                    if t < self.torque_ramp_time:
+                        torque *= (t / self.torque_ramp_time)
+                    if t >= self.change_time:
+                        torque *= 0.5
+                    torque_values.append(torque)
+            
+            # Check if we have energy histories directly available
+            if hasattr(self, 'nn_energy_history') and hasattr(self, 'fem_energy_history'):
+                self.logger.info(f"Using stored energy histories directly")
+                
+                # Use only valid entries from both histories
+                valid_steps = min(len(self.nn_energy_history), len(self.fem_energy_history))
+                nn_energy = self.nn_energy_history[:valid_steps]
+                fem_energy = self.fem_energy_history[:valid_steps]
+                
+                # Ensure time points match the energy data available
+                time_points = time_points[:valid_steps]
+                torque_values = torque_values[:valid_steps]
+                
+                self.logger.info(f"Plotting energy comparison with {valid_steps} data points")
+                self.logger.info(f"NN energy range: [{min(nn_energy):.4e}, {max(nn_energy):.4e}]")
+                self.logger.info(f"FEM energy range: [{min(fem_energy):.4e}, {max(fem_energy):.4e}]")
+            else:
+                # Fallback to the older approach if direct histories aren't available
+                self.logger.warning("No direct energy histories found, reconstructing from stored data")
+                nn_energy = []
+                fem_energy = []
+                
+                # Original code for calculating energy values from stored data
+                if hasattr(self, 'u_history') and self.u_history:
+                    for i, u in enumerate(self.u_history):
+                        if i >= len(self.fem_energy_history):
+                            break
+                            
+                        # Get neural network energy if available
+                        if hasattr(self, 'z_history') and i < len(self.z_history) and self.z_history[i] is not None:
+                            z = torch.tensor(self.z_history[i], device=self.device, dtype=torch.float64)
+                            nn_energy.append(self.compute_energy(z).item())
+                        else:
+                            # Try to compute from displacement
+                            try:
+                                z = self.find_best_latent_vector(u)
+                                nn_energy.append(self.compute_energy(z).item())
+                            except:
+                                nn_energy.append(float('nan'))
+                        
+                        # Get FEM energy
+                        self.logger.info(f"NN energy: {nn_energy[-1]}")
+                        fem_energy.append(self.fem_energy_history[i])
+            
+            # Create figure with two subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            
+            # Plot 1: Energy vs Time with Torque overlay
+            ax1.plot(time_points, nn_energy, 'b-', label='Neural Network Energy')
+            ax1.plot(time_points, fem_energy, 'r--', label='FEM Energy')
+            ax1.set_ylabel('Energy')
+            ax1.set_title('Energy vs Time')
+            ax1.grid(True)
+            ax1.legend(loc='upper left')
+            
+            # Add torque as second y-axis
+            ax1_twin = ax1.twinx()
+            ax1_twin.plot(time_points, torque_values, 'g-.', label='Applied Torque')
+            ax1_twin.set_ylabel('Torque (N·m)')
+            ax1_twin.legend(loc='upper right')
+            
+            # Plot 2: Energy vs Torque
+            ax2.plot(torque_values, nn_energy, 'bo-', label='Neural Network Energy')
+            ax2.plot(torque_values, fem_energy, 'ro--', label='FEM Energy')
+            ax2.set_xlabel('Applied Torque (N·m)')
+            ax2.set_ylabel('Energy')
+            ax2.set_title('Energy vs Applied Torque')
+            ax2.grid(True)
+            ax2.legend()
+            
+            # Adjust layout and save
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close()
+            
+            self.logger.info(f"Energy vs Torque plot saved to {save_path}")
+            
+            # Also create a direct plotting function for the plotter
+            def add_energy_torque_plot_to_plotter(plotter=None):
+                """Adds the energy vs torque plot to a PyVista plotter"""
+                if plotter is None and hasattr(self, 'plotter') and self.plotter is not None:
+                    plotter = self.plotter
+                
+                if plotter is not None:
+                    try:
+                        # Create a PyVista chart with the energy vs torque data
+                        import pyvista
+                        
+                        # Save the plot to a temporary file
+                        temp_file = os.path.join(self.output_dir, "temp_energy_plot.png")
+                        plt.figure(figsize=(8, 6))
+                        plt.plot(torque_values, nn_energy, 'bo-', label='Neural Network Energy')
+                        plt.plot(torque_values, fem_energy, 'ro--', label='FEM Energy')
+                        plt.xlabel('Applied Torque (N·m)')
+                        plt.ylabel('Energy')
+                        plt.title('Energy vs Applied Torque')
+                        plt.grid(True)
+                        plt.legend()
+                        plt.savefig(temp_file, dpi=150)
+                        plt.close()
+                        
+                        # Add the image to the plotter
+                        chart_actor = plotter.add_background_image(temp_file)
+                        
+                        # Return the actor for potential later removal
+                        return chart_actor
+                    except Exception as e:
+                        self.logger.error(f"Failed to add energy-torque plot to plotter: {e}")
+                        return None
+                return None
+            
+            # Store the function as an instance method
+            self.add_energy_torque_plot_to_plotter = add_energy_torque_plot_to_plotter
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create energy vs torque plot: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        return False
+        
     def run_fem_step(self, t):
         """Run one step of the FEM simulation matching exactly the twisting_beam.py implementation"""
         self.logger.info(f"Running FEM simulation for time t={t:.3f}s")
@@ -842,178 +1000,212 @@ class DynamicValidator:
         """Run parallel FEM and neural network simulations for direct comparison"""
         self.logger.info("Starting dynamic simulation with torque application...")
         
-        # Initialize arrays for storing results
-        z_history = []
-        u_nn_history = []  # Neural network predictions
-        u_fem_history = []  # FEM solutions
-        displacement_norms_nn = []
-        displacement_norms_fem = []
-        energy_history = []
-        torque_history = []
-        time_points = []
-        error_history = []  # Track error between NN and FEM
-        
-        
-        # Store initial state
-        self.fem_solution_history = [self.u.x.array.copy()]
-        
-        # Initialize neural network state
-        self.z_current = torch.zeros(self.routine.latent_dim, device=self.device, dtype=torch.float64)
-        self.z_prev = torch.zeros(self.routine.latent_dim, device=self.device, dtype=torch.float64)
-        
-        # First compute initial steps using pure FEniCS
-        num_initial_steps = 2 # Use 5 initial FEniCS steps
-        self.logger.info(f"Computing {num_initial_steps} initial steps using FEniCS with NeoHookean material...")
-        
-        # Clear solution history before computing initial steps
-        self.fem_solution_history = []
-        
-        # Run the initial FEM steps
-        t = 0.0
-        for n in range(num_initial_steps):
-            t += self.dt
-            success = self.run_fem_step(t)
-            if not success:
-                self.logger.error(f"Initial FEM step failed at t={t:.4f}s, terminating simulation")
-                return {}
+        try:
+            # Initialize arrays for storing results
+            z_history = []
+            u_nn_history = []  # Neural network predictions
+            u_fem_history = []  # FEM solutions
+            displacement_norms_nn = []
+            displacement_norms_fem = []
             
-            time_points.append(t)
-            torque_history.append(self.torque_magnitude * min(t/self.torque_ramp_time, 1.0))
+            torque_history = []
+            time_points = []
+            error_history = []  # Track error between NN and FEM
+
+
+            self.fem_history = []
+            self.nn_energy_history = [] # Store neural network energy history
             
-            self.logger.info(f"Initial FEM step {n+1}/{num_initial_steps}, t={t:.4f}s completed")
-        
-        # Convert latest FEM solutions to torch tensors for the neural network
-        # CRITICAL FIX: Use different variable names for tensors vs. FEniCS Functions
-        u_prev_torch = torch.tensor(self.fem_solution_history[-2], device=self.device, dtype=torch.float64)
-        u_current_torch = torch.tensor(self.fem_solution_history[-1], device=self.device, dtype=torch.float64)
-        
-        # Find initial latent vector through projection
-        self.z_prev = self.find_best_latent_vector(u_prev_torch)
-        self.z_current = self.find_best_latent_vector(u_current_torch)
-        
-        # Compute initial energy
-        energy = self.compute_energy(self.z_current).item()
-        energy_history.extend([0.0] * (num_initial_steps-1))  # Placeholder for earlier steps
-        energy_history.append(energy)
-        
-        # Store latent vectors
-        z_history.extend([None] * (num_initial_steps-1))  # Placeholder for earlier steps
-        z_history.append(self.z_current.cpu().numpy())
-        
-        # Store optimal displacements for visualization
-        u_nn = u_current_torch.clone()  # Define u_nn using current torch tensor
-        u_nn_history.append(u_nn.clone())
-        displacement_norms_nn.append(torch.norm(u_nn).item())
-        
-        # Compute FEM displacement norms for consistent comparison
-        displacement_norms_fem = [np.linalg.norm(sol) for sol in self.fem_solution_history]
-        
-        # Current torque for logging
-        current_torque = self.torque_magnitude * min(t/self.torque_ramp_time, 1.0)
-        if t >= self.change_time:
-            current_torque *= 0.5
-        torque_history.append(current_torque)
-        
-        
-        # Main simulation loop - run both FEM and neural network for comparison
-        for n in range(1, self.num_steps):
-            t += self.dt
-            self.logger.info(f"\n--- Step {n+1}/{self.num_steps}, Time: {t:.4f}s ---")
             
-            # 1. Run FEM step (ground truth)
-            fem_success = self.run_fem_step(t)
-            if not fem_success:
-                self.logger.warning(f"FEM solver failed at t={t:.4f}s but continuing with neural model")
+            # Store initial state
+            self.fem_solution_history = [self.u.x.array.copy()]
             
-            # Get FEM solution
-            u_fem_current = torch.tensor(self.u.x.array, device=self.device, dtype=torch.float64) if fem_success else None
+            # Initialize neural network state
+            self.z_current = torch.zeros(self.routine.latent_dim, device=self.device, dtype=torch.float64)
+            self.z_prev = torch.zeros(self.routine.latent_dim, device=self.device, dtype=torch.float64)
             
-            # 2. Run neural network prediction (independent from FEM result)
-            # Use the previous NN state to predict the next state
-            prev_z = self.z_current.clone()
-            prev_u_nn = u_nn.clone()
+            # First compute initial steps using pure FEniCS
+            num_initial_steps = 2 # Use 5 initial FEniCS steps
+            self.logger.info(f"Computing {num_initial_steps} initial steps using FEniCS with NeoHookean material...")
             
-            ## Find optimal z for next timestep
-            self.logger.info(f"Computing neural network prediction for t={t:.4f}s")
-            z_predicted, u_nn_predicted = self.find_optimal_z(
-                u_nn, u_prev_torch, self.dt, t  # Use u_prev_torch here, not self.u_prev
-            )
-            print(f"z_predicted: {z_predicted}")
-                        
-            # Update neural network state for next prediction
-            u_prev_torch = u_nn.clone()
-            u_nn = u_nn_predicted.clone()
-            self.z_prev = prev_z
-            self.z_current = z_predicted
+            # Clear solution history before computing initial steps
+            self.fem_solution_history = []
             
-            # 3. Compare and store results
-            if fem_success and u_fem_current is not None:
-                # Calculate error between NN and FEM
-                error = torch.norm(u_nn - u_fem_current) / torch.norm(u_fem_current)
-                self.logger.info(f"Relative error between NN and FEM: {error.item():.6f}")
+            # Run the initial FEM steps
+            t = 0.0
+            for n in range(num_initial_steps):
+                t += self.dt
+                success = self.run_fem_step(t)
+                if not success:
+                    self.logger.error(f"Initial FEM step failed at t={t:.4f}s, terminating simulation")
+                    return {}
                 
-                # Store FEM results
-                u_fem_history.append(u_fem_current.clone())
-                displacement_norms_fem.append(torch.norm(u_fem_current).item())
-            else:
-                error = torch.tensor(float('nan'))
-                u_fem_history.append(None)
-                displacement_norms_fem.append(float('nan'))
+                time_points.append(t)
+                torque_history.append(self.torque_magnitude * min(t/self.torque_ramp_time, 1.0))
+                
+                self.logger.info(f"Initial FEM step {n+1}/{num_initial_steps}, t={t:.4f}s completed")
             
-            # Store time and results for this step
-            time_points.append(t)
-            z_history.append(z_predicted.cpu().numpy())
+            # Convert latest FEM solutions to torch tensors for the neural network
+            # CRITICAL FIX: Use different variable names for tensors vs. FEniCS Functions
+            u_prev_torch = torch.tensor(self.fem_solution_history[-2], device=self.device, dtype=torch.float64)
+            u_current_torch = torch.tensor(self.fem_solution_history[-1], device=self.device, dtype=torch.float64)
+            
+            # Find initial latent vector through projection
+            self.z_prev = self.find_best_latent_vector(u_prev_torch)
+            self.z_current = self.find_best_latent_vector(u_current_torch)
+            
+            # Compute initial nn energy
+            energy = self.compute_energy(self.z_current).item()
+            self.nn_energy_history.append(energy)
+            
+            # Store latent vectors
+            z_history.extend([None] * (num_initial_steps-1))  # Placeholder for earlier steps
+            z_history.append(self.z_current.cpu().numpy())
+            
+            # Store optimal displacements for visualization
+            u_nn = u_current_torch.clone()  # Define u_nn using current torch tensor
             u_nn_history.append(u_nn.clone())
             displacement_norms_nn.append(torch.norm(u_nn).item())
-            error_history.append(error.item())
             
-            # Compute energy and torque
-            energy = self.compute_energy(z_predicted).item()
-            energy_history.append(energy)
+            # Compute FEM displacement norms for consistent comparison
+            displacement_norms_fem = [np.linalg.norm(sol) for sol in self.fem_solution_history]
             
-            current_torque = self.torque_magnitude
-            if t < self.torque_ramp_time:
-                current_torque *= (t / self.torque_ramp_time)
+            # Current torque for logging
+            current_torque = self.torque_magnitude * min(t/self.torque_ramp_time, 1.0)
             if t >= self.change_time:
                 current_torque *= 0.5
             torque_history.append(current_torque)
             
-            # Log progress every few steps
-            if n % 5 == 0:
-                self.logger.info(f"Step {n+1}/{self.num_steps}, Time: {t:.2f}s, Energy: {energy:.4e}")
-                self.logger.info(f"NN max displacement: {torch.max(torch.norm(u_nn.reshape(-1, 3), dim=1)).item():.4e}")
-                if fem_success and u_fem_current is not None:
-                    self.logger.info(f"FEM max displacement: {torch.max(torch.norm(u_fem_current.reshape(-1, 3), dim=1)).item():.4e}")
-                self.logger.info(f"Rel. Error: {error.item():.6f}")
             
-            # Visualize steps
-            if n % 1 == 0:
-                self.visualize_step(n, t, z_predicted, u_nn, current_torque)
+            # Main simulation loop - run both FEM and neural network for comparison
+            for n in range(1, self.num_steps):
+                t += self.dt
+                self.logger.info(f"\n--- Step {n+1}/{self.num_steps}, Time: {t:.4f}s ---")
+                
+                # 1. Run FEM step (ground truth)
+                fem_success = self.run_fem_step(t)
+                if not fem_success:
+                    self.logger.warning(f"FEM solver failed at t={t:.4f}s but continuing with neural model")
+                
+                # Get FEM solution
+                u_fem_current = torch.tensor(self.u.x.array, device=self.device, dtype=torch.float64) if fem_success else None
+                
+                # 2. Run neural network prediction (independent from FEM result)
+                # Use the previous NN state to predict the next state
+                prev_z = self.z_current.clone()
+                prev_u_nn = u_nn.clone()
+                
+                ## Find optimal z for next timestep
+                self.logger.info(f"Computing neural network prediction for t={t:.4f}s")
+                z_predicted, u_nn_predicted = self.find_optimal_z(
+                    u_nn, u_prev_torch, self.dt, t  # Use u_prev_torch here, not self.u_prev
+                )
+                print(f"z_predicted: {z_predicted}")
+                            
+                # Update neural network state for next prediction
+                u_prev_torch = u_nn.clone()
+                u_nn = u_nn_predicted.clone()
+                self.z_prev = prev_z
+                self.z_current = z_predicted
+                
+                # 3. Compare and store results
+                if fem_success and u_fem_current is not None:
+                    # Calculate error between NN and FEM
+                    error = torch.norm(u_nn - u_fem_current) / torch.norm(u_fem_current)
+                    self.logger.info(f"Relative error between NN and FEM: {error.item():.6f}")
+                    
+                    # Store FEM results
+                    u_fem_history.append(u_fem_current.clone())
+                    displacement_norms_fem.append(torch.norm(u_fem_current).item())
+                else:
+                    error = torch.tensor(float('nan'))
+                    u_fem_history.append(None)
+                    displacement_norms_fem.append(float('nan'))
+                
+                # Store time and results for this step
+                time_points.append(t)
+                z_history.append(z_predicted.cpu().numpy())
+                u_nn_history.append(u_nn.clone())
+                displacement_norms_nn.append(torch.norm(u_nn).item())
+                error_history.append(error.item())
+                
+                # Compute energy and torque
+                energy = self.compute_energy(z_predicted).item()
+                self.nn_energy_history.append(energy)
+                
+                current_torque = self.torque_magnitude
+                if t < self.torque_ramp_time:
+                    current_torque *= (t / self.torque_ramp_time)
+                if t >= self.change_time:
+                    current_torque *= 0.5
+                torque_history.append(current_torque)
+                
+                # Log progress every few steps
+                if n % 5 == 0:
+                    self.logger.info(f"Step {n+1}/{self.num_steps}, Time: {t:.2f}s, Energy: {energy:.4e}")
+                    self.logger.info(f"NN max displacement: {torch.max(torch.norm(u_nn.reshape(-1, 3), dim=1)).item():.4e}")
+                    if fem_success and u_fem_current is not None:
+                        self.logger.info(f"FEM max displacement: {torch.max(torch.norm(u_fem_current.reshape(-1, 3), dim=1)).item():.4e}")
+                    self.logger.info(f"Rel. Error: {error.item():.6f}")
+                
+                # Visualize steps
+                if n % 1 == 0:
+                    self.visualize_step(n, t, z_predicted, u_nn, current_torque)
+            
+            # Create error plot
+            plt.figure(figsize=(10, 6))
+            plt.plot(time_points, error_history, 'o-')
+            plt.axhline(y=0.05, color='r', linestyle='--', label='5% error threshold')
+            plt.xlabel('Time (s)')
+            plt.ylabel('Relative Error')
+            plt.title('Neural Network vs FEM Relative Error')
+            plt.grid(True)
+            plt.legend()
+            plt.savefig(os.path.join(self.output_dir, "nn_vs_fem_error.png"))
+            plt.close()
+            
+            # Visualize final comparison results
+            self.visualize_comparison(time_points, displacement_norms_nn, displacement_norms_fem, 
+                                    self.fem_history, torque_history, error_history)
+            
+            return {
+                'time': time_points,
+                'z': z_history,
+                'displacement_norm_nn': displacement_norms_nn,
+                'displacement_norm_fem': displacement_norms_fem,
+                'nn_energy': self.nn_energy_history,   
+                'fem_energy': self.fem_energy_history, 
+                'error': error_history
+            }
+        except Exception as e:
+            self.logger.error(f"Simulation error: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return {}
         
-        # Create error plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(time_points, error_history, 'o-')
-        plt.axhline(y=0.05, color='r', linestyle='--', label='5% error threshold')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Relative Error')
-        plt.title('Neural Network vs FEM Relative Error')
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(self.output_dir, "nn_vs_fem_error.png"))
-        plt.close()
-        
-        # Visualize final comparison results
-        self.visualize_comparison(time_points, displacement_norms_nn, displacement_norms_fem, 
-                                energy_history, torque_history, error_history)
-        
-        return {
-            'time': time_points,
-            'z': z_history,
-            'displacement_norm_nn': displacement_norms_nn,
-            'displacement_norm_fem': displacement_norms_fem,
-            'energy': energy_history,
-            'error': error_history
-        }
+        finally:
+            # Always create energy vs torque plot, even if simulation failed
+            self.logger.info("Creating energy vs torque plot...")
+            self.plot_energy_vs_torque()
+            
+            # If we have a plotter, add the energy-torque plot to the final frame
+            if hasattr(self, 'plotter') and self.plotter is not None:
+                try:
+                    for _ in range(30):  # Hold the final frame for a few seconds
+                        self.plotter.update()
+                        self.plotter.clear()
+                        self.plotter.subplot(0, 0)
+                        self.plotter.add_text("Simulation Complete", position="upper_edge", font_size=24, color='white')
+                        
+                        # Add energy vs torque plot to the right subplot
+                        self.plotter.subplot(0, 1)
+                        self.add_energy_torque_plot_to_plotter()
+                        
+                        # Save the final frame
+                        self.plotter.write_frame()
+                    
+                except Exception as e:
+                    self.logger.error(f"Error adding final visualization: {e}")
     
     def compute_neohookean_energy(self, u_function):
         """
@@ -1103,42 +1295,6 @@ class DynamicValidator:
     
     
 
-def create_video_from_images(image_folder, output_file, fps=30):
-    """Create a video from simulation step images"""
-    try:
-        import cv2
-        import glob
-        
-        # Get all png files
-        image_files = sorted(glob.glob(os.path.join(image_folder, "step_*.png")))
-        
-        if not image_files:
-            print("No image files found!")
-            return False
-        
-        # Get dimensions from first image
-        img = cv2.imread(image_files[0])
-        height, width, layers = img.shape
-        
-        # Create video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID'
-        video = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
-        
-        # Add each image to video
-        for image_file in image_files:
-            img = cv2.imread(image_file)
-            video.write(img)
-            
-        # Release resources
-        cv2.destroyAllWindows()
-        video.release()
-        
-        print(f"Video created at {output_file}")
-        return True
-    
-    except ImportError:
-        print("OpenCV not installed. Cannot create video.")
-        return False
 
 def main():
     # Parse arguments
@@ -1191,15 +1347,6 @@ def main():
     
     # Run simulation
     results = validator.run_simulation()
-    
-    # Create video from simulation frames
-    logger.info("Creating video from simulation frames")
-    video_path = os.path.join(args.output, "simulation.mp4")
-    create_video_from_images(args.output, video_path, fps=30)
-    
-    logger.info(f"Results saved to {args.output}")
-    logger.info(f"Video saved to {video_path}")
-
 if __name__ == "__main__":
     main()
 
