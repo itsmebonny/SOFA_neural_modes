@@ -738,11 +738,7 @@ class DynamicValidator:
 
     def plot_energy_vs_gravity(self, save_path=None):
         """
-        Create a plot comparing neural network energy and FEM energy against applied gravity.
-        Uses the stored energy histories rather than recomputing them.
-        
-        Args:
-            save_path: Optional path to save the figure (defaults to output_dir/energy_gravity_comparison.png)
+        Create plots comparing neural network energy and FEM energy against time and gravity.
         """
         try:
             import matplotlib.pyplot as plt
@@ -771,134 +767,125 @@ class DynamicValidator:
                     gravity_values.append(gravity)
             
             # Check if we have energy histories directly available
-            if hasattr(self, 'nn_energy_history') and hasattr(self, 'fem_energy_history'):
-                self.logger.info(f"Using stored energy histories directly")
-                
-                # Use only valid entries from both histories
-                valid_steps = min(len(self.nn_energy_history), len(self.fem_energy_history))
-                nn_energy = self.nn_energy_history[:valid_steps]
-                fem_energy = self.fem_energy_history[:valid_steps]
-                
-                # Ensure time points match the energy data available
-                time_points = time_points[:valid_steps]
-                gravity_values = gravity_values[:valid_steps]
-                
-                self.logger.info(f"Plotting energy comparison with {valid_steps} data points")
-                self.logger.info(f"NN energy range: [{min(nn_energy):.4e}, {max(nn_energy):.4e}]")
-                self.logger.info(f"FEM energy range: [{min(fem_energy):.4e}, {max(fem_energy):.4e}]")
-            else:
-                # Fallback to the older approach if direct histories aren't available
-                self.logger.warning("No direct energy histories found, reconstructing from stored data")
-                nn_energy = []
-                fem_energy = []
-                
-                # Calculate energy from stored data
-                if hasattr(self, 'u_history') and self.u_history:
-                    for i, u in enumerate(self.u_history):
-                        if i >= len(self.fem_energy_history):
-                            break
-                            
-                        # Get neural network energy if available
-                        if hasattr(self, 'z_history') and i < len(self.z_history) and self.z_history[i] is not None:
-                            z = torch.tensor(self.z_history[i], device=self.device, dtype=torch.float64)
-                            nn_energy.append(self.compute_energy(z).item())
-                        else:
-                            # Try to compute from displacement
-                            try:
-                                z = self.find_best_latent_vector(u)
-                                nn_energy.append(self.compute_energy(z).item())
-                            except:
-                                nn_energy.append(float('nan'))
-                        
-                        # Get FEM energy
-                        self.logger.info(f"NN energy: {nn_energy[-1]}")
-                        fem_energy.append(self.fem_energy_history[i])
+            self.logger.info(f"Using stored energy histories directly")
             
-            # Create figure with two subplots
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            # Use only valid entries from both histories
+            valid_steps = min(len(self.nn_energy_history), len(self.fem_energy_history))
+            nn_energy = self.nn_energy_history[:valid_steps]
+            fem_energy = self.fem_energy_history[:valid_steps]
             
-            # Plot 1: Energy vs Time with Gravity overlay
-            ax1.plot(time_points, nn_energy, 'b-', label='Neural Network Energy')
-            ax1.plot(time_points, fem_energy, 'r--', label='FEM Energy')
-            ax1.set_ylabel('Energy')
-            ax1.set_title('Energy vs Time')
+            # Ensure time points match the energy data available
+            time_points = time_points[:valid_steps]
+            gravity_values = gravity_values[:valid_steps]
+            
+            self.logger.info(f"Plotting energy comparison with {valid_steps} data points")
+            self.logger.info(f"NN energy range: [{min(nn_energy):.4e}, {max(nn_energy):.4e}]")
+            self.logger.info(f"FEM energy range: [{min(fem_energy):.4e}, {max(fem_energy):.4e}]")
+        
+            
+            # Create figure with three plots
+            fig = plt.figure(figsize=(18, 10))
+            
+            # 1. Plot Energy vs Time (MAIN PLOT)
+            ax1 = plt.subplot2grid((2, 2), (0, 0), colspan=2)  # Make this span both columns
+            ax1.plot(time_points, nn_energy, 'b-', linewidth=2, label='Neural Network Energy')
+            ax1.plot(time_points, fem_energy, 'r--', linewidth=2, label='FEM Energy')
+            ax1.set_ylabel('Energy', fontsize=12)
+            ax1.set_xlabel('Time (s)', fontsize=12)
+            ax1.set_title('Energy vs Time', fontsize=14)
             ax1.grid(True)
-            ax1.legend(loc='upper left')
+            ax1.legend(loc='upper left', fontsize=12)
             
-            # Add gravity as second y-axis
+            # Add gravity as second y-axis on Energy vs Time plot
             ax1_twin = ax1.twinx()
-            ax1_twin.plot(time_points, gravity_values, 'g-.', label='Applied Gravity')
-            ax1_twin.set_ylabel('Gravity (m/s²)')
-            ax1_twin.legend(loc='upper right')
+            ax1_twin.plot(time_points, gravity_values, 'g-.', linewidth=1.5, label='Applied Gravity')
+            ax1_twin.set_ylabel('Gravity (m/s²)', fontsize=12)
+            ax1_twin.legend(loc='upper right', fontsize=12)
             
-            # Plot 2: Energy vs Gravity
+            # 2. Plot Energy vs Gravity (smaller subplot)
+            ax2 = plt.subplot2grid((2, 2), (1, 0))
             ax2.plot(gravity_values, nn_energy, 'bo-', label='Neural Network Energy')
             ax2.plot(gravity_values, fem_energy, 'ro--', label='FEM Energy')
-            ax2.set_xlabel('Applied Gravity (m/s²)')
-            ax2.set_ylabel('Energy')
-            ax2.set_title('Energy vs Applied Gravity')
+            ax2.set_xlabel('Applied Gravity (m/s²)', fontsize=12)
+            ax2.set_ylabel('Energy', fontsize=12)
+            ax2.set_title('Energy vs Applied Gravity', fontsize=14)
             ax2.grid(True)
-            ax2.legend()
+            ax2.legend(fontsize=10)
+            
+            # 3. Add Energy Difference plot (smaller subplot)
+            ax3 = plt.subplot2grid((2, 2), (1, 1))
+            energy_diff = np.array(nn_energy) - np.array(fem_energy)
+            energy_ratio = np.array(nn_energy) / np.array(fem_energy)
+            ax3.plot(time_points, energy_diff, 'k-', label='Energy Difference (NN-FEM)')
+            ax3.set_xlabel('Time (s)', fontsize=12)
+            ax3.set_ylabel('Energy Difference', fontsize=12)
+            ax3.set_title('Energy Difference Between Models', fontsize=14)
+            ax3.grid(True)
+            
+            # Add energy ratio as second y-axis
+            ax3_twin = ax3.twinx()
+            ax3_twin.plot(time_points, energy_ratio, 'm--', label='Energy Ratio (NN/FEM)')
+            ax3_twin.set_ylabel('Energy Ratio', fontsize=12)
+            ax3_twin.set_ylim([0, 2])  # Reasonable range for ratio
+            
+            # Add combined legend
+            lines1, labels1 = ax3.get_legend_handles_labels()
+            lines2, labels2 = ax3_twin.get_legend_handles_labels()
+            ax3.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=10)
             
             # Adjust layout and save
             plt.tight_layout()
             plt.savefig(save_path)
             plt.close()
             
-            self.logger.info(f"Energy vs Gravity plot saved to {save_path}")
+            # Create separate Energy vs Time plot for the final visualization
+            energy_time_path = os.path.join(self.output_dir, "energy_vs_time.png")
+            plt.figure(figsize=(10, 6))
+            plt.plot(time_points, nn_energy, 'b-', linewidth=3, label='Neural Network Energy')
+            plt.plot(time_points, fem_energy, 'r--', linewidth=3, label='FEM Energy')
+            plt.xlabel('Time (s)', fontsize=14)
+            plt.ylabel('Energy', fontsize=14)
+            plt.title('Energy vs Time Comparison', fontsize=16)
+            plt.grid(True)
+            plt.legend(fontsize=12)
+            plt.tight_layout()
+            plt.savefig(energy_time_path)
+            plt.close()
             
-            # Also create a direct plotting function for the plotter
-            def add_energy_gravity_plot_to_plotter(plotter=None):
-                """Adds the energy vs gravity plot to a PyVista plotter"""
+            self.logger.info(f"Energy plots saved to {save_path} and {energy_time_path}")
+            
+            # Modify the plotter function to use the dedicated Energy vs Time plot
+            def add_energy_time_plot_to_plotter(plotter=None):
+                """Adds the energy vs time plot to a PyVista plotter"""
                 if plotter is None and hasattr(self, 'plotter') and self.plotter is not None:
                     plotter = self.plotter
                 
                 if plotter is not None:
                     try:
-                        # Create a PyVista chart with the energy vs gravity data
+                        # Use the dedicated energy vs time plot
                         import pyvista
-                        
-                        # Save the plot to a temporary file
-                        temp_file = os.path.join(self.output_dir, "temp_energy_plot.png")
-                        plt.figure(figsize=(8, 6))
-                        plt.plot(gravity_values, nn_energy, 'bo-', label='Neural Network Energy')
-                        plt.plot(gravity_values, fem_energy, 'ro--', label='FEM Energy')
-                        plt.xlabel('Applied Gravity (m/s²)')
-                        plt.ylabel('Energy')
-                        plt.title('Energy vs Applied Gravity')
-                        plt.grid(True)
-                        plt.legend()
-                        plt.savefig(temp_file, dpi=150)
-                        plt.close()
-                        
-                        # Add the image to the plotter
-                        try:
-                            # First try to remove any existing backgrounds
-                            if hasattr(plotter, 'remove_background_image'):
-                                plotter.remove_background_image()
-                        except:
-                            pass
-                            
-                        # Add the image
-                        chart_actor = plotter.add_background_image(temp_file)
-                        
-                        # Return the actor for potential later removal
+                        chart_actor = plotter.add_background_image(energy_time_path)
                         return chart_actor
                     except Exception as e:
-                        self.logger.error(f"Failed to add energy-gravity plot to plotter: {e}")
+                        self.logger.error(f"Failed to add energy-time plot to plotter: {e}")
                         return None
                 return None
             
             # Store the function as an instance method
-            self.add_energy_gravity_plot_to_plotter = add_energy_gravity_plot_to_plotter
+            self.add_energy_time_plot_to_plotter = add_energy_time_plot_to_plotter
             
-            return True
-            
+            # Use this method in the final visualization
+            if hasattr(self, 'plotter') and self.plotter is not None:
+                    # [Final visualization code would use add_energy_time_plot_to_plotter]
+                    
+                return True
+                
         except Exception as e:
-            self.logger.error(f"Failed to create energy vs gravity plot: {e}")
+            self.logger.error(f"Failed to create energy plots: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             return False
+        
 
     def run_simulation(self):
         """Run the full dynamic simulation"""
@@ -1058,23 +1045,22 @@ class DynamicValidator:
                 self.logger.error(f"Failed to save results during error handling: {e}")
         
         finally:
-            # Always create energy vs gravity plot, even if simulation failed
-            self.logger.info("Creating energy vs gravity plot...")
+            # Always create energy vs time plot, even if simulation failed
+            self.logger.info("Creating energy plots...")
             self.plot_energy_vs_gravity()
             
-            # If we have a plotter, add the energy-gravity plot to the final frame
+            # If we have a plotter, add the energy-time plot to the final frame
             if hasattr(self, 'plotter') and self.plotter is not None:
                 try:
                     for _ in range(50):
-                        
                         self.plotter.clear()
                         self.plotter.subplot(0, 0)
                         self.plotter.add_text("Simulation Complete", position="upper_edge", font_size=24, color='white')
                         
-                        # Add energy vs gravity plot to the right subplot
+                        # Add energy vs TIME plot to the right subplot
                         self.plotter.subplot(0, 1)
                         try:
-                            self.add_energy_gravity_plot_to_plotter()
+                            self.add_energy_time_plot_to_plotter()  # Use the new function
                         except Exception as e:
                             self.logger.error(f"Could not add energy plot: {e}")
                         
