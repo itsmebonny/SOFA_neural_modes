@@ -31,7 +31,7 @@ import gmsh
 from mpi4py import MPI
 import ufl
 from scipy.linalg import eig
-from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy  
+from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy, UFLNeoHookeanModel
 
 # Add after imports
 from slepc4py import SLEPc
@@ -229,7 +229,7 @@ class Routine:
         # print(f"g = {self.g}")
 
         # Choose energy calculator 
-        self.energy_calculator = ModularNeoHookeanEnergy(
+        self.energy_calculator = UFLNeoHookeanModel(
                 self.domain, self.fem_degree, self.E, self.nu,
                 precompute_matrices=True, device=self.device
             ).to(self.device)
@@ -469,11 +469,7 @@ class Routine:
         print(f"Neural network volume:   {result['neural_volume']:.6f} (ratio: {result['neural_volume_ratio']:.6f})")
         print(f"Volume change - Linear:  {(result['linear_volume_ratio']-1)*100:.4f}%")
         print(f"Volume change - Neural:  {(result['neural_volume_ratio']-1)*100:.4f}%")
-        
-        if abs(result['linear_volume_ratio'] - 1.0) > 1e-10:
-            print(f"Improvement factor:      {result['volume_preservation_improvement']:.2f}x")
-        print("==========================================\n")
-        
+ 
         return result
         
 
@@ -559,7 +555,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 0.5
-                deformation_scale_final = 10
+                deformation_scale_final = 3
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
 
@@ -684,7 +680,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e6* ortho + 1e5 * origin  
+                    loss = energy + 1e6* ortho + 1e5 * origin  + 1e3 * vol_penalty
 
 
                     loss.backward()

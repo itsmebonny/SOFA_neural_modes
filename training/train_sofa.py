@@ -14,7 +14,7 @@ from ufl import TrialFunction, TestFunction, inner, dx, grad, sym, Identity, div
 import traceback
 from scipy import sparse
 
-from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy
+from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy, UFLNeoHookeanModel
 
 
 
@@ -1152,7 +1152,7 @@ class Routine:
             self.g = [0, float(gravity), 0]  # Convert scalar to 3D vector
         print(f"g = {self.g}")
 
-        self.energy_calculator = ModularNeoHookeanEnergy(
+        self.energy_calculator = UFLNeoHookeanModel(
                         self.domain, self.fem_degree, self.E, self.nu,
                         precompute_matrices=True, device=self.device
                     ).to(self.device)
@@ -1162,7 +1162,7 @@ class Routine:
         # Load neural network
         print("Loading neural network...")
         self.latent_dim = cfg['model']['latent_dim']
-        self.num_modes = self.latent_dim  - 6
+        self.num_modes = self.latent_dim 
         output_dim = self.V.dofmap.index_map.size_global * self.domain.geometry.dim
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)

@@ -1227,7 +1227,7 @@ class DynamicValidator:
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
         
         # Define strain energy density for Neo-Hookean material
-        d = 3  # 3D problem
+        d = 3  
         I = ufl.Identity(d)
         F = I + ufl.grad(u_function)
         C = F.T * F
