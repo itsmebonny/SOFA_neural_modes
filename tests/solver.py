@@ -2821,7 +2821,8 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
         self.gt_mesh_actor = None
         self.info_actor_left = None
         self.info_actor_right = None
-        self._should_visualize = visualize # Store intent
+        self._should_visualize = visualize 
+        self.force_glyphs_actor = None
 
         # --- Setup Visualization ONCE during initialization if requested ---
         # Setup only on rank 0 if running with MPI
@@ -3391,6 +3392,39 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
                 clim=[0, np.max(force_mag) if np.max(force_mag) > 0 else 1.0]
             )
             
+            # --- NEW: Add force glyphs ---
+            # First, remove old glyphs if they exist
+            if hasattr(self, 'force_glyphs_actor') and self.force_glyphs_actor is not None:
+                self.viz_plotter.remove_actor(self.force_glyphs_actor)
+                
+            # Only add glyphs where force magnitude is significant
+            # This avoids cluttering the view with tiny arrows
+            force_threshold = np.max(force_mag) * 0.05  # 5% of max force
+            mask = force_mag > force_threshold
+            
+            if np.any(mask) and np.max(force_mag) > 1e-8:
+                # Scale factor for the arrows - adjust based on mesh size and forces
+                # Dynamically scale based on mesh bounds and max force
+                mesh_size = np.max(self.viz_grid.bounds[1::2] - self.viz_grid.bounds[::2])
+                scale_factor = mesh_size * 0.05 / (np.max(force_mag) + 1e-10)
+                
+                # Create a subset of points and vectors for glyphs
+                # For very large meshes, we might want to downsample
+                points_subset = self.viz_points_cpu[mask]
+                forces_subset = f_cpu[mask]
+                
+                # Add force glyphs (arrows)
+                self.force_glyphs_actor = self.viz_plotter.add_arrows(
+                    points_subset,
+                    forces_subset,
+                    scale=scale_factor,  # Dynamic scaling based on mesh size and force magnitude
+                    color='yellow',      # Make arrows stand out
+                    opacity=0.8,         # Semi-transparent
+                    line_width=2
+                )
+            else:
+                self.force_glyphs_actor = None  # No significant forces to display
+            
             # Update left info text - REMOVE AND RE-ADD ACTOR
             left_text = f"Sample: {sample_idx+1}\nMax F: {force_mag.max():.2e}"
             if strain_energy is not None: left_text += f"\nStrain E: {strain_energy:.2e}"
@@ -3405,6 +3439,7 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
                 shadow=True
             )
             
+            # --- Rest of the method (Deformation visualization, etc.) remains unchanged ---
             # --- Right Plot Update (Deformation) ---
             self.viz_plotter.subplot(0, 1)
             # Create a fresh copy for deformation
