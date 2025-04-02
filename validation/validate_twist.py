@@ -354,7 +354,6 @@ class DynamicValidator:
         
         try:
             # Set up for visualization similar to twisting_beam.py
-            pyvista.set_jupyter_backend("static")
             topology, cell_types, x = plot.vtk_mesh(self.routine.V)
             self.grid = pyvista.UnstructuredGrid(topology, cell_types, x)
             self.x = x  # Store x coordinates for later use
@@ -1301,7 +1300,7 @@ def main():
     parser = argparse.ArgumentParser(description='Dynamic validation for Neural Plates')
     parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path')
     parser.add_argument('--checkpoint', type=str, default='checkpoints/best.pt', help='checkpoint path')
-    parser.add_argument('--steps', type=int, default=100, help='number of simulation steps (default: 100 as in twisting_beam.py)')
+    parser.add_argument('--steps', type=int, default=500, help='number of simulation steps (default: 100 as in twisting_beam.py)')
     parser.add_argument('--time', type=float, default=2.4, help='total simulation time (matches twisting_beam.py)')
     parser.add_argument('--torque', type=float, default=1.0e4, help='torque magnitude (matches twisting_beam.py)')
     parser.add_argument('--damping', type=float, default=0.01, help='damping coefficient')
@@ -1324,6 +1323,9 @@ def main():
         logger.info("Checkpoint loaded successfully")
     else:
         logger.warning(f"Checkpoint not found at {args.checkpoint}, using untrained model")
+
+    if not os.path.exists(args.output):
+        os.makedirs(args.output)
 
     # Run visualization tests
     try:

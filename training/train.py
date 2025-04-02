@@ -12,7 +12,7 @@ from dolfinx.fem import form
 from ufl import TrialFunction, TestFunction, inner, dx, grad, sym, Identity, div
 
 import traceback
-from scipy import sparse
+from scipy import sparse as sp
 
 
 
@@ -31,7 +31,7 @@ import gmsh
 from mpi4py import MPI
 import ufl
 from scipy.linalg import eig
-from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy, UFLNeoHookeanModel
+from tests.solver import EnergyModel, ModularNeoHookeanEnergy, UFLNeoHookeanModel
 
 # Add after imports
 from slepc4py import SLEPc
@@ -245,7 +245,10 @@ class Routine:
         # print("Loading linear eigenmodes...")
         self.linear_modes = self.compute_linear_modes()
         self.linear_modes = torch.tensor(self.linear_modes, device=self.device).double()
-        # print("Linear eigenmodes loaded.")
+        #remove the first 6 modes
+        # print(f"Initial linear modes shape: {self.linear_modes.shape}")
+        # self.linear_modes = self.linear_modes[:, 6:]
+        print(f"Linear eigenmodes loaded. Shape: {self.linear_modes.shape}")
 
         # print("Loading neural network...")
         self.num_modes = self.latent_dim  # Make them the same
@@ -254,9 +257,9 @@ class Routine:
         hid_dim = cfg['model'].get('hid_dim', 64)
         # print(f"Output dimension: {output_dim}")
         # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        self.model = Net(self.latent_dim, output_dim, hid_layers, hid_dim).to(device).double()
+        self.model = Net(self.num_modes, output_dim, hid_layers, hid_dim).to(device).double()
 
-        # print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
+        print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
 
         # Tensorboard setup
@@ -269,7 +272,9 @@ class Routine:
     
 
     def compute_linear_modes(self):
-        # print("Computing linear modes with FEniCS...")
+        """Compute linear eigenmodes with improved method from linear_modes.py"""
+        print("Computing linear modes with improved solver settings...")
+        
         # Get domain extents
         x_coords = self.domain.geometry.x
         x_min = x_coords[:, 0].min()
@@ -278,47 +283,33 @@ class Routine:
         y_max = x_coords[:, 1].max()
         z_min = x_coords[:, 2].min()
         z_max = x_coords[:, 2].max()
-        # print(f"Domain extents: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]")
+        print(f"Domain extents: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]")
 
         # Use the same function space as the main model
         V = self.V
         u_tr = TrialFunction(V)
         u_test = TestFunction(V)
 
-        
-        if isinstance(self.energy_calculator, ModularNeoHookeanEnergy):
-            # print("Using Neo-Hookean forms for linear modes")
-            
-            # Define strain tensor
-            def epsilon(u):
-                return sym(grad(u))
-
-            # Linearized Neo-Hookean stress tensor at undeformed state
-            def sigma(u):
-                return self.lambda_ * div(u) * Identity(3) + self.mu * (grad(u) + grad(u).T)
-                
-            a_form = inner(sigma(u_tr), epsilon(u_test)) * dx
-            m_form = self.rho * inner(u_tr, u_test) * dx
-            
+        # Set up forms based on energy calculator type
+        if hasattr(self, 'energy_calculator') and hasattr(self.energy_calculator, 'type'):
+            print(f"Using {self.energy_calculator.type} forms for linear modes")
         else:
-            # print("Using standard linear elasticity forms for linear modes")
-            
-            # Default to linear elasticity forms
-            def epsilon(u):
-                return sym(grad(u))
-
-            def sigma(u):
-                return self.lambda_ * div(u) * Identity(3) + 2 * self.mu * epsilon(u)
-                
-            a_form = inner(sigma(u_tr), epsilon(u_test)) * dx
-            m_form = self.rho * inner(u_tr, u_test) * dx
-
-        x_coordinates = self.domain.geometry.x
-        x_min = np.min(x_coordinates[:, 0])
-        y_min = np.min(x_coordinates[:, 1])
-        x_min_tol = 1e-10  # Tolerance for identifying boundary nodes
+            print("Using standard linear elasticity forms for linear modes")
         
-        # Create boundary condition function
+        # Define strain tensor
+        def epsilon(u):
+            return sym(grad(u))
+
+        # Linear elasticity stress tensor
+        def sigma(u):
+            return self.lambda_ * div(u) * Identity(3) + 2 * self.mu * epsilon(u)
+            
+        # Define stiffness and mass forms
+        a_form = inner(sigma(u_tr), epsilon(u_test)) * dx
+        m_form = self.rho * inner(u_tr, u_test) * dx
+
+        # Define boundary condition at fixed end (x_min)
+        x_min_tol = 1e-10
         def x_min_boundary(x):
             return np.isclose(x[0], x_min, atol=x_min_tol)
         
@@ -330,82 +321,162 @@ class Routine:
         boundary_dofs = fem.locate_dofs_geometrical(self.V, x_min_boundary)
         bc = fem.dirichletbc(u_fixed, boundary_dofs)
         
-        # print("Assembling A matrix")
-        A = assemble_matrix_petsc(form(a_form), bcs=[bc])
+        # ---- Assemble matrices WITHOUT boundary conditions (new approach) ----
+        print("Assembling A matrix WITHOUT boundary conditions")
+        A = assemble_matrix_petsc(form(a_form)) # No bcs here
         A.assemble()
-        self.A = A
         
-        # print("Assembling M matrix")
-        M = assemble_matrix_petsc(form(m_form))
+        print("Assembling M matrix WITHOUT boundary conditions")
+        M = assemble_matrix_petsc(form(m_form)) # No bcs here
         M.assemble()
-        self.M = M
+        
+        # ---- Apply boundary conditions AFTER assembly to preserve symmetry ----
+        print("Applying boundary conditions symmetrically with zeroRowsColumns")
+        constrained_dofs = bc.dof_indices()[0]
+        
+        if constrained_dofs.size > 0:
+            A.zeroRowsColumns(constrained_dofs, diag=1.0)
+            M.zeroRowsColumns(constrained_dofs, diag=0.0)
+            print(f"Applied zeroRowsColumns to {constrained_dofs.size} DOFs")
+        else:
+            print("Warning: No constrained DOFs found, check boundary condition setup")
+        
+        # ---- Check symmetry ----
+        is_A_sym = A.isSymmetric(tol=1e-9)
+        is_M_sym = M.isSymmetric(tol=1e-9)
+        print(f"Stiffness matrix A is symmetric: {is_A_sym}")
+        print(f"Mass matrix M is symmetric: {is_M_sym}")
+        if not is_A_sym or not is_M_sym:
+            print("WARNING: Matrices are not symmetric! Eigenvalue solver may fail or give incorrect results.")
+        
+        # ---- Optional: Create hybrid mass matrix (improved approach) ----
+        use_hybrid_mass = True  # Set to False to use consistent mass matrix
+        lumping_ratio = 0.4     # Ratio of lumped mass (0=consistent, 1=fully lumped)
+        
+        if use_hybrid_mass:
+            print(f"Creating hybrid mass matrix with lumping ratio {lumping_ratio}")
+            # Convert M to SciPy CSR for lumping calculations
+            ai, aj, av = M.getValuesCSR()
+            M_scipy_consistent = sp.csr_matrix((av, aj, ai), shape=M.getSize())
 
-        # print("Matrices assembled")
+            # Create a fully lumped mass matrix (diagonal only)
+            lumped_diag = np.array(M_scipy_consistent.sum(axis=1)).flatten()
+            M_scipy_lumped = sp.diags(lumped_diag, format='csr')
 
-        # Setup eigensolver - USE LINEAR_MODES.PY CONFIGURATION
-        # print("Creating main eigensolver")
+            # Blend the matrices
+            M_scipy_hybrid = M_scipy_lumped * lumping_ratio + M_scipy_consistent * (1 - lumping_ratio)
+
+            # Preserve total mass
+            total_mass_consistent = M_scipy_consistent.sum()
+            total_mass_hybrid = M_scipy_hybrid.sum()
+            if total_mass_hybrid > 1e-15:
+                mass_scaling = total_mass_consistent / total_mass_hybrid
+                M_scipy_hybrid = M_scipy_hybrid * mass_scaling
+                print(f"Hybrid mass matrix scaled by {mass_scaling:.4f} to preserve total mass")
+            else:
+                print("Warning: Hybrid mass matrix has near-zero total mass, skipping scaling")
+
+            # Convert back to PETSc
+            M_hybrid_petsc = PETSc.Mat().createAIJ(size=M_scipy_hybrid.shape,
+                                    csr=(M_scipy_hybrid.indptr, M_scipy_hybrid.indices, M_scipy_hybrid.data))
+            M_hybrid_petsc.assemble()
+            M_final = M_hybrid_petsc
+            print("Hybrid mass matrix created and converted to PETSc")
+        else:
+            M_final = M
+            print("Using consistent mass matrix")
+        
+        # Store for later use
+        self.A = A
+        self.M = M_final
+        
+        # ---- Setup eigensolver with improved settings ----
+        print("Creating eigensolver with improved settings")
         eigensolver = SLEPc.EPS().create(self.domain.comm)
-        eigensolver.setOperators(A, M)
+        eigensolver.setOperators(A, M_final)
         eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
         eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
 
-        # Change back to TARGET_MAGNITUDE with a small non-zero target
+        # Use target magnitude with a small positive target
         eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)  
-        eigensolver.setTarget(0.001)  # Small positive target value
+        eigensolver.setTarget(0.001)  # Small positive target
 
+        # Use spectral transformation for better convergence
         st = eigensolver.getST()
-        st.setType(SLEPc.ST.Type.SINVERT)  
+        st.setType(SLEPc.ST.Type.SINVERT)
         st.setShift(0.0)
 
-        # Set explicit dimensions to increase chances of convergence
-        eigensolver.setDimensions(self.latent_dim*2, PETSc.DECIDE)  # Request more to ensure we get enough
+        # Set dimensions with some extra padding
+        requested_modes = self.latent_dim * 2  # Request more to ensure we get enough
+        eigensolver.setDimensions(requested_modes, PETSc.DECIDE)
 
-        # Increase max iterations and tolerance
+        # Increase solver tolerance and max iterations
         eigensolver.setTolerances(tol=1e-6, max_it=1000)
 
-        # print("Solving eigenvalue problem...")
+        print(f"Solving eigenvalue problem for {requested_modes} requested modes...")
         eigensolver.solve()
-        # print("Eigenvalue problem solved")
-
-        # Extract eigenvectors and eigenvalues
-        nconv = eigensolver.getConverged()
-        # # print(f"Number of converged eigenvalues: {nconv}")
         
-        # Initialize arrays to store both
+        # ---- Extract eigenvectors and eigenvalues with improved filtering ----
+        nconv = eigensolver.getConverged()
+        print(f"Number of converged eigenvalues: {nconv}")
+        
+        # Initialize arrays to store valid modes
         modes = []
         eigenvalues = []
-        if self.latent_dim > nconv:
-            # print(f"WARNING: Requested {self.latent_dim} modes, but only {nconv} could be computed")
-            self.latent_dim = nconv
+        actual_modes_found = 0
         
-        for i in range(min(self.latent_dim, nconv)):
-            # Extract eigenvector
-            vr = A.createVecRight()
-            eigensolver.getEigenvector(i, vr)
-            modes.append(vr.array[:])
-            
-            # Extract eigenvalue (store for scaling)
+        # Prototype vector for extracting eigenvectors
+        vr = A.createVecRight()
+        
+        for i in range(nconv):
+            # Extract eigenvalue
             eigenvalue = eigensolver.getEigenvalue(i)
-            eigenvalues.append(eigenvalue.real)  # Keep only real part
+            lambda_real = eigenvalue.real
+            
+            # Filter out negative or near-zero eigenvalues (likely rigid body modes)
+            if lambda_real < 1e-9:
+                print(f"  Skipping eigenvalue {i+1}: Near-zero or negative ({lambda_real:.4e})")
+                continue
+            
+            # Extract eigenvector for valid eigenvalue
+            eigensolver.getEigenvector(i, vr)
+            
+            # Store valid eigenvalue and eigenvector
+            eigenvalues.append(lambda_real)
+            modes.append(vr.array.copy())
             
             # Display frequency information
-            frequency = np.sqrt(np.abs(eigenvalue.real)) / (2 * np.pi)  # Convert to Hz
-            # print(f"Eigenvalue {i+1}: {eigenvalue.real:.6e}, Frequency: {frequency:.4f} Hz")
+            frequency = np.sqrt(lambda_real) / (2 * np.pi)  # Convert to Hz
+            print(f"  Mode {actual_modes_found+1}: λ={lambda_real:.6e}, Frequency: {frequency:.4f} Hz")
+            
+            actual_modes_found += 1
+            
+            # Stop once we have enough modes
+            if actual_modes_found >= self.latent_dim:
+                break
         
-        # Store eigenvalues for later use in scaling
-        self.eigenvalues = np.array(eigenvalues)
-        # print(f"Eigenvalues: {self.eigenvalues}")
+        print(f"Successfully extracted {actual_modes_found} valid eigenmodes")
+        
+        # Handle insufficient modes case
+        if actual_modes_found < self.latent_dim:
+            print(f"WARNING: Requested {self.latent_dim} modes, but only found {actual_modes_found}")
+            print("Reducing latent dimension to match number of modes found")
+            self.latent_dim = actual_modes_found
         
         # Handle case when no modes are found
         if len(modes) == 0:
-            # print("ERROR: No modes could be computed. Using random initialization.")
-            # Create random modes and eigenvalues as fallback
+            print("ERROR: No valid modes could be computed. Using random initialization.")
             random_modes = np.random.rand(A.getSize()[0], self.latent_dim)
             self.eigenvalues = np.ones(self.latent_dim)  # Default eigenvalues
             return random_modes
         
+        # Store eigenvalues for later use in scaling
+        self.eigenvalues = np.array(eigenvalues)
+        print(f"Eigenvalues: {self.eigenvalues}")
+        
+        # Return modal matrix
         linear_modes = np.column_stack(modes)
-        # print(f"Shape of linear_modes: {linear_modes.shape}")
+        print(f"Shape of linear_modes: {linear_modes.shape}")
         return linear_modes
     
 
@@ -492,7 +563,7 @@ class Routine:
         X = X.view(1, -1).expand(batch_size, -1)
         
         # Use a subset of linear modes (you might need to adjust indices)
-        L = self.latent_dim  # Use at most 3 linear modes
+        L = self.num_modes  # Use at most 3 linear modes
         linear_modes = self.linear_modes[:, :L]  # Use the first L modes
         
         # Setup iteration counter and best loss tracking
@@ -555,12 +626,12 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 0.5
-                deformation_scale_final = 3
+                deformation_scale_final = 10
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
-                mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)
+                mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
                 mode_scales = mode_scales * current_scale
                 mode_scales[-1] *= 2  # Increase scale for last mode
 
@@ -1070,7 +1141,7 @@ class Routine:
             row_idx = num_points - 1 - i  # Reverse order for proper cartesian layout
             for j, val2 in enumerate(values):
                 # Create latent vector with fixed values except for the two selected dims
-                z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
+                z = torch.zeros(self.num_modes, device=self.device, dtype=torch.float64)
                 z[dim1] = val1
                 z[dim2] = val2
                 
@@ -1154,7 +1225,7 @@ class Routine:
         
         # Determine which modes to show
         if modes_to_show is None:
-            modes_to_show = list(range(self.latent_dim))
+            modes_to_show = list(range(self.num_modes))
         
         num_modes = len(modes_to_show)
         
@@ -1181,7 +1252,7 @@ class Routine:
         for i, mode_idx in enumerate(modes_to_show):
             for j, val in enumerate(values):
                 # Create a zero latent vector
-                z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
+                z = torch.zeros(self.num_modes, device=self.device, dtype=torch.float64)
                 
                 # Set only the current mode to the current value
                 z[mode_idx] = val

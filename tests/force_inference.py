@@ -12,7 +12,7 @@ from dolfinx.nls.petsc import NewtonSolver
 import ufl
 from dolfinx.io import gmshio
 import pyvista
-from training.solver import ModernFEMSolver, NeoHookeanEnergyModel
+from tests.solver import ModularNeoHookeanEnergy, UFLNeoHookeanModel, ModernFEMSolver, FullFEMSolver, DifferentiableFEMSolverIFT
 
 import time
 import sys
@@ -134,13 +134,13 @@ class FEMDataGenerator:
         self.elements_tensor = torch.tensor(elements_list, device=self.device, dtype=torch.long)
         
         # Now create the NeoHookeanEnergyModel
-        self.neohookean_model = NeoHookeanEnergyModel(
-            coordinates=self.coordinates_tensor,
-            elements=self.elements_tensor,
-            young_modulus=self.E,
-            poisson_ratio=self.nu,
+        self.neohookean_model = UFLNeoHookeanModel(
+            domain=self.domain,  
+            degree=1,  # Add degree parameter (use 1 for linear elements)
+            E=self.E,  # Change young_modulus to E
+            nu=self.nu,  # Change poisson_ratio to nu
             device=self.device,
-            precompute=True
+            precompute_matrices=True  # Change precompute to precompute_matrices
         )
                 
 
@@ -876,7 +876,6 @@ class ForceInferenceTrainer:
         self.output_dir = output_dir
         self.config_path = config_path
         self.mesh_filename = mesh_filename
-        self
         self.coordinates = coordinates
         self.elements = elements
         self.input_dim = input_dim
@@ -925,6 +924,8 @@ class ForceInferenceTrainer:
         
         # Create Routine object for energy calculations
         self.routine = Routine(self.cfg)
+
+        self.domain = self.routine.domain
         
         # Convert to tensors
         self.displacements_tensor = torch.tensor(self.displacements, dtype=torch.float64, device=self.device)
@@ -1141,20 +1142,23 @@ class ForceInferenceTrainer:
         mse_criterion = torch.nn.MSELoss()
         
         # Create energy model and solver
-        neohookean_model = NeoHookeanEnergyModel(
-            coordinates=self.coordinates,
-            elements=self.elements,
-            young_modulus=youngs_modulus,
-            poisson_ratio=poissons_ratio,
+        neohookean_model = UFLNeoHookeanModel(
+            domain=self.domain,  
+            degree=1,  # Add degree parameter (use 1 for linear elements)
+            E=self.routine.E,  # Change young_modulus to E
+            nu=self.routine.nu,  # Change poisson_ratio to nu
             device=self.device,
-            precompute=True
+            precompute_matrices=True  # Change precompute to precompute_matrices
         )
 
-        diff_solver = ModernFEMSolver(
+        diff_solver = DifferentiableFEMSolverIFT(
             energy_model=neohookean_model,
             max_iterations=10,
             tolerance=1e-8,
-            energy_tolerance=1e-8,
+            cg_max_iter=500,
+            cg_tol=1e-3,
+            cg_max_iter_backward=500,
+            cg_tol_backward=1e-4,
             verbose=False,
             visualize=True,
             filename=self.mesh_filename
@@ -1235,10 +1239,11 @@ class ForceInferenceTrainer:
                 indices = torch.randperm(pred_forces_with_bcs.shape[0])[:solver_batch_size]
                 pred_forces_subset = pred_forces_with_bcs[indices]
                 disp_gt_subset = batch_displacements_denorm[indices]
-                disp_gt_noise = disp_gt_subset + torch.randn_like(disp_gt_subset) * 1e-3
+                disp_gt_noise = disp_gt_subset + torch.randn_like(disp_gt_subset) * 1e-2
                 
                 # Solve for displacements - solver handles boundary conditions internally
-                predicted_displacements = diff_solver(pred_forces_subset, disp_gt_noise)
+                #list diff_solver methods
+                predicted_displacements = diff_solver(pred_forces_subset)
                 
                 # Physics-based loss using weighted displacement
                 displacement_consistency_loss = mse_criterion(
