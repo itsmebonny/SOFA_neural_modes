@@ -12,7 +12,7 @@ from dolfinx.nls.petsc import NewtonSolver
 import ufl
 from dolfinx.io import gmshio
 import pyvista
-from tests.solver import ModularNeoHookeanEnergy, UFLNeoHookeanModel, ModernFEMSolver, FullFEMSolver, DifferentiableFEMSolverIFT
+from tests.solver import ModularNeoHookeanEnergy, UFLNeoHookeanModel, FullFEMSolver, DifferentiableFEMSolverIFT
 
 import time
 import sys

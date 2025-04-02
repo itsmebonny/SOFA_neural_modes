@@ -1576,424 +1576,6 @@ class SmoothBoundaryConditionManager:
         return penalty_energy
 
 
-class ModernFEMSolver(torch.nn.Module):
-    """
-    Modern Finite Element Method (FEM) solver using PyTorch for automatic differentiation.
-    This solver is designed for nonlinear solid mechanics problems with Neo-Hookean materials.
-    
-    Args:
-        energy_model: Energy model for the material behavior
-        max_iterations: Maximum number of iterations for the nonlinear solver
-        tolerance: Convergence tolerance for the nonlinear solver
-        energy_tolerance: Energy convergence tolerance for the nonlinear solver
-        verbose: Whether to print detailed solver information
-        visualize: Whether to visualize the solver progress
-        filename: Filename for mesh visualization (optional)
-    """
-    def __init__(self, energy_model, max_iterations=20, tolerance=1e-8,
-                energy_tolerance=1e-8, verbose=True, visualize=False, filename=None):
-        super().__init__()
-
-        # Store energy model
-        self.energy_model = energy_model
-        
-        # Store original parameters
-        self.max_iterations = max_iterations
-        self.tolerance = tolerance
-        self.energy_tolerance = energy_tolerance
-        self.verbose = verbose
-        
-        # Store device and problem size
-        self.device = energy_model.device
-        self.dtype = energy_model.dtype
-        self.num_nodes = energy_model.num_nodes
-        self.dim = energy_model.dim
-        self.dof_count = self.num_nodes * self.dim
-        self.gt_disp = None
-        
-        # Create boundary condition manager
-        self.bc_manager = SmoothBoundaryConditionManager(device=self.device)
-        
-        # Boundary conditions
-        self.fixed_dofs = torch.tensor([], dtype=torch.long, device=self.device)
-        self.fixed_values = torch.tensor([], dtype=self.dtype, device=self.device)
-
-        # Visualization flag
-        self.visualize = visualize
-        if self.visualize:
-            self._setup_visualization(filename)
-            
-            # Initialize additional actors for ground truth visualization
-            self.gt_actor = None
-            self.error_text_actor = None
-    
-    def forward(self, external_forces, u0=None):
-        """
-        Solve nonlinear system for a batch of forces
-        
-        Args:
-            external_forces: External forces to apply
-            u0: Initial displacement guess (optional)
-            gt_disp: Ground truth displacement for comparison visualization (optional)
-        
-        Returns:
-            Displacement solution
-        """
-        # Try to solve with standard approach
-        return self._solve_with_torch_lbfgs(external_forces, u0)
-
-    
-    def apply_boundary_conditions(self, u_batch):
-        """Apply boundary conditions to displacement field"""
-        return self.bc_manager.apply(u_batch)
-
-    # Add methods to set boundary conditions
-    def set_fixed_dofs(self, indices, values):
-        """Set fixed DOFs with their values"""
-        self.bc_manager.set_fixed_dofs(indices, values)
-
-    def set_disp_gt(self, disp_gt):
-        self.gt_disp = disp_gt
-    
-    
-    def _solve_with_torch_lbfgs(self, external_forces, u0=None, history_size=50, max_iter=50):
-        """Use PyTorch's built-in L-BFGS optimizer for FEM solving"""
-        # Initialize displacement
-        batch_size = external_forces.shape[0]
-        
-        # Process each sample individually for better control
-        solutions = []
-        
-        for i in range(batch_size):
-            # Get single sample (keeping batch dimension)
-            f_i = external_forces[i:i+1]
-
-            # Get corresponding ground truth if provided
-            gt_disp_i = None
-            if self.gt_disp is not None:
-                gt_disp_i = self.gt_disp[i:i+1]
-            
-            # Initialize displacement for this sample
-            if u0 is None:
-                # Initialize with small random displacements instead of zeros
-                u_i = torch.randn_like(f_i) * 0.1
-                u_i.requires_grad_(True)
-            else:
-                u_i = u0[i:i+1].clone().detach().requires_grad_(True)
-            
-            # Apply boundary conditions
-            u_i = self.apply_boundary_conditions(u_i)
-            
-            # Create optimizer
-            optimizer = torch.optim.LBFGS([u_i], 
-                            lr=1,
-                            max_iter=max_iter,
-                            history_size=history_size,
-                            line_search_fn='strong_wolfe',
-                            max_eval=100,  # Add this - limits function evaluations
-                            tolerance_grad=self.tolerance,  # Relax tolerance
-                            tolerance_change=self.energy_tolerance)  # Relax tolerance
-            
-            # Convergence tracking
-            initial_energy = None
-            iter_count = 0
-            
-            # Optimization closure
-            # Inside _solve_with_torch_lbfgs method, in the closure function:
-            def closure():
-                nonlocal iter_count, initial_energy
-                optimizer.zero_grad()
-                
-                # Compute strain energy
-                strain_energy = self.energy_model.compute_energy(u_i)
-                
-                # Compute external work
-                external_work = torch.sum(f_i * u_i, dim=1)
-                
-                # Compute BC penalty
-                bc_penalty = self.bc_manager.compute_penalty_energy(u_i)
-                
-                # CORRECT: Direct potential energy - no squaring, no artificial penalties
-                energy_functional = strain_energy - external_work
-
-                # compute the gradient of the total energy
-                energy_grad = torch.autograd.grad(energy_functional, u_i, create_graph=True)[0]
-
-                grad_norm = torch.norm(energy_grad)
-                
-                # Compute force-based convergence metrics
-                internal_forces = torch.autograd.grad(energy_functional, u_i, create_graph=True)[0]
-                residual = f_i - internal_forces
-
-                fixed_dofs_mask = torch.zeros_like(residual, dtype=torch.bool)
-                for dof in self.bc_manager.fixed_dofs:
-                    fixed_dofs_mask[:, dof] = True
-
-                # Apply mask (keep only free DOF residuals)
-                filtered_residual = residual * (~fixed_dofs_mask)
-
-                # Compute proper norm (only considering free DOFs)
-                free_dof_count = residual.numel() - self.bc_manager.fixed_dofs.numel()
-                free_dof_count = torch.tensor(free_dof_count, device=self.device, dtype=self.dtype)
-                filtered_residual_norm = torch.norm(filtered_residual) / torch.sqrt(free_dof_count)
-                                    
-                objective = 1000 * torch.sum(filtered_residual**2) + bc_penalty
-
-             
-                
-                # Store original energy for logging
-                original_energy = energy_functional + bc_penalty 
-               
-
-                # Compute energy ratio with tensor operations (absolute values)
-                if iter_count == 0:
-                    initial_energy = energy_functional.clone()
-                else:
-                    # Add small epsilon to prevent division by zero
-                    energy_ratio = energy_functional.abs() / (initial_energy + 1e-10)
-                    # Scale large ratios using tensor operations
-                    energy_ratio = torch.where(
-                        energy_ratio > 10.0,
-                        torch.log10(energy_ratio) + 1.0,
-                        energy_ratio
-                    )
-                
-                
-                # For logging
-                if self.verbose and iter_count % 1 == 0:
-                   print(f"Sample {i+1}: iter {iter_count}, residual={filtered_residual_norm.item():.2e}, "
-                        f"orig_energy={original_energy.item():.2e}, energy={energy_functional.item():.2e}, "
-                        f"energy_ratio={energy_ratio.item():.4f}, ext_work={external_work.item():.2e}")
-                    
-                # Update visualization if enabled
-                if self.visualize and iter_count % 5 == 0:
-                    self._update_visualization(
-                        u_i, f_i, i, iter_count,
-                        filtered_residual_norm.item(), energy_functional.item(), grad_norm.item(),
-                        strain_energy.item(), external_work.item(),
-                        gt_disp=gt_disp_i  # Pass ground truth to visualization
-                    )
-                                
-                # Compute gradient
-                objective.backward(retain_graph=True)
-                
-                iter_count += 1
-                return objective
-
-
-            optimizer.step(closure)
-            
-            
-            # Store solution
-            solutions.append(u_i.detach())
-        
-        # Stack solutions back into batch
-        return torch.cat(solutions, dim=0)
-        
-    
-    def _setup_visualization(self, filename=None):
-        """Set up real-time visualization for solver progress"""
-        # Convert mesh to PyVista format
-        domain, _, _ = gmshio.read_from_msh(filename, MPI.COMM_WORLD, gdim=3)
-        topology, cell_types, x = plot.vtk_mesh(domain)
-        self.viz_grid = pyvista.UnstructuredGrid(topology, cell_types, x)
-        
-        # Create plotter with two viewports
-        self.viz_plotter = pyvista.Plotter(shape=(1, 2), 
-                                          title="FEM Solver Visualization",
-                                          window_size=[1200, 600], 
-                                          off_screen=False)
-        
-        # Initialize initial and deformed mesh actors
-        self.viz_plotter.subplot(0, 0)
-        self.viz_plotter.add_text("Applied Forces", position="upper_right", font_size=12)
-        self.mesh_actor_left = self.viz_plotter.add_mesh(self.viz_grid, color='lightblue', show_edges=True)
-        
-        self.viz_plotter.subplot(0, 1)
-        self.viz_plotter.add_text("Deformed Configuration", position="upper_right", font_size=10)
-        self.mesh_actor_right = self.viz_plotter.add_mesh(self.viz_grid, color='lightblue', show_edges=True)
-        
-        # Add info text for solver status
-        self.info_actor = self.viz_plotter.add_text("Initializing solver...", position=(0.02, 0.02), font_size=10)
-        
-        # Link camera views
-        self.viz_plotter.link_views()
-        
-        # Show the window without blocking
-        self.viz_plotter.show(interactive=False, auto_close=False)
-        
-    def _update_visualization(self, u_i, f_i, i, iter_count, residual_norm, energy, energy_ratio, 
-                        strain_energy=None, external_work=None, gt_disp=None):
-        """Update real-time visualization with current solver state and force field"""
-        if not hasattr(self, 'viz_plotter') or not self.visualize:
-            return
-            
-        try:
-            # Cache CPU arrays once at initialization time
-            if not hasattr(self, 'viz_points_cpu'):
-                # Store original points as numpy array once
-                self.viz_points_cpu = self.viz_grid.points.copy()
-                
-            # Move tensors to CPU only once per update
-            with torch.no_grad():  # Avoid tracking history
-                u_cpu = u_i.detach().cpu()
-                f_cpu = f_i.detach().cpu()
-                
-                # Convert ground truth if provided
-                gt_array = None
-                if gt_disp is not None:
-                    gt_cpu = gt_disp.detach().cpu()
-                    gt_array = gt_cpu.numpy().reshape(-1, 3)
-                
-                # Reshape once
-                u_array = u_cpu.numpy().reshape(-1, 3)
-                f_array = f_cpu.numpy().reshape(-1, 3)
-            
-            # Create a new grid for forces (left viewport)
-            force_grid = self.viz_grid.copy()
-            force_grid.point_data["Forces"] = f_array
-            force_mag = np.linalg.norm(f_array, axis=1)
-            force_grid["force_magnitude"] = force_mag
-            
-            # Create a deformed grid for displacements (right viewport)
-            deformed_grid = self.viz_grid.copy()
-            # Use cached points instead of accessing self.viz_grid.points again
-            deformed_grid.points = self.viz_points_cpu + u_array
-            
-            # Compute displacement magnitude for coloring
-            displacement_magnitude = np.linalg.norm(u_array, axis=1)
-            deformed_grid["displacement"] = displacement_magnitude
-
-            if hasattr(self, 'info_actor'):
-                self.viz_plotter.remove_actor(self.info_actor)
-            
-            # Update left viewport with force visualization and strain energy data
-            self.viz_plotter.subplot(0, 0)
-            self.viz_plotter.remove_actor(self.mesh_actor_left)
-            self.mesh_actor_left = self.viz_plotter.add_mesh(
-                force_grid, 
-                scalars="force_magnitude",
-                cmap="plasma",
-                show_edges=True,
-                clim=[0, np.max(force_mag) if np.max(force_mag) > 0 else 1.0]
-            )
-            
-            # Create strain energy text for left subplot
-            if strain_energy is not None:
-                strain_energy_text = (
-                    f"Strain Energy: {strain_energy:.2e}\n"
-                    f"External Work: {external_work:.2e}\n"
-                    f"Force Magnitude: {np.max(force_mag):.2e}\n"
-                    f"SE/EW: {strain_energy / external_work:.2e}\n"
-                    f"Sample: {i+1}, Iter: {iter_count}\n"
-                )
-                
-                # Remove old text if it exists
-                if hasattr(self, 'strain_text_actor'):
-                    self.viz_plotter.remove_actor(self.strain_text_actor)
-                    
-                # Add strain energy text to left subplot
-                self.strain_text_actor = self.viz_plotter.add_text(
-                    strain_energy_text, 
-                    position="upper_left",
-                    font_size=10, 
-                    color='black',
-                    shadow=True
-                )
-            
-            # Update right viewport with deformed mesh and external work data
-            self.viz_plotter.subplot(0, 1)
-            self.viz_plotter.remove_actor(self.mesh_actor_right)
-            self.mesh_actor_right = self.viz_plotter.add_mesh(
-                deformed_grid, 
-                scalars="displacement",
-                cmap="viridis",
-                show_edges=True,
-                clim=[0, np.max(displacement_magnitude) if np.max(displacement_magnitude) > 0 else 1.0]
-            )
-            
-            # Add ground truth wireframe if provided
-            if gt_array is not None:
-                # Remove old ground truth if it exists
-                if hasattr(self, 'gt_actor'):
-                    self.viz_plotter.remove_actor(self.gt_actor)
-                
-                # Create ground truth mesh
-                gt_grid = self.viz_grid.copy()
-                gt_grid.points = self.viz_points_cpu + gt_array
-                
-                # Add as wireframe
-                self.gt_actor = self.viz_plotter.add_mesh(
-                    gt_grid,
-                    style='wireframe',
-                    color='red',
-                    line_width=2,
-                    opacity=0.7
-                )
-                
-                # Calculate error between current and ground truth
-                error = np.linalg.norm(u_array - gt_array, axis=1)
-                mean_error = np.mean(error)
-                max_error = np.max(error)
-                
-                # Add error information to the visualization
-                error_text = (
-                    f"GT Comparison:\n"
-                    f"Mean Error: {mean_error:.2e}\n"
-                    f"Max Error: {max_error:.2e}\n"
-                )
-                
-                # Remove old error text if it exists
-                if hasattr(self, 'error_text_actor'):
-                    self.viz_plotter.remove_actor(self.error_text_actor)
-                    
-                # Add error text
-                self.error_text_actor = self.viz_plotter.add_text(
-                    error_text,
-                    position="lower_right",
-                    font_size=10,
-                    color='red',
-                    shadow=True
-                )
-            
-            # Create external work text for right subplot
-            if external_work is not None:
-                external_work_text = (
-                    f"Max Displacement: {np.max(displacement_magnitude):.2e}\n"
-                    f"Energy Functional: {energy:.2f}\n"
-                    f"Energy Gradient: {energy_ratio:.4f}\n"
-                    f"Residual: {residual_norm:.2e}\n"
-                )
-                
-                # Remove old text if it exists
-                if hasattr(self, 'work_text_actor'):
-                    self.viz_plotter.remove_actor(self.work_text_actor)
-                    
-                # Add external work text to right subplot
-                self.work_text_actor = self.viz_plotter.add_text(
-                    external_work_text, 
-                    position="upper_left",
-                    font_size=10,
-                    color='black',
-                    shadow=True
-                )
-            
-            # Render the updated scene
-            self.viz_plotter.update()
-            
-        except Exception as e:
-            print(f"Visualization error: {str(e)}")
-            import traceback
-            print(traceback.format_exc())
-
-
-
-
-    def close_visualization(self):
-        """Close the visualization window"""
-        if hasattr(self, 'viz_plotter') and self.viz_plotter is not None:
-            self.viz_plotter.close()
-
 # --- FullFEMSolver Class ---
 class FullFEMSolver(torch.nn.Module):
 
@@ -2821,8 +2403,8 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
         self.gt_mesh_actor = None
         self.info_actor_left = None
         self.info_actor_right = None
-        self._should_visualize = visualize 
-        self.force_glyphs_actor = None
+        self._should_visualize = visualize # Store intent
+        self.force_glyphs_actor = None 
 
         # --- Setup Visualization ONCE during initialization if requested ---
         # Setup only on rank 0 if running with MPI
@@ -3186,7 +2768,7 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
                 # Check for breakdown condition (denominator close to zero or negative)
                 # Indicates loss of positive definiteness or numerical instability
                 if pAp_dot <= 1e-12 * torch.dot(p.flatten(), p.flatten()):
-                    print(f"CG Warning: Breakdown condition met at iteration {i} (p^T*A*p = {pAp_dot.item():.3e} <= tolerance). Returning best solution found.")
+                    # print(f"CG Warning: Breakdown condition met at iteration {i} (p^T*A*p = {pAp_dot.item():.3e} <= tolerance). Returning best solution found.")
                     return best_x * (~fixed_dofs_mask)
 
                 alpha = rsold_sq / pAp_dot
@@ -3360,7 +2942,7 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
         if not self.visualize_active or self.viz_plotter is None:
             return
 
-        print(f"Updating visualization for iteration {iter_count}")  # Confirm function is called
+        # print(f"Updating visualization for iteration {iter_count}")  # Confirm function is called
 
         try:
             # --- Prepare Data (on CPU) ---
@@ -3391,39 +2973,42 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
                 show_edges=True,
                 clim=[0, np.max(force_mag) if np.max(force_mag) > 0 else 1.0]
             )
-            
-            # --- NEW: Add force glyphs ---
-            # First, remove old glyphs if they exist
+            # Remove old glyphs if they exist
             if hasattr(self, 'force_glyphs_actor') and self.force_glyphs_actor is not None:
                 self.viz_plotter.remove_actor(self.force_glyphs_actor)
                 
             # Only add glyphs where force magnitude is significant
-            # This avoids cluttering the view with tiny arrows
             force_threshold = np.max(force_mag) * 0.05  # 5% of max force
             mask = force_mag > force_threshold
-            
+
             if np.any(mask) and np.max(force_mag) > 1e-8:
-                # Scale factor for the arrows - adjust based on mesh size and forces
-                # Dynamically scale based on mesh bounds and max force
-                mesh_size = np.max(self.viz_grid.bounds[1::2] - self.viz_grid.bounds[::2])
-                scale_factor = mesh_size * 0.05 / (np.max(force_mag) + 1e-10)
+                # Scale factor for the arrows
+                bounds = np.array(self.viz_grid.bounds)
+                bounds_min = bounds[::2]  
+                bounds_max = bounds[1::2]  
+                mesh_size = np.max(bounds_max - bounds_min)
                 
                 # Create a subset of points and vectors for glyphs
-                # For very large meshes, we might want to downsample
                 points_subset = self.viz_points_cpu[mask]
                 forces_subset = f_cpu[mask]
                 
-                # Add force glyphs (arrows)
+                # IMPORTANT: Pre-scale the vectors instead of using 'scale' parameter
+                # Calculate scaling factor
+                scale_factor = mesh_size * 0.05 / (np.max(force_mag) + 1e-10)
+                # Pre-scale the vectors
+                scaled_forces = forces_subset * scale_factor
+                
+                # Add force glyphs WITHOUT using the scale parameter
                 self.force_glyphs_actor = self.viz_plotter.add_arrows(
                     points_subset,
-                    forces_subset,
-                    scale=scale_factor,  # Dynamic scaling based on mesh size and force magnitude
-                    color='yellow',      # Make arrows stand out
-                    opacity=0.8,         # Semi-transparent
+                    scaled_forces,  # Use pre-scaled vectors
+                    color='yellow',
+                    opacity=0.8,
                     line_width=2
                 )
             else:
-                self.force_glyphs_actor = None  # No significant forces to display
+                self.force_glyphs_actor = None
+
             
             # Update left info text - REMOVE AND RE-ADD ACTOR
             left_text = f"Sample: {sample_idx+1}\nMax F: {force_mag.max():.2e}"
@@ -3439,7 +3024,6 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
                 shadow=True
             )
             
-            # --- Rest of the method (Deformation visualization, etc.) remains unchanged ---
             # --- Right Plot Update (Deformation) ---
             self.viz_plotter.subplot(0, 1)
             # Create a fresh copy for deformation
@@ -3491,7 +3075,7 @@ class DifferentiableFEMSolverIFT(torch.nn.Module):
             # --- Force Rendering ---
             self.viz_plotter.render()  # Explicit render call
             self.viz_plotter.update(1)  # Process events
-            print(f"Visualization updated for iteration {iter_count}")
+            # print(f"Visualization updated for iteration {iter_count}")
 
         except Exception as e:
             print(f"\n[Viz Update Error] Iter {iter_count}: {str(e)}")
