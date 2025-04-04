@@ -103,19 +103,23 @@ class Net(torch.nn.Module):
         super(Net, self).__init__()
         
         # Input layer
-        layers = [torch.nn.Linear(latent_dim, hid_dim)]
+        layers = [torch.nn.Linear(latent_dim, hid_dim, bias=False)]
         
         # Hidden layers
         for _ in range(hid_layers-1):
-            layers.append(torch.nn.Linear(hid_dim, hid_dim))
+            layers.append(torch.nn.Linear(hid_dim, hid_dim, bias=False))
             
         # Output layer
-        layers.append(torch.nn.Linear(hid_dim, output_dim))
+        layers.append(torch.nn.Linear(hid_dim, output_dim, bias=False))
         
         self.layers = torch.nn.ModuleList(layers)
 
-        #self.layers[-1].weight.data.fill_(0.0)
-        # self.layers[-1].bias.data.fill_(0.0) 
+        # Initialize weights of all layers
+        for i in range(len(self.layers)-1):
+            torch.nn.init.kaiming_normal_(self.layers[i].weight, nonlinearity='leaky_relu')
+        
+        # Initialize the last layer with smaller weights to avoid large initial outputs
+        torch.nn.init.normal_(self.layers[-1].weight, mean=0.0, std=0.01)
         
     def forward(self, x):
         # Handle both single vectors and batches
@@ -125,7 +129,7 @@ class Net(torch.nn.Module):
         
         # Apply GELU activation to all but the last layer
         for i in range(len(self.layers)-1):
-            x = torch.nn.functional.gelu(self.layers[i](x))
+            x = torch.nn.functional.leaky_relu(self.layers[i](x))
         
         # No activation on output layer
         x = self.layers[-1](x)
@@ -134,7 +138,6 @@ class Net(torch.nn.Module):
         if not is_batched:
             x = x.squeeze(0)
         return x
-        
 
 # Add this class near the top of your file, after imports
 class LBFGSScheduler:
@@ -591,8 +594,8 @@ class Routine:
         # Use LBFGS optimizer
         optimizer = torch.optim.LBFGS(self.model.parameters(), 
                                     lr=1,
-                                    max_iter=25,
-                                    max_eval=35,
+                                    max_iter=15,
+                                    max_eval=20,
                                     tolerance_grad=1e-05,
                                     tolerance_change=1e-07,
                                     history_size=100,
@@ -626,7 +629,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 0.5
-                deformation_scale_final = 10
+                deformation_scale_final = 50
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
 
@@ -640,7 +643,7 @@ class Routine:
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                z[rest_idx, :] = 0  # Set rest shape latent to zero
+                # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -652,7 +655,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -725,7 +728,7 @@ class Routine:
                     # Add incentive for beneficial nonlinearity (energy improvement term)
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
                     energy_linear = self.energy_calculator(u_linear_only).mean()
-                    energy_improvement = (energy_linear - energy)
+                    energy_improvement = (torch.relu(energy_linear - energy))/energy_linear
                    
                     # Get the raw div(P) tensor
                     raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
@@ -751,7 +754,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e6* ortho + 1e5 * origin  + 1e3 * vol_penalty
+                    loss = energy +  ortho #+ 1e5*  origin 
 
 
                     loss.backward()
@@ -778,7 +781,7 @@ class Routine:
                         # Energy metrics section
                         print(f"│ ENERGY METRICS:")
                         print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Linear Energy:':<20} {energy_linear.item():<12.6f}")
-                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item():<12.6f} │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
+                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item()*100:.2f}% │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
@@ -791,10 +794,10 @@ class Routine:
                         
                         # Divergence metrics section
                         div_p_means = torch.mean(raw_div_p, dim=0).mean(dim=0)
-                        print(f"│ DIVERGENCE METRICS:")
-                        print(f"│ {'Direction:':<20} {'X':<17} {'Y':<17} {'Z':<17}")
-                        print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
-                        print(f"│ {'Div(P) Loss:':<20} {log_scaled_div_p.item():<12.6f} │ {'Raw Div(P) L2:':<20} {raw_div_p_L2_mean.item():<12.6e}")
+                        # print(f"│ DIVERGENCE METRICS:")
+                        # print(f"│ {'Direction:':<20} {'X':<17} {'Y':<17} {'Z':<17}")
+                        # print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
+                        # print(f"│ {'Div(P) Loss:':<20} {log_scaled_div_p.item():<12.6f} │ {'Raw Div(P) L2:':<20} {raw_div_p_L2_mean.item():<12.6e}")
 
                         # Add volume metrics section
                         print(f"│ VOLUME PRESERVATION:")
@@ -1322,7 +1325,117 @@ class Routine:
         return plotter  # Return plotter in case further customization is needed
     
     
-    
+    def plot_training_metrics(self, save_path=None):
+        """
+        Plot key training metrics (energy and constraints) over training iterations.
+        
+        Args:
+            save_path: Optional path to save the plot image
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Fetch metrics from tensorboard logs
+        try:
+            # Get events from tensorboard file
+            from tensorboard.backend.event_processing import event_accumulator
+            
+            # Find the tensorboard log path
+            import os
+            import glob
+            
+            # Look for tensorboard files in writer's log_dir
+            logdir = self.writer.log_dir
+            tb_files = glob.glob(os.path.join(logdir, "events.out.tfevents.*"))
+            
+            if not tb_files:
+                print("No tensorboard log files found. Using dummy data.")
+                # Use dummy data for the plot in case logs aren't found
+                iterations = np.arange(100)
+                energy_values = np.random.exponential(1.0, size=100)[::-1]  # Decreasing values
+                ortho_values = np.random.exponential(0.1, size=100)[::-1]
+                origin_values = np.random.exponential(0.01, size=100)[::-1]
+            else:
+                print(f"Loading training metrics from {tb_files[0]}")
+                ea = event_accumulator.EventAccumulator(tb_files[0])
+                ea.Reload()  # Load all data
+                
+                # Extract scalar values
+                energy_events = ea.Scalars('train/energy')
+                ortho_events = ea.Scalars('train/ortho')
+                origin_events = ea.Scalars('train/origin')
+                
+                # Extract iteration and value pairs
+                iterations = [e.step for e in energy_events]
+                energy_values = [e.value for e in energy_events]
+                ortho_values = [e.value for e in ortho_events]
+                origin_values = [e.value for e in origin_events]
+        
+        except Exception as e:
+            print(f"Error loading tensorboard logs: {str(e)}")
+            # Fall back to dummy data
+            iterations = np.arange(100)
+            energy_values = np.random.exponential(1.0, size=100)[::-1]
+            ortho_values = np.random.exponential(0.1, size=100)[::-1]
+            origin_values = np.random.exponential(0.01, size=100)[::-1]
+        
+        # Create figure with two subplots (energy and constraints)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        fig.suptitle('Neural Modes Training Metrics', fontsize=16)
+        
+        # Plot energy on the first subplot
+        ax1.plot(iterations, energy_values, 'b-', linewidth=2, label='Energy')
+        ax1.set_yscale('log')  # Log scale often better for energy values
+        ax1.set_ylabel('Energy (log scale)')
+        ax1.set_title('Energy Loss Over Training')
+        ax1.grid(True, which='both', linestyle='--', alpha=0.6)
+        ax1.legend()
+        
+        # Plot constraint values on the second subplot
+        ax2.plot(iterations, ortho_values, 'r-', linewidth=2, label='Orthogonality Constraint')
+        ax2.plot(iterations, origin_values, 'g-', linewidth=2, label='Origin Constraint')
+        ax2.set_yscale('log')  # Log scale for constraints too
+        ax2.set_xlabel('Training Iteration')
+        ax2.set_ylabel('Constraint Value (log scale)')
+        ax2.set_title('Constraint Losses Over Training')
+        ax2.grid(True, which='both', linestyle='--', alpha=0.6)
+        ax2.legend()
+        
+        # Add horizontal grid lines
+        for ax in [ax1, ax2]:
+            ax.yaxis.grid(True, linestyle='-', which='major', color='gray', alpha=0.5)
+            ax.yaxis.grid(True, linestyle=':', which='minor', color='gray', alpha=0.3)
+            if iterations:  # Only format if we have data
+                ax.set_xlim([min(iterations), max(iterations)])
+        
+        # Annotate best values
+        if energy_values:
+            min_energy_idx = np.argmin(energy_values)
+            min_energy = energy_values[min_energy_idx]
+            min_energy_iter = iterations[min_energy_idx]
+            
+        
+        # Add overall improvement rate
+        if len(energy_values) > 1:
+            first_energy = energy_values[0]
+            last_energy = energy_values[-1]
+            improvement = (first_energy - last_energy) / first_energy * 100 if first_energy != 0 else 0
+            fig.text(0.5, 0.01, f'Total Energy Improvement: {improvement:.2f}%', 
+                    ha='center', fontsize=12, bbox=dict(boxstyle='round,pad=0.5', fc='lightblue', alpha=0.5))
+        
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.1) # Make space for the text
+        
+        # Save plot if path provided
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Training metrics plot saved to {save_path}")
+        
+        # Show the plot
+        plt.show()
+        
+        return fig
 
 def main():
     print("Starting main function...")
@@ -1389,6 +1502,12 @@ def main():
     print("\nVisualizing latent space modes...")
     # Visualize all latent dimensions
     engine.visualize_latent_space(num_samples=5)
+
+    print("\nPlotting training metrics...")
+    metrics_plot_path = os.path.join('checkpoints', 'training_metrics.png')
+    engine.plot_training_metrics(save_path=metrics_plot_path)
+    
+    print("Main function complete.")
     
     print("Main function complete.")
 

@@ -120,13 +120,13 @@ class DynamicValidator:
         self.logger.info(f"Approximate beam volume: {self.beam_volume:.6f} m³")
 
             
-    def compute_gravity_term(self, u, t):
-        """Compute the virtual work of gravity force"""
+    def compute_gravity_term(self, u, t, use_reference=True):
+        """Compute the gravity potential energy with proper reference point."""
         # Skip if no gravity
         if self.gravity_magnitude == 0:
             return torch.tensor(0.0, device=self.device, dtype=torch.float64)
             
-        # Reshape u to get nodal displacements [n_nodes, 3]
+        # Reshape u to get nodal displacements
         u_reshaped = u.reshape(-1, 3)
         
         # Get original coordinates of the mesh
@@ -144,21 +144,25 @@ class DynamicValidator:
         gravity_potential = torch.tensor(0.0, device=self.device, dtype=torch.float64)
         
         # For each node, compute gravity contribution
-        node_mass = self.rho * self.beam_volume / len(coords)  # Simple approximation of node mass
+        node_mass = self.rho * self.beam_volume / len(coords)
         
-        for i, disp in enumerate(u_reshaped):
-            # Get absolute position (original position + displacement)
-            position = coords[i] + disp
-            
-            # Gravity potential is m*g*h, where h is absolute position in gravity direction
-            gravity_potential -= node_mass * current_magnitude * torch.dot(gravity_dir, position)
-            
+        # Calculate energy from displacements only, not initial positions
+        if use_reference:
+            # Just use the energy from displacement, not absolute position
+            for i, disp in enumerate(u_reshaped):
+                # Only consider the contribution from displacement
+                gravity_potential -= node_mass * current_magnitude * torch.dot(gravity_dir, disp)
+        else:
+            # Original implementation (absolute energy)
+            for i, disp in enumerate(u_reshaped):
+                position = coords[i] + disp
+                gravity_potential -= node_mass * current_magnitude * torch.dot(gravity_dir, position)
+        
         return gravity_potential
                 
     def objective_function(self, z, u_current, u_prev, dt, alpha=1.0, t=0.0):
         """
-        Objective function to minimize with better gravity handling 
-        (following the approach from validate_twist.py)
+        Objective function to minimize with gravity potential energy included.
         """
         # Get displacement from latent vector
         l = (self.routine.linear_modes @ z.unsqueeze(1)).squeeze(1)
@@ -177,18 +181,24 @@ class DynamicValidator:
         # Calculate norm_M^2 = residual^T * M * residual
         temporal = torch.sum(residual * M_residual) / (2 * dt * dt)
         
-        # Energy term - use very small weight to avoid dominating
-        energy_term = self.compute_energy(z)
+        # Elastic strain energy term
+        elastic_energy = self.compute_energy(z)
+        
+        # Gravity potential energy
+        gravity_energy = self.compute_gravity_term(u_next, t)
+        
+        # Total energy is the sum of elastic and gravity potential energies
+        total_energy = elastic_energy + gravity_energy
         
         # Total objective with carefully weighted components
-        objective = temporal +  energy_term 
-
-     
+        objective = temporal + total_energy
         
-        # Store component values for logging (like in validate_twist.py)
+        # Store component values for logging
         self.loss_components = {
             'temporal': temporal.item(),
-            'energy': energy_term.item(),
+            'elastic_energy': elastic_energy.item(),
+            'gravity_energy': gravity_energy.item(),
+            'total_energy': total_energy.item(),
             'total': objective.item()
         }
         
@@ -209,7 +219,7 @@ class DynamicValidator:
         
         # Material parameters
         E = 1.0e5
-        nu = 0.4
+        nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
         
@@ -505,7 +515,9 @@ class DynamicValidator:
                             initial_components = components
                             self.logger.info(f"{stage} components at t={current_time:.3f}s, iter {i}: ")
                             self.logger.info(f"  Temporal: {components['temporal']:.3e}")
-                            self.logger.info(f"  Energy: {components['energy']:.3e}")
+                            self.logger.info(f"  Elastic Energy: {components['elastic_energy']:.3e}")
+                            self.logger.info(f"  Gravity Energy: {components['gravity_energy']:.3e}")
+                            self.logger.info(f"  Total Energy: {components['total_energy']:.3e}")
                             self.logger.info(f"  Total: {components['total']:.3e}")
                     
                     # Mark this iteration as having had its first evaluation
@@ -519,7 +531,6 @@ class DynamicValidator:
             # Print progress every iteration
             if i % 3 == 0 or i == num_iters-1:  # Log every 3rd iteration and the last one
                 self.logger.info(f"  z opt iter {i}/{num_iters}, loss: {loss.item():.6e}")
-        
         # Final logging after optimization
         with torch.no_grad():
             final_loss = self.objective_function(z, u_current, u_prev, dt, alpha, current_time).item()
@@ -527,7 +538,9 @@ class DynamicValidator:
             
             self.logger.info(f"Final components at t={current_time:.3f}s: ")
             self.logger.info(f"  Temporal: {final_components['temporal']:.3e} (initial: {initial_components['temporal']:.3e})")
-            self.logger.info(f"  Energy: {final_components['energy']:.3e} (initial: {initial_components['energy']:.3e})")
+            self.logger.info(f"  Elastic Energy: {final_components['elastic_energy']:.3e} (initial: {initial_components['elastic_energy']:.3e})")
+            self.logger.info(f"  Gravity Energy: {final_components['gravity_energy']:.3e} (initial: {initial_components['gravity_energy']:.3e})")
+            self.logger.info(f"  Total Energy: {final_components['total_energy']:.3e} (initial: {initial_components['total_energy']:.3e})")
             self.logger.info(f"  Total: {final_components['total']:.3e} (initial: {initial_components['total']:.3e})")
 
         # Report optimization results
@@ -645,7 +658,7 @@ class DynamicValidator:
         
         # Material parameters - match twisting_beam.py exactly
         E = 1.0e5
-        nu = 0.4
+        nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
         

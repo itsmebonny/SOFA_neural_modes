@@ -898,7 +898,7 @@ class DynamicValidator:
         
         # Material parameters - match twisting_beam.py exactly
         E = 1.0e5
-        nu = 0.45
+        nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
         
@@ -1221,7 +1221,7 @@ class DynamicValidator:
         
         # Material parameters - match twisting_beam.py exactly
         E = 10000
-        nu = 0.49
+        nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
         
@@ -1233,8 +1233,8 @@ class DynamicValidator:
         Ic = ufl.tr(C)
         J = ufl.det(F)
         
-        # Neo-Hookean strain energy density formula
-        psi = (mu/2) * (Ic - 3) - mu * ufl.ln(J) + (lmbda/2) * (ufl.ln(J))**2
+        # Neo-Hookean strain energy density formula 0.25 * self.lmbda * (J ** 2 - 1.0 - 2.0 * log_J)
+        psi = (mu/2) * (Ic - 3) - mu * ufl.ln(J) + (lmbda/4) * (J**2 - 1.0 - 2.0 * ufl.ln(J))
         
         # Integrate over domain to get total energy
         energy_form = psi * ufl.dx
