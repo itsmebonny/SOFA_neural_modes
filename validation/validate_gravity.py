@@ -181,10 +181,12 @@ class DynamicValidator:
         # u_ddot_current = 0 (simplification, or we could estimate from previous steps)
         
         # Estimate current velocity
-        u_dot_current = (u_current - u_prev) / dt
-        
-        # Calculate acceleration at next step using Newmark formula
-        u_ddot_next = (1.0 / (beta * dt * dt)) * (u_next - u_current - dt * u_dot_current)
+        u_dot_current = (u_current - u_prev) / dt  # Approximate current velocity
+
+        # Replicate FEM solver's acceleration computation exactly:
+        u_ddot_next = (1.0 / (beta * dt * dt)) * (u_next - u_current) - \
+                    (1.0 / (beta * dt)) * u_dot_current - \
+                    ((1/(2*beta)) - 1) * torch.zeros_like(u_next)  # Last term can be zero initially
         
         # Create M*u_ddot - this represents the inertial forces
         M_petsc_vec = PETSc.Vec().createWithArray(u_ddot_next.cpu().detach().numpy())
@@ -217,7 +219,7 @@ class DynamicValidator:
         total_energy = elastic_energy + gravity_energy
         
         # Total objective combines dynamic terms and energy
-        objective = temporal + damping_term + total_energy
+        objective = temporal + damping_term + alpha * total_energy
         
         # Store component values for logging
         self.loss_components = {
@@ -262,7 +264,7 @@ class DynamicValidator:
         psi = 0.5 * mu * (Ic - 3.0 - 2.0 * ufl.ln(J)) + 0.25 * lmbda * (J**2 - 1.0 - 2.0 * ufl.ln(J))
         
         # Integrate over domain to get total energy
-        energy_form = psi * ufl.dx
+        energy_form = psi * ufl.dx(metadata={"quadrature_degree": 2})
         
         # Compute the energy using dolfinx's form assembly
         energy = fem.assemble_scalar(fem.form(energy_form))
@@ -497,12 +499,12 @@ class DynamicValidator:
         # Use L-BFGS for optimization
         optimizer = torch.optim.LBFGS([z], 
                                     lr=1, 
-                                    max_iter=10,
-                                    history_size=10,
-                                    line_search_fn=None)
+                                    max_iter=20,
+                                    history_size=50,
+                                    line_search_fn="strong_wolfe")
         
         # Weight for energy term
-        alpha = 1e-8  # Lower energy weight to match validate_twist.py
+        alpha = 1e8  # Lower energy weight to match validate_twist.py
         
         initial_loss = None
         final_loss = None
@@ -926,188 +928,327 @@ class DynamicValidator:
             return False
         
 
+        # No changes needed outside the run_simulation method itself for this fix.
+    # Make sure you have also addressed the objective function weighting issue separately.
+
     def run_simulation(self):
-        """Run the full dynamic simulation"""
+        """Run the full dynamic simulation with corrected time-stepping logic"""
         self.logger.info("Starting dynamic simulation with gravity application...")
-        try: 
-            # Initialize arrays for storing results
-            z_history = []
-            u_nn_history = []  # Neural network predictions
-            u_fem_history = []  # FEM solutions
-            displacement_norms_nn = []
-            displacement_norms_fem = []
-            energy_history = []
-            gravity_history = []  # Renamed from torque_history
-            time_points = []
-            error_history = []  # Track error between NN and FEM
+        
+        # --- Variables Initialization ---
+        # Keep original structure for history lists
+        z_history = []
+        u_nn_history = []  # Neural network predictions stored step-by-step
+        # FEM solutions populated by run_fem_step into self.fem_solution_history
+        displacement_norms_nn = []
+        displacement_norms_fem = [] # Calculated post-loop from FEM history
+        energy_history_nn = [] # NN Elastic energy
+        gravity_history = []   # Applied gravity magnitude history
+        time_points = []
+        error_history = []     # Error between NN(t) and FEM(t)
+        self.u_history = []  # Initialize/reset u_history
 
-            self.nn_energy_history = []
-            
-            self.u_prev_torch, self.u_current_torch = self.compute_initial_steps_with_fenics(num_initial_steps=3)
 
-            # Find initial latent vectors that best represent these displacements
-            self.z_prev = self.find_best_latent_vector(self.u_prev_torch)
-            self.z_current = self.find_best_latent_vector(self.u_current_torch)
+        # self.nn_energy_history is used by plot_energy_vs_gravity, ensure it's initialized
+        if not hasattr(self, 'nn_energy_history'):
+             self.nn_energy_history = []
+        self.nn_energy_history.clear() # Clear from previous runs if any
 
-            # Store initial state
-            z_history.append(self.z_current.cpu().numpy())
-            u_nn_history.append(self.u_current_torch.clone())
-            displacement_norms_nn.append(torch.norm(self.u_current_torch).item())
-            energy_history.append(self.compute_energy(self.z_current).item())
-            
+        if not hasattr(self, 'fem_energy_history'):
+            self.fem_energy_history = []
+        self.fem_energy_history.clear() # Clear from previous runs if any
 
-            
-            # Calculate initial gravity magnitude with ramp-up
-            if self.gravity_ramp_time > 0:  # Changed from torque_ramp_time
-                initial_gravity = 0.0
-            else:
-                initial_gravity = self.gravity_magnitude  # Changed from torque_magnitude
-            gravity_history.append(initial_gravity)  # Changed from torque_history
-            
-            time_points.append(0.0)
-            
-            # Create plotter for visualization
-            plotter = None
+        # --- Simulation Execution Block ---
+        try: # Wrap simulation logic for robust finally block execution
+            # --- Initial State Setup (t=0 and t=dt using FEM) ---
+            # We need states at t=0 and t=dt to predict t=2*dt.
+            self.logger.info("Setting up initial states using FEM...")
+            self.fem_solution_history = [] # Ensure FEM history is clean
+
+            # State at t=0 (Assume zero initial displacement/velocity)
+            t = 0.0
+            u0_torch = torch.zeros_like(self.u_current_torch)
+            z0_torch = torch.zeros_like(self.z_current)
+            self.fem_solution_history.append(u0_torch.cpu().numpy().copy()) # FEM history starts at t=0
+            # Store initial state in NN history lists
+            time_points.append(t)
+            z_history.append(z0_torch.cpu().numpy())
+            u_nn_history.append(u0_torch.clone())
+            displacement_norms_nn.append(0.0)
+            energy_nn_t0 = self.compute_energy(z0_torch).item()
+            energy_history_nn.append(energy_nn_t0)
+            self.nn_energy_history.append(energy_nn_t0) # Also for energy plot
+            gravity_history.append(0.0) # Gravity at t=0
+
+            # State at t=dt (Compute using one FEM step)
+            t = self.dt
+            if not self.run_fem_step(t): # run_fem_step appends to self.fem_solution_history and self.fem_energy_history
+                 self.logger.error(f"FEM solver failed during initialization at t={t:.4f}s. Aborting.")
+                 raise RuntimeError(f"FEM initialization failed at t={t:.4f}s") # Use exception to trigger finally
+            u1_torch = torch.tensor(self.fem_solution_history[-1], device=self.device, dtype=torch.float64)
+            z1_torch = self.find_best_latent_vector(u1_torch) # Project FEM state to latent space
+
+            # Store state at t=dt in NN history lists
+            time_points.append(t)
+            z_history.append(z1_torch.cpu().numpy())
+            u_nn_history.append(u1_torch.clone()) # Use FEM result for NN history at t=dt
+            displacement_norms_nn.append(torch.norm(u1_torch).item())
+            energy_nn_t1 = self.compute_energy(z1_torch).item()
+            energy_history_nn.append(energy_nn_t1)
+            self.nn_energy_history.append(energy_nn_t1) # Also for energy plot
+            current_gravity = self.gravity_magnitude * min(t / self.gravity_ramp_time, 1.0) if self.gravity_ramp_time > 0 else self.gravity_magnitude
+            gravity_history.append(current_gravity)
+
+            # --- Initialize NN State Variables for Prediction Loop ---
+            # To predict step 2 (t=2*dt), we need state 0 (t=0) and state 1 (t=dt)
+            self.u_prev_torch = u0_torch.clone() # State at t=0
+            self.u_current_torch = u1_torch.clone() # State at t=dt
+            self.z_prev = z0_torch.clone()
+            self.z_current = z1_torch.clone()
+
+            self.logger.info(f"Initialization complete using FEM states at t=0 and t={self.dt:.4f}s.")
+            self.logger.info(f"NN predictor ready. u_prev=u(0), u_current=u({self.dt:.4f})")
+
+            # Visualization setup
             last_viz_time = 0.0
-            viz_interval = self.dt
-            
-            # Main simulation loop
-            for step in range(1, self.num_steps + 1):
-                t = step * self.dt
-                
-                # Calculate current gravity magnitude with ramp-up (for logging)
-                if t < self.gravity_ramp_time:  # Changed from torque_ramp_time
-                    current_gravity = self.gravity_magnitude * (t / self.gravity_ramp_time)  # Changed from torque_
-                else:
-                    current_gravity = self.gravity_magnitude  # Changed from torque_magnitude
-                
-                # 1. Run FEM step (ground truth)
-                fem_success = self.run_fem_step(t)
-                if not fem_success:
-                    self.logger.warning(f"FEM solver failed at t={t:.4f}s but continuing with neural model")
-                
-                # Get FEM solution
-                u_fem_current = torch.tensor(self.u.x.array, device=self.device, dtype=torch.float64) if fem_success else None
-                
-                # 2. Run neural network prediction (independent from FEM result)
-                prev_z = self.z_current.clone()
-                prev_u_nn = self.u_current_torch.clone()
-                
-                ## Find optimal z for next timestep
-                self.logger.info(f"Computing neural network prediction for t={t:.4f}s")
+            viz_interval = self.total_time / 50 # Aim for ~50 frames (adjust as needed)
+
+            # --- Main Simulation Loop (Predicting t=2*dt onwards) ---
+            # The loop predicts states for time steps 2, 3, ..., num_steps
+            for step in range(2, self.num_steps + 1):
+                t = step * self.dt # The time we are *predicting for* in this iteration
+                self.logger.info(f"--- Step {step}/{self.num_steps}: Predicting for t={t:.4f}s ---")
+
+                # Calculate target gravity magnitude for this time step
+                current_gravity = self.gravity_magnitude * min(t / self.gravity_ramp_time, 1.0) if self.gravity_ramp_time > 0 else self.gravity_magnitude
+
+                # 1. Predict NN state u(t) using u(t-dt) and u(t-2*dt)
+                # self.u_current_torch holds u(t-dt) from the *previous* iteration's update
+                # self.u_prev_torch holds u(t-2*dt) from the *previous* iteration's update
                 z_predicted, u_nn_predicted = self.find_optimal_z(
-                    self.u_current_torch, self.u_prev_torch, self.dt, t
+                    self.u_current_torch,  # Pass state at t-dt
+                    self.u_prev_torch,     # Pass state at t-2*dt
+                    self.dt,
+                    t                      # Pass target time t for objective function
                 )
-                                
-                # Update neural network state for next prediction
-                self.u_prev_torch = self.u_current_torch.clone()
-                self.u_current_torch = u_nn_predicted.clone()
-                self.z_prev = self.z_current.clone()
-                self.z_current = z_predicted.clone()
-                            
-                # 3. Compare and store results
-                if fem_success and u_fem_current is not None:
-                    # Calculate error between NN and FEM
-                    error = torch.norm(self.u_current_torch - u_fem_current) / torch.norm(u_fem_current)
-                    self.logger.info(f"Relative error between NN and FEM: {error.item():.6f}")
-                    
-                    # Store FEM results
-                    u_fem_history.append(u_fem_current.clone())
-                    displacement_norms_fem.append(torch.norm(u_fem_current).item())
-                else:
-                    error = torch.tensor(float('nan'))
-                    u_fem_history.append(None)
-                    displacement_norms_fem.append(float('nan'))
-                
-                # Store time and results for this step
+
+                # --- Store results for the current time step t ---
                 time_points.append(t)
                 z_history.append(z_predicted.cpu().numpy())
-                u_nn_history.append(self.u_current_torch.clone())
-                displacement_norms_nn.append(torch.norm(self.u_current_torch).item())
-                error_history.append(error.item())
-                
-                # Compute energy and gravity
-                energy = self.compute_energy(z_predicted).item()
-                energy_history.append(energy)
-                gravity_history.append(current_gravity)  
-                self.nn_energy_history.append(energy) 
+                u_nn_history.append(u_nn_predicted.clone()) # Store the NN prediction for time t
+                u_nn_history.append(u_nn_predicted.clone())
+                self.u_history = u_nn_history  # Keep u_history synced with u_nn_history
+
+                displacement_norms_nn.append(torch.norm(u_nn_predicted).item())
+                energy_nn = self.compute_energy(z_predicted).item()
+                energy_history_nn.append(energy_nn)
+                self.nn_energy_history.append(energy_nn) # Add to second list too
+                gravity_history.append(current_gravity)
+
+                # 2. Run FEM simulation for the same time step t for comparison
+                # This appends the FEM solution for time t to self.fem_solution_history
+                # and FEM energy to self.fem_energy_history
+                fem_success = self.run_fem_step(t)
+                if not fem_success:
+                    self.logger.warning(f"FEM solver failed at t={t:.4f}s. Storing NaN for FEM results.")
+                    u_fem_current_np = None # Use None to indicate failure
+                    # Append NaN to FEM energy history if needed (run_fem_step might handle this)
+                    if len(self.fem_energy_history) < len(self.fem_solution_history):
+                         self.fem_energy_history.append(float('nan'))
+
+                else:
+                    # Get the just-computed FEM solution
+                    u_fem_current_np = self.fem_solution_history[-1]
+
+                # 3. Compare NN prediction u_nn_predicted with FEM result u_fem_current_np
+                if u_fem_current_np is not None:
+                    u_fem_current_torch = torch.tensor(u_fem_current_np, device=self.device, dtype=torch.float64)
+                    fem_norm = torch.norm(u_fem_current_torch)
+                    error = torch.norm(u_nn_predicted - u_fem_current_torch) / fem_norm if fem_norm > 1e-12 else torch.norm(u_nn_predicted - u_fem_current_torch)
+                    self.logger.info(f"Relative error between NN and FEM at t={t:.4f}s: {error.item():.6f}")
+                else:
+                    error = torch.tensor(float('nan')) # Error is NaN if FEM failed
+
+                error_history.append(error.item()) # error_history corresponds to times t=2*dt, 3*dt,...
+
+                # 4. CRITICAL STATE UPDATE for NEXT iteration:
+                # Prepare inputs for predicting step t+dt: Need u(t) and u(t-dt)
+                self.u_prev_torch = self.u_current_torch.clone() # u_prev becomes state from t-dt
+                self.u_current_torch = u_nn_predicted.clone()    # u_current becomes state from t (the one just predicted)
+                self.z_prev = self.z_current.clone()
+                self.z_current = z_predicted.clone()
 
 
-                # Log progress
-                if step % 5 == 0:
-                    self.logger.info(f"Step {step}/{self.num_steps}, Time: {t:.2f}s, Energy: {energy:.4e}")
-                    self.logger.info(f"NN max displacement: {torch.max(torch.norm(self.u_current_torch.reshape(-1, 3), dim=1)).item():.4e}")
-                    if fem_success and u_fem_current is not None:
-                        self.logger.info(f"FEM max displacement: {torch.max(torch.norm(u_fem_current.reshape(-1, 3), dim=1)).item():.4e}")
-                    self.logger.info(f"Rel. Error: {error.item():.6f}")
-                
-                # Visualize if needed
-                if t - last_viz_time >= viz_interval:
-                    self.visualize_step(step, t, z_predicted, self.u_current_torch, current_gravity)  # Changed from current_torque
+                # Logging (matches original frequency and content)
+                if step % 5 == 0 or step == self.num_steps:
+                    self.logger.info(f"Step {step}/{self.num_steps} completed, Time: {t:.2f}s, NN Energy: {energy_nn:.4e}")
+                    nn_max_disp = torch.max(torch.norm(u_nn_predicted.reshape(-1, 3), dim=1)).item()
+                    self.logger.info(f"  NN max displacement: {nn_max_disp:.4e}")
+                    if u_fem_current_np is not None:
+                         fem_max_disp = np.max(np.linalg.norm(u_fem_current_np.reshape(-1, 3), axis=1))
+                         self.logger.info(f"  FEM max displacement: {fem_max_disp:.4e}")
+                         self.logger.info(f"  Rel. Error: {error.item():.6f}")
+                    else:
+                         self.logger.info(f"  FEM max displacement: NaN (solver failed)")
+                         self.logger.info(f"  Rel. Error: NaN")
+
+
+                # Visualization (uses state just computed for time t)
+                # Compares NN prediction `u_nn_predicted` with FEM solution `self.fem_solution_history[-1]`
+                if t - last_viz_time >= viz_interval or step == self.num_steps:
+                    # The index `step` corresponds to time `t = step * dt` in the 0-based history lists
+                    self.visualize_step(step, t, z_predicted, u_nn_predicted, current_gravity)
                     last_viz_time = t
-                    
+
+
+            # --- Simulation Loop Finished ---
+            self.logger.info("Simulation loop completed.")
+
+            # --- Post-Processing (within try block) ---
+
+            # Calculate FEM displacement norms from the collected history
+            displacement_norms_fem = [np.linalg.norm(u_fem) if u_fem is not None else float('nan')
+                                    for u_fem in self.fem_solution_history]
+            if len(displacement_norms_fem) != len(time_points):
+                 self.logger.warning(f"Length mismatch: FEM norms ({len(displacement_norms_fem)}) vs Time ({len(time_points)})")
+                 # Pad FEM norms if FEM failed early? Or adjust plotting. Let's pad.
+                 if len(displacement_norms_fem) < len(time_points):
+                     displacement_norms_fem.extend([float('nan')] * (len(time_points) - len(displacement_norms_fem)))
+
+
             # Create error plot
             plt.figure(figsize=(10, 6))
-            plt.plot(time_points, error_history, 'o-')
-            plt.axhline(y=0.05, color='r', linestyle='--', label='5% error threshold')
-            plt.xlabel('Time (s)')
-            plt.ylabel('Relative Error')
-            plt.title('Neural Network vs FEM Relative Error')
-            plt.grid(True)
-            plt.legend()
-            plt.savefig(os.path.join(self.output_dir, "nn_vs_fem_error.png"))
-            plt.close()
-            
-            # Visualize final comparison results
-            self.visualize_results(time_points, displacement_norms_nn, 
-                                    energy_history, gravity_history) 
-                
-            return {
+            # error_history corresponds to time_points[2:] (times t=2*dt to num_steps*dt)
+            plot_times_error = time_points[2:]
+            if len(error_history) > 0 and len(plot_times_error) == len(error_history):
+                plt.plot(plot_times_error, error_history, 'o-')
+                plt.axhline(y=0.05, color='r', linestyle='--', label='5% error threshold')
+                plt.xlabel('Time (s)')
+                plt.ylabel('Relative Error')
+                plt.title('Neural Network vs FEM Relative Error Over Time')
+                plt.grid(True)
+                plt.legend()
+                plt.savefig(os.path.join(self.output_dir, "nn_vs_fem_error.png"))
+                self.logger.info(f"Error plot saved to {os.path.join(self.output_dir, 'nn_vs_fem_error.png')}")
+            else:
+                 self.logger.warning(f"Could not generate error plot. Mismatch: Time points for error ({len(plot_times_error)}), Errors recorded ({len(error_history)}).")
+            plt.close() # Close plot figure to free memory
+
+
+            # Visualize final summary plots (e.g., displacement norms, energy)
+            # Ensure visualize_results handles potential NaN values if FEM failed
+            self.visualize_results(time_points, displacement_norms_nn,
+                                    energy_history_nn, gravity_history) # Pass NN energy
+
+            # Prepare final results dictionary
+            results = {
                 'time': time_points,
                 'z': z_history,
                 'displacement_norm_nn': displacement_norms_nn,
                 'displacement_norm_fem': displacement_norms_fem,
-                'energy': energy_history,
-                'error': error_history
+                'energy_nn': energy_history_nn, # NN elastic energy
+                'fem_energy_history': self.fem_energy_history, # FEM energy from run_fem_step
+                'error': error_history # Note: length is num_steps-1
             }
-        
+
+            self.logger.info("Successfully prepared results dictionary.")
+            return results # Return results on success
+
         except Exception as e:
-            self.logger.error(f"Simulation failed: {e}")
+            self.logger.error(f"Simulation failed due to an exception: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
-            
-            # Attempt to save the current state if possible
+
+            # Attempt to save partial results before exiting try block
+            self.logger.warning("Attempting to save partial results...")
             try:
-                self.visualize_results(time_points, displacement_norms_nn, 
-                                        energy_history, gravity_history)
-            except Exception as e:
-                self.logger.error(f"Failed to save results during error handling: {e}")
-        
+                 # Recalculate FEM norms from whatever history exists
+                 displacement_norms_fem_partial = [np.linalg.norm(u_fem) if u_fem is not None else float('nan')
+                                                 for u_fem in self.fem_solution_history]
+                 # Pad FEM norms if needed
+                 if len(displacement_norms_fem_partial) < len(time_points):
+                     displacement_norms_fem_partial.extend([float('nan')] * (len(time_points) - len(displacement_norms_fem_partial)))
+
+                 # Make sure all lists passed to visualize_results have the same length
+                 min_len = min(len(time_points), len(displacement_norms_nn), len(energy_history_nn), len(gravity_history))
+                 self.visualize_results(time_points[:min_len], displacement_norms_nn[:min_len],
+                                        energy_history_nn[:min_len], gravity_history[:min_len])
+                 self.logger.info("Partial summary plots saved.")
+            except Exception as plot_e:
+                self.logger.error(f"Failed to save partial summary plots during error handling: {plot_e}")
+
+            # Return None to indicate failure
+            return None
+
         finally:
-            # Always create energy vs time plot, even if simulation failed
-            self.logger.info("Creating energy plots...")
-            self.plot_energy_vs_gravity()
-            
-            # If we have a plotter, add the energy-time plot to the final frame
+            # This block executes whether the try block succeeded or failed
+            self.logger.info("Executing finally block: Creating final energy plots and closing visualization...")
+
+            # Ensure plot_energy_vs_gravity uses the correct, potentially partial, histories
+            # It relies on self.nn_energy_history and self.fem_energy_history
+            self.plot_energy_vs_gravity() # Assumes this function handles potentially mismatched lengths
+
+            # Safely close the GIF plotter and add a final frame
             if hasattr(self, 'plotter') and self.plotter is not None:
                 try:
-                    for _ in range(50):
+                    # Determine final message based on whether 'results' was successfully created
+                    sim_outcome_known = 'results' in locals() or 'results' in globals()
+                    final_frame_text = "Simulation Complete" if sim_outcome_known and results is not None else "Simulation Failed"
+                    self.logger.info(f"Adding final plotter frame with text: '{final_frame_text}'")
+
+                    # Add a few final frames to make the end state visible in the GIF
+                    for _ in range(10): # Add 10 identical final frames
                         self.plotter.clear()
+
+                        # Left subplot: Final Status Text
                         self.plotter.subplot(0, 0)
-                        self.plotter.add_text("Simulation Complete", position="upper_edge", font_size=24, color='white')
-                        
-                        # Add energy vs TIME plot to the right subplot
+                        self.plotter.add_text(final_frame_text, position="upper_edge", font_size=20, color='white')
+                        # Optionally add the final deformed mesh (if available)
+                        if u_nn_history: # Check if any NN history exists
+                             try:
+                                 u_final_nn = u_nn_history[-1]
+                                 # Create mesh with deformation for NN solution (similar to visualize_step)
+                                 u_quadratic = fem.Function(self.routine.V)
+                                 u_quadratic.x.array[:] = u_final_nn.cpu().numpy()
+                                 self.u_linear.interpolate(u_quadratic)
+                                 u_linear_np = self.u_linear.x.array
+                                 nn_grid = self.grid.copy()
+                                 nn_grid.point_data["displacement"] = u_linear_np.reshape((-1, 3))
+                                 nn_warped = nn_grid.warp_by_vector("displacement", factor=1.0)
+                                 self.plotter.add_mesh(nn_warped, color='lightblue', show_edges=True, opacity=0.7)
+                             except Exception as mesh_e:
+                                 self.logger.warning(f"Could not add final NN mesh to plotter: {mesh_e}")
+                        else:
+                             # Show undeformed grid if no results
+                             if hasattr(self, 'grid'): self.plotter.add_mesh(self.grid, style='wireframe', color='grey', opacity=0.3)
+
+
+                        # Right subplot: Energy Plot Background
                         self.plotter.subplot(0, 1)
                         try:
-                            self.add_energy_time_plot_to_plotter()  # Use the new function
-                        except Exception as e:
-                            self.logger.error(f"Could not add energy plot: {e}")
-                        
-                        # Save the final frame
+                            # Use the method that adds the pre-generated energy plot image
+                            if hasattr(self, 'add_energy_time_plot_to_plotter'):
+                                self.add_energy_time_plot_to_plotter(plotter=self.plotter)
+                            else:
+                                self.logger.warning("add_energy_time_plot_to_plotter method not found.")
+                                self.plotter.add_text("Energy plot unavailable", position="upper_edge", color="white")
+                        except Exception as plot_add_e:
+                            self.logger.error(f"Could not add energy plot image to final frame: {plot_add_e}")
+                            self.plotter.add_text("Energy plot error", position="upper_edge", color="red")
+
+                        # Write the combined frame to the GIF
                         self.plotter.write_frame()
-                    
-                except Exception as e:
-                    self.logger.error(f"Error adding final visualization: {e}")
+
+                    # Close the plotter (which also finalizes the GIF)
+                    self.plotter.close()
+                    self.logger.info("GIF plotter closed and file finalized.")
+
+                except Exception as close_e:
+                    # Log error during cleanup but don't prevent program exit
+                    self.logger.error(f"Error during plotter closing/final frame writing in finally block: {close_e}")
+            else:
+                 self.logger.info("Plotter was not initialized or already closed. Skipping final frame.")
+            # --- End of Finally Block ---
 
 
     def compute_energy(self, z):

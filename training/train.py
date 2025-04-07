@@ -757,17 +757,20 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 10
-                deformation_scale_final = 50
+                deformation_scale_init = 15
+                deformation_scale_final = 30
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
                 mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
+                z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
+
+                #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
+                z = z * torch.rand(batch_size, L, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
