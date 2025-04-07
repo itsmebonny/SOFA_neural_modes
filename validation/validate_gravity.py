@@ -163,23 +163,37 @@ class DynamicValidator:
     def objective_function(self, z, u_current, u_prev, dt, alpha=1.0, t=0.0):
         """
         Objective function to minimize with gravity potential energy included.
+        Using Newmark-beta consistent time integration to match FEM solver.
         """
+        # Newmark-beta parameters - must match those in run_fem_step
+        beta = 0.25
+        gamma = 0.5
+        
         # Get displacement from latent vector
         l = (self.routine.linear_modes @ z.unsqueeze(1)).squeeze(1)
         y = self.routine.model(z)
         u_next = l + y
         
-        # Calculate the temporal term: (u_next - 2*u_current + u_prev) for central difference
-        residual = u_next - 2*u_current + u_prev
+        # Calculate acceleration from Newmark formula:
+        # u_ddot = (1/(β*dt²))*(u_next - u_current - dt*u_dot) - (1/(2β)-1)*u_ddot_current
+        # Where:
+        # u_dot = (u_current - u_prev)/dt (approximation for current velocity)
+        # u_ddot_current = 0 (simplification, or we could estimate from previous steps)
         
-        # Calculate M*residual
-        M_petsc_vec = PETSc.Vec().createWithArray(residual.cpu().detach().numpy())
+        # Estimate current velocity
+        u_dot_current = (u_current - u_prev) / dt
+        
+        # Calculate acceleration at next step using Newmark formula
+        u_ddot_next = (1.0 / (beta * dt * dt)) * (u_next - u_current - dt * u_dot_current)
+        
+        # Create M*u_ddot - this represents the inertial forces
+        M_petsc_vec = PETSc.Vec().createWithArray(u_ddot_next.cpu().detach().numpy())
         result_petsc_vec = M_petsc_vec.duplicate()
         self.M.mult(M_petsc_vec, result_petsc_vec)
-        M_residual = torch.tensor(result_petsc_vec.getArray(), device=self.device, dtype=torch.float64)
+        M_u_ddot = torch.tensor(result_petsc_vec.getArray(), device=self.device, dtype=torch.float64)
         
-        # Calculate norm_M^2 = residual^T * M * residual
-        temporal = torch.sum(residual * M_residual) / (2 * dt * dt)
+        # Inertial term: ρ*(u_ddot)*v (same as in FEM weak form)
+        temporal = torch.sum(u_ddot_next * M_u_ddot)
         
         # Elastic strain energy term
         elastic_energy = self.compute_energy(z)
@@ -187,15 +201,28 @@ class DynamicValidator:
         # Gravity potential energy
         gravity_energy = self.compute_gravity_term(u_next, t)
         
-        # Total energy is the sum of elastic and gravity potential energies
+        # Damping term (Rayleigh damping, like in FEM):
+        # C = αM + βK, but we'll just use mass proportional damping (α only)
+        # using the current velocity estimate
+        damping_coef = self.damping  # Use the same damping as in FEM
+        
+        # Apply damping: C*u_dot ≈ damping_coef * M * u_dot
+        M_velocity_vec = PETSc.Vec().createWithArray(u_dot_current.cpu().detach().numpy())
+        result_v_petsc_vec = M_velocity_vec.duplicate()
+        self.M.mult(M_velocity_vec, result_v_petsc_vec)
+        M_u_dot = torch.tensor(result_v_petsc_vec.getArray(), device=self.device, dtype=torch.float64)
+        damping_term = damping_coef * torch.sum(u_dot_current * M_u_dot)
+        
+        # Total energy is the sum of components
         total_energy = elastic_energy + gravity_energy
         
-        # Total objective with carefully weighted components
-        objective = temporal + total_energy
+        # Total objective combines dynamic terms and energy
+        objective = temporal + damping_term + total_energy
         
         # Store component values for logging
         self.loss_components = {
             'temporal': temporal.item(),
+            'damping': damping_term.item(),
             'elastic_energy': elastic_energy.item(),
             'gravity_energy': gravity_energy.item(),
             'total_energy': total_energy.item(),
@@ -232,7 +259,7 @@ class DynamicValidator:
         J = ufl.det(F)
         
         # Neo-Hookean strain energy density formula
-        psi = (mu/2) * (Ic - 3) - mu * ufl.ln(J) + (lmbda/2) * (ufl.ln(J))**2
+        psi = 0.5 * mu * (Ic - 3.0 - 2.0 * ufl.ln(J)) + 0.25 * lmbda * (J**2 - 1.0 - 2.0 * ufl.ln(J))
         
         # Integrate over domain to get total energy
         energy_form = psi * ufl.dx
@@ -296,7 +323,6 @@ class DynamicValidator:
         
         try:
             # Set up for visualization similar to twisting_beam.py
-            pyvista.set_jupyter_backend("static")
             topology, cell_types, x = plot.vtk_mesh(self.routine.V)
             self.grid = pyvista.UnstructuredGrid(topology, cell_types, x)
             self.x = x  # Store x coordinates for later use

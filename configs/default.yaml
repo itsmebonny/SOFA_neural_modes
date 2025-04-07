@@ -33,7 +33,7 @@ model:
 
 # Training parameters
 training:
-  num_epochs: 150
+  num_epochs: 15
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"

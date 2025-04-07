@@ -684,7 +684,7 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 32  # You can add this to config
+        batch_size = 64  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
         print_every = 1
         checkpoint_every = 50
@@ -765,10 +765,9 @@ class Routine:
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
                 mode_scales = mode_scales * current_scale
-                mode_scales[-1] *= 2  # Increase scale for last mode
 
                 # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
+                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
@@ -890,11 +889,7 @@ class Routine:
 
                     loss.backward()
 
-                    # Choose a random latent vector from the batch
-                    random_idx = np.random.randint(1, batch_size)
-                    random_z = z[random_idx].detach().clone()
-                    self.visualize_latent_vector(random_z, iteration, loss_val)
-                    self.compute_volume_comparison(random_z)
+                    
 
                     # Print stats periodically
                     if iteration % print_every == 0:
@@ -954,6 +949,12 @@ class Routine:
                 optimizer.step(closure)
 
                 scheduler.step(loss_val)  
+
+                # Choose a random latent vector from the batch
+                random_idx = np.random.randint(1, batch_size)
+                random_z = z[random_idx].detach().clone()
+                self.visualize_latent_vector(random_z, iteration, loss_val)
+                self.compute_volume_comparison(random_z)
 
             if iteration % 1 == 0:  # Update visualization every 5 iterations
                 pass

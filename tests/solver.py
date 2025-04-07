@@ -1123,8 +1123,7 @@ class UFLNeoHookeanModel(torch.nn.Module):
 
         # Neo-Hookean energy density (W₂)
         # W = (μ/2) * (I_C - 3) - μ * ln(J) + (λ/2) * (ln(J))² 
-        W = 0.5 * self.mu * (IC - 3.0) - self.mu * log_J + 0.25 * self.lmbda * (J ** 2 - 1.0 - 2.0 * log_J)
-
+        W = 0.5 * self.mu * (IC - 3.0 - 2.0 * log_J) + 0.25 * self.lmbda * (J ** 2 - 1.0 - 2.0 * log_J)
         return W
 
     # --- Methods for Gradients and Stress ---

@@ -1234,7 +1234,7 @@ class DynamicValidator:
         J = ufl.det(F)
         
         # Neo-Hookean strain energy density formula 0.25 * self.lmbda * (J ** 2 - 1.0 - 2.0 * log_J)
-        psi = (mu/2) * (Ic - 3) - mu * ufl.ln(J) + (lmbda/4) * (J**2 - 1.0 - 2.0 * ufl.ln(J))
+        psi = 0.5 * mu * (Ic - 3.0 - 2.0 * ufl.ln(J)) + 0.25 * lmbda * (J**2 - 1.0 - 2.0 * ufl.ln(J))
         
         # Integrate over domain to get total energy
         energy_form = psi * ufl.dx
