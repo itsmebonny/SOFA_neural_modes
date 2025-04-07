@@ -138,6 +138,126 @@ class Net(torch.nn.Module):
         if not is_batched:
             x = x.squeeze(0)
         return x
+    
+
+class ResidualNet(torch.nn.Module):
+    """
+    Residual network architecture that ensures model(0) = 0 by design.
+    Uses skip connections and ensures zero output for zero input.
+    """
+    def __init__(self, latent_dim, output_dim, hid_layers=3, hid_dim=128, 
+                 activation=torch.nn.functional.leaky_relu, zero_init_output=True):
+        """
+        Neural network with residual connections and guaranteed zero-mapping property.
+        
+        Args:
+            latent_dim: Dimension of input latent space
+            output_dim: Dimension of output space
+            hid_layers: Number of hidden layers
+            hid_dim: Width of hidden layers
+            activation: Activation function to use (default: leaky_relu)
+            zero_init_output: Whether to initialize the output layer to near-zero weights
+        """
+        super(ResidualNet, self).__init__()
+        
+        self.latent_dim = latent_dim
+        self.output_dim = output_dim
+        self.activation = activation
+        
+        # Input projection layer (latent → hidden)
+        self.input_proj = torch.nn.Linear(latent_dim, hid_dim, bias=False)
+        
+        # Residual blocks
+        self.res_blocks = torch.nn.ModuleList()
+        for _ in range(hid_layers):
+            block = torch.nn.Sequential(
+                torch.nn.Linear(hid_dim, hid_dim, bias=False),
+                torch.nn.LayerNorm(hid_dim),
+                torch.nn.Linear(hid_dim, hid_dim, bias=False),
+                torch.nn.LayerNorm(hid_dim)
+            )
+            self.res_blocks.append(block)
+        
+        # Output projection (hidden → output)
+        self.output_proj = torch.nn.Linear(hid_dim, output_dim, bias=False)
+
+        # Initialize weights
+        # self._init_weights(zero_init_output)
+        #zero last layer weights
+        torch.nn.init.zeros_(self.output_proj.weight)
+
+    def _init_weights(self, zero_init_output):
+        """Initialize network weights properly for stable training and zero mapping."""
+        # Initialize input projection with Kaiming
+        torch.nn.init.kaiming_normal_(self.input_proj.weight, nonlinearity='leaky_relu')
+        
+        # Initialize residual blocks
+        for block in self.res_blocks:
+            for i, layer in enumerate(block):
+                if isinstance(layer, torch.nn.Linear):
+                    # For linear layers, use Kaiming initialization
+                    torch.nn.init.kaiming_normal_(layer.weight, nonlinearity='leaky_relu')
+                    # Scale down the second layer in each block for stability
+                    if i == 2:  # Second linear layer in the block
+                        layer.weight.data.mul_(0.1)
+        
+        # Initialize output projection to small values
+        if zero_init_output:
+            torch.nn.init.normal_(self.output_proj.weight, mean=0.0, std=0.01)
+        else:
+            torch.nn.init.kaiming_normal_(self.output_proj.weight, nonlinearity='linear')
+            self.output_proj.weight.data.mul_(0.01)  # Scale down regardless
+    
+    def forward(self, x):
+        """
+        Forward pass with residual connections.
+        Ensures model(0) = 0 by design due to absence of bias terms.
+        
+        Args:
+            x: Input latent vector(s)
+        """
+        # Handle both single vectors and batches
+        is_batched = x.dim() > 1
+        if not is_batched:
+            x = x.unsqueeze(0)  # Add batch dimension
+            
+        # Input projection & activation
+        h = self.activation(self.input_proj(x))
+        
+        # Process through residual blocks
+        for block in self.res_blocks:
+            # Compute block output
+            block_output = block[0](h)  # First linear
+            block_output = self.activation(block_output)
+            block_output = block[1](block_output)  # First normalization
+            block_output = block[2](block_output)  # Second linear
+            block_output = self.activation(block_output)
+            block_output = block[3](block_output)  # Second normalization
+            
+            # Add residual connection
+            h = h + block_output
+            
+        # Output projection
+        y = self.output_proj(h)
+        
+        # Remove batch dimension if input wasn't batched
+        if not is_batched:
+            y = y.squeeze(0)
+            
+        return y
+    
+    def verify_zero_property(self, epsilon=1e-6):
+        """Verify that the network maps zero to zero by testing f(0) ≈ 0"""
+        with torch.no_grad():
+            zero_input = torch.zeros(self.latent_dim, device=next(self.parameters()).device)
+            zero_output = self.forward(zero_input)
+            zero_norm = torch.norm(zero_output).item()
+            
+            print(f"Zero-mapping test: ||f(0)|| = {zero_norm:.3e}")
+            passed = zero_norm < epsilon * self.output_dim**0.5
+            print(f"Zero-mapping test {'PASSED' if passed else 'FAILED'}")
+            
+            return passed, zero_norm
 
 # Add this class near the top of your file, after imports
 class LBFGSScheduler:
@@ -260,8 +380,17 @@ class Routine:
         hid_dim = cfg['model'].get('hid_dim', 64)
         # print(f"Output dimension: {output_dim}")
         # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        self.model = Net(self.num_modes, output_dim, hid_layers, hid_dim).to(device).double()
+        self.model = ResidualNet(
+            self.num_modes, 
+            output_dim, 
+            hid_layers=hid_layers, 
+            hid_dim=hid_dim,
+            activation=torch.nn.functional.leaky_relu,
+            zero_init_output=True
+        ).to(device).double()
 
+        # After model creation, verify zero property
+        self.model.verify_zero_property()
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
 
@@ -594,8 +723,8 @@ class Routine:
         # Use LBFGS optimizer
         optimizer = torch.optim.LBFGS(self.model.parameters(), 
                                     lr=1,
-                                    max_iter=15,
-                                    max_eval=20,
+                                    max_iter=20,
+                                    max_eval=40,
                                     tolerance_grad=1e-05,
                                     tolerance_change=1e-07,
                                     history_size=100,
@@ -628,10 +757,10 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 0.5
+                deformation_scale_init = 10
                 deformation_scale_final = 50
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
@@ -643,7 +772,7 @@ class Routine:
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                # z[rest_idx, :] = 0  # Set rest shape latent to zero
+                z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -655,7 +784,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -723,7 +852,9 @@ class Routine:
 
                  
 
-                    energy_scaling = torch.log10(energy + 1)
+                    # Scale energy by maximum linear displacement to get comparable units
+                    max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
+                    energy_scaling = energy / (max_linear_disp + 1e-8)  # Add epsilon to avoid division by zero
 
                     # Add incentive for beneficial nonlinearity (energy improvement term)
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
@@ -754,7 +885,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy +  ortho #+ 1e5*  origin 
+                    loss = energy_scaling + 1e5 * ortho #+ 1e5*  origin 
 
 
                     loss.backward()
