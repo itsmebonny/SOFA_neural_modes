@@ -757,10 +757,10 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 15
-                deformation_scale_final = 30
+                deformation_scale_init = 5
+                deformation_scale_final = 20
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
@@ -770,7 +770,7 @@ class Routine:
                 z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
 
                 #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
-                z = z * torch.rand(batch_size, L, device=self.device) * 0.999 + 0.001
+                z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
@@ -856,38 +856,27 @@ class Routine:
 
                     # Scale energy by maximum linear displacement to get comparable units
                     max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
-                    energy_scaling = energy / (max_linear_disp + 1e-8)  # Add epsilon to avoid division by zero
+                    energies_scaling = energies / (max_linear_disp + 1e-8)  # Add epsilon to avoid division by zero
+
+                    energy_scaling = torch.mean(energies_scaling)  # Average energy across batch
 
                     # Add incentive for beneficial nonlinearity (energy improvement term)
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
                     energy_linear = self.energy_calculator(u_linear_only).mean()
-                    energy_improvement = (torch.relu(energy_linear - energy))/energy_linear
-                   
+                    energy_improvement = (torch.relu(energy_linear - energy))/(energy_linear + 1e-8)  
+                    improvement_loss = (energy_linear - energy) / (energy_linear + 1e-8)  
+
+                                
                     # Get the raw div(P) tensor
                     raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
-                    raw_div_p_L2_mean = torch.mean(torch.norm(raw_div_p, dim=2))
-
-                    div_p_magnitude = torch.norm(raw_div_p, dim=2, keepdim=True)
-                    div_p_direction = raw_div_p / (div_p_magnitude + 1e-8)
-
-                    # Apply log scaling to magnitude only
-                    log_div_p_magnitude = torch.log10(div_p_magnitude + 1)
-
-                    # Recombine with original direction
-                    log_scaled_div_p_tensor = log_div_p_magnitude * div_p_direction
-
-                    # log_Scaled_div_p is a tensor of shape [batch_size, num_nodes, 3]
-
-                    log_scaled_div_p = torch.mean(torch.norm(log_scaled_div_p_tensor, dim=2))
 
 
 
-                    div_p_weight = 2.0  # Weight for divergence loss
 
 
                     # Modified loss
-                    loss = energy_scaling + 1e5 * ortho #+ 1e5*  origin 
+                    loss = -improvement_loss #+ 1e5 * ortho #+ 1e5*  origin 
 
 
                     loss.backward()
@@ -999,7 +988,7 @@ class Routine:
             patience += 1
             
             # Early stopping criterion (optional)
-            if loss_val < 1e-8 or patience > 30:
+            if patience > 30: #loss_val < 1e-8 or 
                 print(f"Converged to target loss at iteration {iteration}")
                 break
         

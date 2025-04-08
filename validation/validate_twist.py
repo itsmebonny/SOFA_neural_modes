@@ -120,7 +120,18 @@ class DynamicValidator:
 
             
     def compute_torque_term(self, u, t):
-        """Compute the virtual work of the applied torque - using same approach as twisting_beam.py"""
+        """
+        Compute the external work done by the applied torque.
+        This work should be SUBTRACTED from the total energy because
+        external forces do negative work on the system.
+        
+        Args:
+            u: Displacement field
+            t: Current time
+            
+        Returns:
+            External work done by torque (to be subtracted from total energy)
+        """
         # Skip if no torque
         if self.torque_magnitude == 0:
             return torch.tensor(0.0, device=self.device, dtype=torch.float64)
@@ -130,6 +141,13 @@ class DynamicValidator:
         
         # Get original coordinates of the mesh
         coords = torch.tensor(self.routine.domain.geometry.x, device=self.device, dtype=torch.float64)
+        
+        # Compute current torque magnitude with time ramping
+        current_torque = self.torque_magnitude
+        if t < self.torque_ramp_time:
+            current_torque *= (t / self.torque_ramp_time)
+        if t >= self.change_time:
+            current_torque *= 0.5
         
         # Compute torque with corrected center (match twisting_beam.py)
         torque_potential = torch.tensor(0.0, device=self.device, dtype=torch.float64)
@@ -144,16 +162,11 @@ class DynamicValidator:
                                 device=self.device, dtype=torch.float64)
             
             # Magnitude with same scaling as twisting_beam.py
-            magnitude = self.torque_magnitude * ((orig_pos[0]-self.x_min)/self.beam_length)
+            magnitude = current_torque * ((orig_pos[0]-self.x_min)/self.beam_length)
             
-            if t < 2.0:
-                magnitude *= (t / 2.0)
-            
-            if t >= self.change_time:
-                magnitude *= 0.5
-            
+            # External work contribution at this node
             torque_potential += magnitude * r_loc * torch.dot(force_dir, u_reshaped[i])
-            
+        
         return torque_potential
                 
 
@@ -255,7 +268,7 @@ class DynamicValidator:
 
     def objective_function(self, z, u_current, u_prev, dt, alpha=1.0, t=0.0):
         """
-        Objective function with volume preservation constraint
+        Objective function with external work from torque
         """
         # Get displacement from latent vector
         l = (self.routine.linear_modes @ z.unsqueeze(1)).squeeze(1)
@@ -281,20 +294,24 @@ class DynamicValidator:
         # Calculate norm_M^2 = residual^T * M * residual
         temporal = torch.sum(residual * M_residual) / (2 * dt * dt)
 
-        # Energy term
-        energy_term = self.compute_energy(z)
-
-       
+        # Internal energy term (strain energy)
+        internal_energy = self.compute_energy(z)
         
-        # Total objective with carefully weighted components
-        objective = temporal + energy_term 
-
-   
+        # External work from torque (should be subtracted)
+        external_work = self.compute_torque_term(u_next, t)
         
-        # Store component values for logging (add volume preservation)
+        # Total potential energy = internal energy - external work
+        total_energy = internal_energy - external_work
+        
+        # Total objective function
+        objective = temporal + total_energy
+        
+        # Store component values for logging
         self.loss_components = {
             'temporal': temporal.item(),
-            'energy': energy_term.item(),
+            'internal_energy': internal_energy.item(),
+            'external_work': external_work.item(),
+            'total_energy': total_energy.item(),
             'total': objective.item()
         }
         
@@ -545,7 +562,7 @@ class DynamicValidator:
     def find_optimal_z(self, u_current, u_prev, dt, current_time, num_iters=10):
         """Find optimal latent vector z that minimizes the objective function"""
         # Use extrapolation from previous two z vectors as starting point
-        z_extrapolated = self.z_current + (self.z_current - self.z_prev)
+        z_extrapolated = self.z_current #+ (self.z_current - self.z_prev)
         
         # Start optimization from extrapolated z to maintain momentum
         z = z_extrapolated.clone().detach().requires_grad_(True)
@@ -597,7 +614,9 @@ class DynamicValidator:
                             initial_components = components
                             self.logger.info(f"{stage} components at t={current_time:.3f}s, iter {i}: ")
                             self.logger.info(f"  Temporal: {components['temporal']:.3e}")
-                            self.logger.info(f"  Energy: {components['energy']:.3e}")
+                            self.logger.info(f"  Internal Energy: {components['internal_energy']:.3e}")
+                            self.logger.info(f"  External Work: {components['external_work']:.3e}")
+                            self.logger.info(f"  Total Energy: {components['total_energy']:.3e}")
                             self.logger.info(f"  Total: {components['total']:.3e}")
                     
                     # Mark this iteration as having had its first evaluation
@@ -619,8 +638,10 @@ class DynamicValidator:
             
             self.logger.info(f"Final components at t={current_time:.3f}s: ")
             self.logger.info(f"  Temporal: {final_components['temporal']:.3e} (initial: {initial_components['temporal']:.3e})")
-            self.logger.info(f"  Energy: {final_components['energy']:.3e} (initial: {initial_components['energy']:.3e})")
-            self.logger.info(f"  Total: {final_components['total']:.3e} (initial: {initial_components['total']:.3e})")
+            self.logger.info(f"  Internal Energy: {final_components['internal_energy']:.3e} (initial: {initial_components['internal_energy']:.3e})")
+            self.logger.info(f"  External Work: {final_components['external_work']:.3e} (initial: {initial_components['external_work']:.3e})")
+            self.logger.info(f"  Total Energy: {final_components['total_energy']:.3e} (initial: {initial_components['total_energy']:.3e})")
+            self.logger.info(f"  Total Loss: {final_components['total']:.3e} (initial: {initial_components['total']:.3e})")
 
         # Report optimization results
         reduction = ((initial_loss - final_loss) / initial_loss * 100) if initial_loss else 0
@@ -897,7 +918,7 @@ class DynamicValidator:
         bc = fem.dirichletbc(u_D, boundary_dofs, self.V)
         
         # Material parameters - match twisting_beam.py exactly
-        E = 1.0e5
+        E = 10000
         nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
@@ -1300,9 +1321,9 @@ def main():
     parser = argparse.ArgumentParser(description='Dynamic validation for Neural Plates')
     parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path')
     parser.add_argument('--checkpoint', type=str, default='checkpoints/best.pt', help='checkpoint path')
-    parser.add_argument('--steps', type=int, default=500, help='number of simulation steps (default: 100 as in twisting_beam.py)')
+    parser.add_argument('--steps', type=int, default=100, help='number of simulation steps (default: 100 as in twisting_beam.py)')
     parser.add_argument('--time', type=float, default=2.4, help='total simulation time (matches twisting_beam.py)')
-    parser.add_argument('--torque', type=float, default=1.0e4, help='torque magnitude (matches twisting_beam.py)')
+    parser.add_argument('--torque', type=float, default=1.0e3, help='torque magnitude (matches twisting_beam.py)')
     parser.add_argument('--damping', type=float, default=0.01, help='damping coefficient')
     parser.add_argument('--output', type=str, default='validation_results', help='output directory')
     args = parser.parse_args()

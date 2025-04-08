@@ -219,7 +219,7 @@ class DynamicValidator:
         total_energy = elastic_energy + gravity_energy
         
         # Total objective combines dynamic terms and energy
-        objective = temporal + damping_term + alpha * total_energy
+        objective = temporal + damping_term +  total_energy
         
         # Store component values for logging
         self.loss_components = {
@@ -247,7 +247,7 @@ class DynamicValidator:
         domain = self.routine.domain
         
         # Material parameters
-        E = 1.0e5
+        E = 10000
         nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
@@ -491,7 +491,7 @@ class DynamicValidator:
     def find_optimal_z(self, u_current, u_prev, dt, current_time, num_iters=10):
         """Find optimal latent vector z that minimizes the objective function"""
         # Use extrapolation from previous two z vectors as starting point
-        z_extrapolated = self.z_current + (self.z_current - self.z_prev)
+        z_extrapolated = self.z_current #+ (self.z_current - self.z_prev)
         
         # Start optimization from extrapolated z to maintain momentum
         z = z_extrapolated.clone().detach().requires_grad_(True)
@@ -685,7 +685,7 @@ class DynamicValidator:
         bc = fem.dirichletbc(u_D, boundary_dofs, self.V)
         
         # Material parameters - match twisting_beam.py exactly
-        E = 1.0e5
+        E = 10000
         nu = 0.35
         mu = E / (2 * (1 + nu))
         lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
@@ -1271,7 +1271,7 @@ def main():
     parser = argparse.ArgumentParser(description='Dynamic validation with gravity for Neural Plates')
     parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path')
     parser.add_argument('--checkpoint', type=str, default='checkpoints/best.pt', help='checkpoint path')
-    parser.add_argument('--steps', type=int, default=50, help='number of simulation steps')
+    parser.add_argument('--steps', type=int, default=100, help='number of simulation steps')
     parser.add_argument('--time', type=float, default=1.2, help='total simulation time')
     parser.add_argument('--gravity', type=float, default=9.81, help='gravity magnitude (m/s²)')
     parser.add_argument('--damping', type=float, default=0.01, help='damping coefficient')

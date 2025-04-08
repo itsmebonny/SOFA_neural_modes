@@ -622,9 +622,8 @@ class UFLNeoHookeanModel(torch.nn.Module):
     """
     Modular Neo-Hookean energy model (UFL-Equivalent Formulation).
 
-    Implements the Neo-Hookean formulation commonly derived from multiplicative
-    decomposition, matching standard UFL implementations:
-    W = (μ/2) * (I_C - 3) - μ * ln(J) + (λ/2) * (ln(J))²
+    Implements the Neo-Hookean formulation:
+    W = 0.5 * μ * (I_C - 3 - 2 * ln(J)) + 0.25 * λ * (J² - 1 - 2 * ln(J))
     where:
         μ = Shear modulus
         λ = First Lamé parameter
@@ -1122,7 +1121,7 @@ class UFLNeoHookeanModel(torch.nn.Module):
         IC = torch.einsum('...ji,...ji->...', F, F) # Sum over last two dimensions
 
         # Neo-Hookean energy density (W₂)
-        # W = (μ/2) * (I_C - 3) - μ * ln(J) + (λ/2) * (ln(J))² 
+        # W = (μ/2) * (I_C - 3 - 2*ln(J)) + (λ/4) * (J² - 1 - 2*ln(J))
         W = 0.5 * self.mu * (IC - 3.0 - 2.0 * log_J) + 0.25 * self.lmbda * (J ** 2 - 1.0 - 2.0 * log_J)
         return W
 
