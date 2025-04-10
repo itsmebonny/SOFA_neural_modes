@@ -248,7 +248,6 @@ class DynamicValidator:
         self.logger.info("Setting up visualization environment...")
         
         # Set up for visualization similar to twisting_beam.py
-        pyvista.set_jupyter_backend("static")
         topology, cell_types, x = plot.vtk_mesh(self.routine.V)
         self.grid = pyvista.UnstructuredGrid(topology, cell_types, x)
         self.x = x  # Store x coordinates for later use

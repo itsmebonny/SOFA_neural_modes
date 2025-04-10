@@ -121,42 +121,53 @@ class DynamicValidator:
 
             
     def compute_gravity_term(self, u, t, use_reference=True):
-        """Compute the gravity potential energy with proper reference point."""
+        """Compute the gravity potential energy using mass matrix for consistency with FEM."""
         # Skip if no gravity
         if self.gravity_magnitude == 0:
             return torch.tensor(0.0, device=self.device, dtype=torch.float64)
             
-        # Reshape u to get nodal displacements
-        u_reshaped = u.reshape(-1, 3)
-        
-        # Get original coordinates of the mesh
-        coords = torch.tensor(self.routine.domain.geometry.x, device=self.device, dtype=torch.float64)
-        
-        # Create gravity direction tensor
-        gravity_dir = torch.tensor(self.gravity_direction, device=self.device, dtype=torch.float64)
-        
         # Scale magnitude based on ramp time
         current_magnitude = self.gravity_magnitude
         if t < self.gravity_ramp_time:
             current_magnitude *= (t / self.gravity_ramp_time)
         
-        # Compute gravity potential energy
-        gravity_potential = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        # Create gravity direction tensor (column vector)
+        gravity_dir = torch.tensor(self.gravity_direction, device=self.device, dtype=torch.float64)
         
-        # For each node, compute gravity contribution
-        node_mass = self.rho * self.beam_volume / len(coords)
+        # Reshape u to get nodal displacements
+        u_reshaped = u.reshape(-1, 3)
         
-        # Calculate energy from displacements only, not initial positions
+        # Get original coordinates of the mesh if needed
+        if not use_reference:
+            coords = torch.tensor(self.routine.domain.geometry.x, device=self.device, dtype=torch.float64)
+        
+        # Create a load vector representing M·g
+        # For each DOF, determine its direction component along gravity
+        n_nodes = u_reshaped.shape[0]
+        gravity_load = torch.zeros_like(u)
+        
+        for i in range(n_nodes):
+            # Set entries for x, y, z components at this node
+            base_idx = i * 3
+            gravity_load[base_idx:base_idx+3] = gravity_dir * current_magnitude
+        
+        # Apply the mass matrix to the gravity load vector
+        # M·g gives the consistent nodal forces due to gravity
+        gravity_load_petsc = PETSc.Vec().createWithArray(gravity_load.cpu().numpy())
+        result_petsc = gravity_load_petsc.duplicate()
+        self.M.mult(gravity_load_petsc, result_petsc)  # This gives M·g
+        weighted_load = torch.tensor(result_petsc.getArray(), device=self.device, dtype=torch.float64)
+        
         if use_reference:
-            # Just use the energy from displacement, not absolute position
-            for i, disp in enumerate(u_reshaped):
-                # Only consider the contribution from displacement
-                gravity_potential -= node_mass * current_magnitude * torch.dot(gravity_dir, disp)
+            # For reference calculation, only use displacement part
+            gravity_potential = -torch.sum(weighted_load * u)
         else:
-            # Original implementation (absolute energy)
-            for i, disp in enumerate(u_reshaped):
-                position = coords[i] + disp
-                gravity_potential -= node_mass * current_magnitude * torch.dot(gravity_dir, position)
+            # For absolute calculation, include the initial positions
+            absolute_positions = torch.zeros_like(u)
+            for i in range(n_nodes):
+                base_idx = i * 3
+                absolute_positions[base_idx:base_idx+3] = coords[i] + u_reshaped[i]
+            gravity_potential = -torch.sum(weighted_load * absolute_positions)
         
         return gravity_potential
                 
@@ -219,7 +230,7 @@ class DynamicValidator:
         total_energy = elastic_energy + gravity_energy
         
         # Total objective combines dynamic terms and energy
-        objective = temporal + damping_term +  total_energy
+        objective = temporal + damping_term +  1e9 * total_energy
         
         # Store component values for logging
         self.loss_components = {
@@ -745,7 +756,7 @@ class DynamicValidator:
         # Kinematics - use the same approach as validate_twist.py
         d = len(u)
         I = ufl.Identity(d)
-        F = I + ufl.grad(u)  # This is the correct way to define F in UFL
+        F = I + ufl.grad(u)  
         C = F.T * F
         Ic = ufl.tr(C)
         J = ufl.det(F)
@@ -960,7 +971,6 @@ class DynamicValidator:
 
         # --- Simulation Execution Block ---
         try: # Wrap simulation logic for robust finally block execution
-            # --- Initial State Setup (t=0 and t=dt using FEM) ---
             # We need states at t=0 and t=dt to predict t=2*dt.
             self.logger.info("Setting up initial states using FEM...")
             self.fem_solution_history = [] # Ensure FEM history is clean
@@ -1302,7 +1312,7 @@ def main():
         total_time=args.time,
         gravity_magnitude=args.gravity,
         gravity_direction=[0, 0, -1],  # Default direction downward
-        gravity_ramp_time=0.5,         # Ramp up gravity over 0.5s
+        gravity_ramp_time=0.2,         # Ramp up gravity over 0.5s
         damping=args.damping,
         output_dir=args.output
     )

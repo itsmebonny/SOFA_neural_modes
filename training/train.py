@@ -172,9 +172,9 @@ class ResidualNet(torch.nn.Module):
         for _ in range(hid_layers):
             block = torch.nn.Sequential(
                 torch.nn.Linear(hid_dim, hid_dim, bias=False),
-                torch.nn.LayerNorm(hid_dim),
+                torch.nn.LayerNorm(hid_dim, elementwise_affine=False),
                 torch.nn.Linear(hid_dim, hid_dim, bias=False),
-                torch.nn.LayerNorm(hid_dim)
+                torch.nn.LayerNorm(hid_dim, elementwise_affine=False)
             )
             self.res_blocks.append(block)
         
@@ -379,6 +379,12 @@ class Routine:
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
         # print(f"Output dimension: {output_dim}")
+        # self.model = Net(
+        #     self.num_modes, 
+        #     output_dim, 
+        #     hid_layers=hid_layers, 
+        #     hid_dim=hid_dim
+        # ).to(device).double()
         # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
         self.model = ResidualNet(
             self.num_modes, 
@@ -757,7 +763,7 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 5
+                deformation_scale_init = 2
                 deformation_scale_final = 20
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
@@ -770,11 +776,11 @@ class Routine:
                 z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
 
                 #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
-                z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
+                #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                z[rest_idx, :] = 0  # Set rest shape latent to zero
+                # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -786,7 +792,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -813,13 +819,10 @@ class Routine:
                     
                     # After (if processing a batch):
                     batch_size = u_total_batch.shape[0]
-                    if batch_size > 1:
-                        # Use batch processing for multiple samples
-                        energies = self.energy_calculator(u_total_batch)
-                        energy = torch.mean(energies)  # Average energy across batch
-                    else:
-                        # Use single-sample processing
-                        energy = self.energy_calculator(u_total_batch[0])
+
+                    energies = self.energy_calculator(u_total_batch)
+                    energy = torch.mean(energies)  # Average energy across batch
+             
 
                     volume_sample_indices = [0, min(5, batch_size-1), rest_idx]  # Rest shape + a couple samples
                     volume_results = []
@@ -876,7 +879,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = -improvement_loss #+ 1e5 * ortho #+ 1e5*  origin 
+                    loss = -improvement_loss + 1e3 * ortho #+ 1e5*  origin 
 
 
                     loss.backward()
@@ -1560,6 +1563,111 @@ class Routine:
         plt.show()
         
         return fig
+    
+    def analyze_latent_correlations(self, delta=0.01, save_path=None):
+        """
+        Analyze correlations between latent dimensions by computing gradient at origin.
+        
+        Args:
+            delta: Small perturbation for finite difference approximation
+            save_path: Path to save visualization
+        """
+        print("Analyzing latent space correlations...")
+        
+        # Get latent dimension
+        latent_dim = self.model.latent_dim
+        
+        # Create base zero latent vector (origin)
+        z0 = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+        
+        # Get base output at origin
+        with torch.no_grad():
+            output0 = self.model(z0).flatten()
+        
+        # Initialize correlation matrix and norm vectors
+        corr_matrix = torch.zeros((latent_dim, latent_dim), device=self.device, dtype=torch.float64)
+        norm_squared = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+        
+        # Compute perturbed outputs for each latent dimension
+        perturbed_outputs = []
+        for i in range(latent_dim):
+            # Perturb the i-th dimension
+            zi = z0.clone()
+            zi[i] += delta
+            
+            # Compute output with perturbation
+            with torch.no_grad():
+                outputi = self.model(zi).flatten()
+            
+            # Store direction vector (scaled gradient)
+            perturbed_outputs.append(outputi)
+        
+        # Compute E = [e1|e2|...|en] matrix where each ei is a gradient direction
+        # And compute correlation matrix ET E incrementally
+        for i in range(latent_dim):
+            # Direction vector for dimension i (gradient approximation)
+            dir_i = (perturbed_outputs[i] - output0) / delta
+            
+            # Update squared norm
+            norm_squared[i] = torch.dot(dir_i, dir_i)
+            
+            # Compute correlations
+            for j in range(latent_dim):
+                dir_j = (perturbed_outputs[j] - output0) / delta
+                dot_product = torch.dot(dir_i, dir_j)
+                corr_matrix[i, j] = dot_product
+        
+        # Normalize to get correlations (-1 to 1 scale)
+        for i in range(latent_dim):
+            for j in range(latent_dim):
+                denominator = torch.sqrt(norm_squared[i] * norm_squared[j])
+                if denominator > 1e-10:
+                    corr_matrix[i, j] /= denominator
+        
+        # Visualize the correlation matrix
+        fig = self.visualize_correlation_matrix(corr_matrix, save_path)
+        
+        print("Latent correlation analysis complete.")
+        return corr_matrix, fig
+    
+
+    def visualize_correlation_matrix(self, corr_matrix, save_path=None):
+        """Visualize the correlation matrix between latent dimensions."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import seaborn as sns
+        
+        # Convert to numpy for visualization
+        corr_np = corr_matrix.cpu().numpy()
+        
+        # Create figure
+        plt.figure(figsize=(10, 8))
+        
+        # Use seaborn for nicer heatmap
+        mask = np.zeros_like(corr_np, dtype=bool)
+        #mask[np.triu_indices_from(mask)] = True  # Optional: show only lower triangle
+        
+        # Plot correlation matrix
+        sns.heatmap(corr_np, mask=mask, cmap='RdBu_r', vmin=-1, vmax=1,
+                    square=True, linewidths=.5, annot=True, fmt='.2f',
+                    cbar_kws={"shrink": .8, "label": "Correlation"})
+        
+        # Set labels
+        latent_dim = corr_np.shape[0]
+        plt.xticks(np.arange(latent_dim) + 0.5, [f'z{i}' for i in range(latent_dim)])
+        plt.yticks(np.arange(latent_dim) + 0.5, [f'z{i}' for i in range(latent_dim)], rotation=0)
+        
+        # Add title
+        plt.title('Neural Modes Latent Space Correlation Matrix', fontsize=14)
+        plt.tight_layout()
+        
+        # Save if requested
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Correlation matrix visualization saved to {save_path}")
+        
+        plt.show()
+        return plt.gcf()
 
 def main():
     print("Starting main function...")
@@ -1626,6 +1734,10 @@ def main():
     print("\nVisualizing latent space modes...")
     # Visualize all latent dimensions
     engine.visualize_latent_space(num_samples=5)
+
+    print("\nAnalyzing latent space correlations...")
+    correlation_matrix_path = os.path.join('checkpoints', 'latent_correlations.png')
+    corr_matrix, _ = engine.analyze_latent_correlations(delta=0.01, save_path=correlation_matrix_path)
 
     print("\nPlotting training metrics...")
     metrics_plot_path = os.path.join('checkpoints', 'training_metrics.png')

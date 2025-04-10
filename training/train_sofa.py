@@ -14,7 +14,7 @@ from ufl import TrialFunction, TestFunction, inner, dx, grad, sym, Identity, div
 import traceback
 from scipy import sparse
 
-from tests.solver import EnergyModel, NeoHookeanEnergyModel, ModularNeoHookeanEnergy, UFLNeoHookeanModel
+from tests.solver import UFLNeoHookeanModel
 
 
 
@@ -114,949 +114,131 @@ class Net(torch.nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-class SOFANeoHookeanEnergy(torch.nn.Module):
+class ResidualNet(torch.nn.Module):
     """
-    NeoHookean energy implementation following SOFA's formulation, fully vectorized
-    for batch processing with PyTorch.
-    
-    This implementation follows the formulation from SOFA's neohookean.cpp:
-    W = 0.5 * mu * (IC - 3) - mu * log(J) + 0.5 * lambda * log(J)^2
+    Residual network architecture that ensures model(0) = 0 by design.
+    Uses skip connections and ensures zero output for zero input.
     """
-    def __init__(self, domain, degree, E, nu, precompute_matrices=True, device=None,
-                 dtype=torch.float64, batch_size=100):
-        super(SOFANeoHookeanEnergy, self).__init__()
+    def __init__(self, latent_dim, output_dim, hid_layers=3, hid_dim=128, 
+                 activation=torch.nn.functional.leaky_relu, zero_init_output=True):
+        """
+        Neural network with residual connections and guaranteed zero-mapping property.
         
-        # Set device and precision
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = dtype
-        self.batch_size = batch_size
+        Args:
+            latent_dim: Dimension of input latent space
+            output_dim: Dimension of output space
+            hid_layers: Number of hidden layers
+            hid_dim: Width of hidden layers
+            activation: Activation function to use (default: leaky_relu)
+            zero_init_output: Whether to initialize the output layer to near-zero weights
+        """
+        super(ResidualNet, self).__init__()
         
-        # Material properties
-        self.E = E
-        self.nu = nu
-        self.mu = E / (2 * (1 + nu))  # Shear modulus
-        self.lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))  # First Lamé parameter
+        self.latent_dim = latent_dim
+        self.output_dim = output_dim
+        self.activation = activation
         
-        # Extract mesh information
-        self.coordinates = torch.tensor(domain.geometry.x, dtype=self.dtype, device=self.device)
-        self.num_nodes = self.coordinates.shape[0]
-        self.dim = self.coordinates.shape[1]
+        # Input projection layer (latent → hidden)
+        self.input_proj = torch.nn.Linear(latent_dim, hid_dim, bias=False)
         
-        # Create elements tensor
-        elements_list = []
-        tdim = domain.topology.dim
-        for cell in range(domain.topology.index_map(tdim).size_local):
-            elements_list.append(domain.topology.connectivity(tdim, 0).links(cell))
+        # Residual blocks
+        self.res_blocks = torch.nn.ModuleList()
+        for _ in range(hid_layers):
+            block = torch.nn.Sequential(
+                torch.nn.Linear(hid_dim, hid_dim, bias=False),
+                torch.nn.LayerNorm(hid_dim, elementwise_affine=False),
+                torch.nn.Linear(hid_dim, hid_dim, bias=False),
+                torch.nn.LayerNorm(hid_dim, elementwise_affine=False)
+            )
+            self.res_blocks.append(block)
         
-        # Convert directly to device tensor in one step
-        self.elements = torch.tensor(np.array(elements_list), dtype=torch.long, device=self.device)
-        self.num_elements = len(self.elements)
-        self.nodes_per_element = self.elements.shape[1]
+        # Output projection (hidden → output)
+        self.output_proj = torch.nn.Linear(hid_dim, output_dim, bias=False)
+
+        # Initialize weights
+        # self._init_weights(zero_init_output)
+        #zero last layer weights
+        torch.nn.init.zeros_(self.output_proj.weight)
+
+    def _init_weights(self, zero_init_output):
+        """Initialize network weights properly for stable training and zero mapping."""
+        # Initialize input projection with Kaiming
+        torch.nn.init.kaiming_normal_(self.input_proj.weight, nonlinearity='leaky_relu')
         
-        # Determine element type
-        if self.nodes_per_element == 4:
-            self.element_type = "tetrahedron"
-        elif self.nodes_per_element == 8:
-            self.element_type = "hexahedron"
+        # Initialize residual blocks
+        for block in self.res_blocks:
+            for i, layer in enumerate(block):
+                if isinstance(layer, torch.nn.Linear):
+                    # For linear layers, use Kaiming initialization
+                    torch.nn.init.kaiming_normal_(layer.weight, nonlinearity='leaky_relu')
+                    # Scale down the second layer in each block for stability
+                    if i == 2:  # Second linear layer in the block
+                        layer.weight.data.mul_(0.1)
+        
+        # Initialize output projection to small values
+        if zero_init_output:
+            torch.nn.init.normal_(self.output_proj.weight, mean=0.0, std=0.01)
         else:
-            raise ValueError(f"Unsupported element type with {self.nodes_per_element} nodes")
-        
-        print(f"Mesh: {self.num_elements} {self.element_type} elements, {self.num_nodes} nodes")
-        
-        # Generate quadrature points
-        self.quadrature_points, self.quadrature_weights = self._generate_quadrature()
-        print(f"Using {len(self.quadrature_weights)} quadrature points per element")
-        
-        # Memory-efficient precomputation strategy
-        self.precomputed = False
-        if precompute_matrices:
-            mem_estimate = self._estimate_precompute_memory()
-            print(f"Estimated memory for precomputation: {mem_estimate:.2f} GB")
-            if mem_estimate > 2.0:  # Arbitrary threshold, adjust based on your hardware
-                print("Warning: High memory usage for precomputation. Proceeding with caution.")
-            self._precompute_derivatives_in_chunks()
-            self.precomputed = True
-
-    def _estimate_precompute_memory(self):
-        """Estimate memory needed for precomputation in GB"""
-        num_qp = len(self.quadrature_points)
-        bytes_per_element = (
-            # dN_dx_all: [num_elements, num_qp, nodes_per_element, 3]
-            self.num_elements * num_qp * self.nodes_per_element * 3 * self.dtype.itemsize +
-            # detJ_all: [num_elements, num_qp]
-            self.num_elements * num_qp * self.dtype.itemsize
-        )
-        return bytes_per_element / (1024**3)  # Convert to GB
-
-    def _generate_quadrature(self):
-        """Generate quadrature rules optimized for Neo-Hookean materials"""
-        if self.element_type == "tetrahedron":
-            # 4-point quadrature for tetrahedron (more accurate for nonlinear materials)
-            points = torch.tensor([
-                [0.58541020, 0.13819660, 0.13819660],
-                [0.13819660, 0.58541020, 0.13819660],
-                [0.13819660, 0.13819660, 0.58541020],
-                [0.13819660, 0.13819660, 0.13819660]
-            ], dtype=self.dtype, device=self.device)
-            weights = torch.tensor([0.25, 0.25, 0.25, 0.25], dtype=self.dtype, device=self.device) / 6.0
-        else:  # hexahedron
-            # 2×2×2 Gaussian quadrature
-            gp = 1.0 / math.sqrt(3)
-            points = []
-            weights = []
-            for i in [-gp, gp]:
-                for j in [-gp, gp]:
-                    for k in [-gp, gp]:
-                        points.append([i, j, k])
-                        weights.append(1.0)
-            points = torch.tensor(points, dtype=self.dtype, device=self.device)
-            weights = torch.tensor(weights, dtype=self.dtype, device=self.device)
-        
-        return points, weights
+            torch.nn.init.kaiming_normal_(self.output_proj.weight, nonlinearity='linear')
+            self.output_proj.weight.data.mul_(0.01)  # Scale down regardless
     
-    def _precompute_derivatives_in_chunks(self):
-        """Precompute derivatives in a format optimized for batch operations"""
-        print("Precomputing derivatives for efficient batch processing...")
-        
-        # Count total quadrature points per element
-        num_qp = len(self.quadrature_points)
-        
-        # Initialize storage as tensors rather than lists of lists
-        self.dN_dx_all = torch.zeros((self.num_elements, num_qp, self.nodes_per_element, 3), 
-                                   dtype=self.dtype, device=self.device)
-        self.detJ_all = torch.zeros((self.num_elements, num_qp), 
-                                  dtype=self.dtype, device=self.device)
-        
-        # Process elements in chunks
-        for chunk_start in range(0, self.num_elements, self.batch_size):
-            chunk_end = min(chunk_start + self.batch_size, self.num_elements)
-            
-            for e in range(chunk_start, chunk_end):
-                element_nodes = self.elements[e].long()
-                element_coords = self.coordinates[element_nodes]
-                
-                for q_idx in range(num_qp):
-                    qp = self.quadrature_points[q_idx]
-                    dN_dx, detJ = self._compute_derivatives(element_coords, qp)
-                    
-                    # Store in tensor format
-                    self.dN_dx_all[e, q_idx] = dN_dx
-                    self.detJ_all[e, q_idx] = detJ
-            
-            # Clear GPU cache after each chunk
-            if torch.cuda.is_available() and (chunk_end - chunk_start) > 1000:
-                torch.cuda.empty_cache()
-        
-        est_memory = self._estimate_precompute_memory()
-        print(f"Precomputation complete. Memory usage: {est_memory:.2f} GB")
-    
-    def _compute_derivatives(self, element_coords, qp):
-        """Compute shape function derivatives for an element at a quadrature point"""
-        if element_coords.shape[0] == 4:  # tetrahedron
-            # Shape function derivatives for tetrahedron (constant)
-            dN_dxi = torch.tensor([
-                [-1.0, -1.0, -1.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0]
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # Jacobian calculation
-            J = torch.matmul(element_coords.T, dN_dxi)
-            detJ = torch.det(J)
-            invJ = torch.linalg.inv(J)
-            
-            # Shape function derivatives w.r.t. physical coordinates
-            dN_dx = torch.matmul(dN_dxi, invJ)
-            
-        else:  # hexahedron with 8 nodes
-            xi, eta, zeta = qp
-            
-            # Precompute terms for efficiency
-            xim = 1.0 - xi
-            xip = 1.0 + xi
-            etam = 1.0 - eta
-            etap = 1.0 + eta
-            zetam = 1.0 - zeta
-            zetap = 1.0 + zeta
-            
-            # Shape function derivatives using vectorized operations
-            dN_dxi = torch.zeros((8, 3), dtype=self.dtype, device=element_coords.device)
-            
-            # First derivatives with respect to xi
-            dN_dxi[:, 0] = torch.tensor([
-                -0.125 * etam * zetam,
-                0.125 * etam * zetam,
-                0.125 * etap * zetam,
-                -0.125 * etap * zetam,
-                -0.125 * etam * zetap,
-                0.125 * etam * zetap,
-                0.125 * etap * zetap,
-                -0.125 * etap * zetap
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # First derivatives with respect to eta
-            dN_dxi[:, 1] = torch.tensor([
-                -0.125 * xim * zetam,
-                -0.125 * xip * zetam,
-                0.125 * xip * zetam,
-                0.125 * xim * zetam,
-                -0.125 * xim * zetap,
-                -0.125 * xip * zetap,
-                0.125 * xip * zetap,
-                0.125 * xim * zetap
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # First derivatives with respect to zeta
-            dN_dxi[:, 2] = torch.tensor([
-                -0.125 * xim * etam,
-                -0.125 * xip * etam,
-                -0.125 * xip * etap,
-                -0.125 * xim * etap,
-                0.125 * xim * etam,
-                0.125 * xip * etam,
-                0.125 * xip * etap,
-                0.125 * xim * etap
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # Jacobian calculation
-            J = torch.matmul(element_coords.T, dN_dxi)
-            detJ = torch.det(J)
-            invJ = torch.linalg.inv(J)
-            
-            # Shape function derivatives w.r.t. physical coordinates
-            dN_dx = torch.matmul(dN_dxi, invJ)
-            
-        return dN_dx, detJ
-    
-    def _compute_sofa_neohookean_energy_batch(self, batch_F):
+    def forward(self, x):
         """
-        Compute NeoHookean strain energy density following SOFA's formulation
-        for a batch of deformation gradients with numerical stability improvements
+        Forward pass with residual connections.
+        Ensures model(0) = 0 by design due to absence of bias terms.
         
         Args:
-            batch_F: Tensor of shape [batch_size, 3, 3] containing deformation gradients
-        
-        Returns:
-            Tensor of shape [batch_size] containing energy densities
+            x: Input latent vector(s)
         """
-        # Compute J = det(F) for all elements in batch
-        batch_J = torch.linalg.det(batch_F)
-        
-        # Compute right Cauchy-Green tensor C = F^T·F
-        batch_C = torch.bmm(batch_F.transpose(1, 2), batch_F)
-        
-        # Compute first invariant of C (trace of C)
-        batch_I1 = torch.diagonal(batch_C, dim1=1, dim2=2).sum(dim=1)
-        
-        # Create storage for energy
-        batch_size = batch_F.shape[0]
-        batch_W = torch.zeros(batch_size, dtype=self.dtype, device=self.device)
-        
-        # Handle different J regimes for numerical stability
-        
-        # Valid J values (J > threshold)
-        valid_mask = batch_J > 1e-6
-        if torch.any(valid_mask):
-            valid_J = batch_J[valid_mask]
-            valid_I1 = batch_I1[valid_mask]
-            valid_log_J = torch.log(valid_J)
+        # Handle both single vectors and batches
+        is_batched = x.dim() > 1
+        if not is_batched:
+            x = x.unsqueeze(0)  # Add batch dimension
             
-            # SOFA formulation: W = 0.5 * mu * (IC - 3) - mu * log(J) + 0.5 * lambda * log(J)^2
-            term1 = 0.5 * self.mu * (valid_I1 - 3.0)
-            term2 = -self.mu * valid_log_J
-            term3 = 0.5 * self.lmbda * torch.pow(valid_log_J, 2)
-            
-            batch_W[valid_mask] = term1 + term2 + term3
+        # Input projection & activation
+        h = self.activation(self.input_proj(x))
         
-        # Small positive J values (need Taylor expansion for log)
-        small_mask = (batch_J > 0) & (batch_J <= 1e-6)
-        if torch.any(small_mask):
-            small_J = batch_J[small_mask]
-            small_I1 = batch_I1[small_mask]
+        # Process through residual blocks
+        for block in self.res_blocks:
+            # Compute block output
+            block_output = block[0](h)  # First linear
+            block_output = self.activation(block_output)
+            block_output = block[1](block_output)  # First normalization
+            block_output = block[2](block_output)  # Second linear
+            block_output = self.activation(block_output)
+            block_output = block[3](block_output)  # Second normalization
             
-            # Taylor series for log(J) near 0: log(J) ≈ (J-1) - (J-1)^2/2 + ...
-            approx_log_J = small_J - 1.0 - (small_J - 1.0)**2 / 2.0
+            # Add residual connection
+            h = h + block_output
             
-            # Apply SOFA's formula with approximated log(J)
-            term1 = 0.5 * self.mu * (small_I1 - 3.0)
-            term2 = -self.mu * approx_log_J
-            term3 = 0.5 * self.lmbda * torch.pow(approx_log_J, 2)
-            
-            batch_W[small_mask] = term1 + term2 + term3
-            
-            # Add barrier term to prevent J → 0
-            barrier = 1e2 * torch.pow(1e-6 - small_J, 2)
-            batch_W[small_mask] += barrier
+        # Output projection
+        y = self.output_proj(h)
         
-        # Negative J values (inverted elements)
-        invalid_mask = batch_J <= 0
-        if torch.any(invalid_mask):
-            # Apply strong penalty for inverted elements
-            batch_W[invalid_mask] = 1e6 * torch.abs(batch_J[invalid_mask])
-        
-        return batch_W
+        # Remove batch dimension if input wasn't batched
+        if not is_batched:
+            y = y.squeeze(0)
+            
+        return y
     
-    def _compute_PK2_batch(self, batch_F):
-        """
-        Compute the Second Piola-Kirchhoff stress tensor following SOFA's formulation
-        for a batch of deformation gradients
-        
-        Args:
-            batch_F: Tensor of shape [batch_size, 3, 3] containing deformation gradients
+    def verify_zero_property(self, epsilon=1e-6):
+        """Verify that the network maps zero to zero by testing f(0) ≈ 0"""
+        with torch.no_grad():
+            zero_input = torch.zeros(self.latent_dim, device=next(self.parameters()).device)
+            zero_output = self.forward(zero_input)
+            zero_norm = torch.norm(zero_output).item()
             
-        Returns:
-            Tensor of shape [batch_size, 3, 3] containing PK2 tensors
-        """
-        # Create identity matrix (repeated for the batch)
-        batch_size = batch_F.shape[0]
-        batch_I = torch.eye(3, dtype=self.dtype, device=self.device).expand(batch_size, 3, 3)
-        
-        # Compute J = det(F)
-        batch_J = torch.linalg.det(batch_F)
-        
-        # Compute right Cauchy-Green tensor C = F^T·F
-        batch_C = torch.bmm(batch_F.transpose(1, 2), batch_F)
-        
-        # Compute inverse of C (batched)
-        batch_inv_C = torch.linalg.inv(batch_C)
-        
-        # Compute log(J) with stability
-        # For valid J, use direct formula
-        batch_log_J = torch.zeros_like(batch_J)
-        valid_mask = batch_J > 1e-6
-        batch_log_J[valid_mask] = torch.log(batch_J[valid_mask])
-        
-        # For small J, use Taylor expansion
-        small_mask = (batch_J > 0) & (batch_J <= 1e-6)
-        small_J = batch_J[small_mask]
-        batch_log_J[small_mask] = small_J - 1.0 - (small_J - 1.0)**2 / 2.0
-        
-        # SOFA's formula: SPK = mu * I + (lambda * log(J) - mu) * C^-1
-        term1 = self.mu * batch_I
-        term2 = (self.lmbda * batch_log_J.unsqueeze(-1).unsqueeze(-1) - self.mu) * batch_inv_C
-        
-        batch_PK2 = term1 + term2
-        
-        # Handle inverted elements separately
-        invalid_mask = batch_J <= 0
-        if torch.any(invalid_mask):
-            # For inverted elements, apply a stabilizing force to uninvert
-            inv_indices = torch.where(invalid_mask)[0]
-            for idx in inv_indices:
-                # Create a strong restorative stress that pushes back toward identity
-                F_inv = batch_F[idx]
-                batch_PK2[idx] = 1e4 * (batch_I[0] - F_inv)
-        
-        return batch_PK2
-    
-    def forward(self, u_tensor):
-        """
-        Compute total elastic energy for the displacement field using SOFA's NeoHookean formula
-        with optimized batch operations
-        
-        Args:
-            u_tensor: Displacement field [num_nodes * 3]
+            print(f"Zero-mapping test: ||f(0)|| = {zero_norm:.3e}")
+            passed = zero_norm < epsilon * self.output_dim**0.5
+            print(f"Zero-mapping test {'PASSED' if passed else 'FAILED'}")
             
-        Returns:
-            Total strain energy
-        """
-        # Ensure tensor is on the correct device and type
-        if u_tensor.device != self.device or u_tensor.dtype != self.dtype:
-            u_tensor = u_tensor.to(device=self.device, dtype=self.dtype)
-        
-        # Reshape displacement vector
-        u = u_tensor.reshape(self.num_nodes, self.dim)
-        
-        # Initialize total energy
-        total_energy = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        
-        # Get number of quadrature points
-        num_qp = len(self.quadrature_points)
-        
-        # Process elements in batches for memory efficiency
-        for batch_start in range(0, self.num_elements, self.batch_size):
-            batch_end = min(batch_start + self.batch_size, self.num_elements)
-            batch_elements = self.elements[batch_start:batch_end]
-            batch_size = batch_end - batch_start
-            
-            # Gather element coordinates and displacements for the entire batch
-            batch_coords = self.coordinates[batch_elements]  # [batch, nodes_per_elem, 3]
-            batch_disps = u[batch_elements]                 # [batch, nodes_per_elem, 3]
-            
-            # Initialize batch energy
-            batch_energy = torch.zeros(batch_size, device=self.device, dtype=self.dtype)
-            
-            # Process all quadrature points
-            for q_idx in range(num_qp):
-                if self.precomputed:
-                    # Use precomputed derivatives
-                    batch_dN_dx = self.dN_dx_all[batch_start:batch_end, q_idx]  # [batch, nodes, 3]
-                    batch_detJ = self.detJ_all[batch_start:batch_end, q_idx]    # [batch]
-                else:
-                    # Compute derivatives on-the-fly (less efficient)
-                    qp = self.quadrature_points[q_idx]
-                    batch_dN_dx = []
-                    batch_detJ = []
-                    for i in range(batch_size):
-                        dN_dx, detJ = self._compute_derivatives(batch_coords[i], qp)
-                        batch_dN_dx.append(dN_dx)
-                        batch_detJ.append(detJ)
-                    batch_dN_dx = torch.stack(batch_dN_dx)
-                    batch_detJ = torch.tensor(batch_detJ, device=self.device, dtype=self.dtype)
-                
-                # Compute deformation gradients for all elements at once
-                batch_F = self._compute_F_batch(batch_coords, batch_disps, batch_dN_dx)
-                
-                # Compute energy densities for all elements at once using SOFA's formula
-                batch_energy_density = self._compute_sofa_neohookean_energy_batch(batch_F)
-                
-                # Numerical integration
-                batch_energy += batch_energy_density * batch_detJ * self.quadrature_weights[q_idx]
-            
-            # Sum up all element energies in this batch
-            total_energy += torch.sum(batch_energy)
-            
-            # Clean up memory periodically
-            if torch.cuda.is_available() and batch_size > 500:
-                torch.cuda.empty_cache()
-        
-        return total_energy
-    
-    def compute_batch_energy(self, batch_u):
-        """
-        Process batch of displacement fields efficiently
-        
-        Args:
-            batch_u: Batch of displacement fields [batch_size, num_nodes * 3]
-            
-        Returns:
-            Energies for each displacement field [batch_size]
-        """
-        batch_size = batch_u.shape[0]
-        energies = torch.zeros(batch_size, dtype=self.dtype, device=self.device)
-        
-        # For larger batches, process in smaller chunks to save memory
-        max_samples_per_batch = 4
-        for i in range(0, batch_size, max_samples_per_batch):
-            end_idx = min(i + max_samples_per_batch, batch_size)
-            sub_batch = batch_u[i:end_idx]
-            sub_batch_size = end_idx - i
-            
-            # Process each sample in sub-batch
-            for j in range(sub_batch_size):
-                energies[i + j] = self.forward(sub_batch[j])
-            
-            # Free memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        return energies
-    
-    def _compute_F_batch(self, batch_coords, batch_disps, batch_dN_dx):
-        """
-        Compute deformation gradient F = I + ∇u for a batch of elements using broadcasting
-        
-        Args:
-            batch_coords: Element coordinates [batch_size, nodes_per_element, 3]
-            batch_disps: Element displacements [batch_size, nodes_per_element, 3]
-            batch_dN_dx: Shape function derivatives [batch_size, nodes_per_element, 3]
-            
-        Returns:
-            Batch of deformation gradients [batch_size, 3, 3]
-        """
-        # Initialize deformation gradient as identity for each element in batch
-        batch_size = batch_disps.shape[0]
-        batch_F = torch.eye(3, dtype=self.dtype, device=self.device).expand(batch_size, 3, 3).clone()
-        
-        # Use einsum for efficient batch computation: F += u_i ⊗ ∇N_i
-        batch_F += torch.einsum('bij,bik->bjk', batch_disps, batch_dN_dx)
-        
-        return batch_F
+            return passed, zero_norm
 
 
 
-class StVenantKirchhoffEnergy(torch.nn.Module):
-    """
-    Optimized implementation of Saint Venant-Kirchhoff elastic energy calculation using
-    PyTorch broadcasting operations for improved performance.
-    
-    This model captures geometric nonlinearity while maintaining a linear stress-strain relationship.
-    """
-    def __init__(self, domain, degree, E, nu, precompute_matrices=True, device=None, 
-                 dtype=torch.float64, batch_size=200):
-        super(StVenantKirchhoffEnergy, self).__init__()
-        
-        # Set device and precision
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = dtype
-        self.batch_size = batch_size
-        
-        # Material properties
-        self.E = E
-        self.nu = nu
-        self.mu = E / (2 * (1 + nu))  # Shear modulus
-        self.lambda_ = E * nu / ((1 + nu) * (1 - 2 * nu))  # First Lamé parameter
-        
-        # Extract mesh information
-        self.coordinates = torch.tensor(domain.geometry.x, dtype=self.dtype, device=self.device)
-        self.num_nodes = self.coordinates.shape[0]
-        self.dim = self.coordinates.shape[1]
-        
-        # Create elements tensor 
-        elements_list = []
-        tdim = domain.topology.dim
-        for cell in range(domain.topology.index_map(tdim).size_local):
-            elements_list.append(domain.topology.connectivity(tdim, 0).links(cell))
-        
-        # Convert directly to device tensor in one step
-        self.elements = torch.tensor(np.array(elements_list), dtype=torch.long, device=self.device)
-        self.num_elements = len(self.elements)
-        self.nodes_per_element = self.elements.shape[1]
-        
-        # Determine element type
-        if self.nodes_per_element == 4:
-            self.element_type = "tetrahedron"
-        elif self.nodes_per_element == 8:
-            self.element_type = "hexahedron"
-        else:
-            raise ValueError(f"Unsupported element type with {self.nodes_per_element} nodes")
-        
-        print(f"Mesh: {self.num_elements} {self.element_type} elements, {self.num_nodes} nodes")
-        
-        # Generate quadrature points - optimized for SVK
-        self.quadrature_points, self.quadrature_weights = self._generate_quadrature()
-        print(f"Using {len(self.quadrature_weights)} quadrature points per element")
-        
-        # Memory-efficient precomputation strategy
-        self.precomputed = False
-        if precompute_matrices:
-            self._precompute_derivatives_in_chunks()
-            self.precomputed = True
 
-    def _estimate_precompute_memory(self):
-        """Estimate memory needed for precomputation in GB"""
-        num_qp = len(self.quadrature_points)
-        bytes_per_element = (
-            # dN_dx_all: [num_elements, num_qp, nodes_per_element, 3]
-            self.num_elements * num_qp * self.nodes_per_element * 3 * self.dtype.itemsize +
-            # detJ_all: [num_elements, num_qp]
-            self.num_elements * num_qp * self.dtype.itemsize
-        )
-        return bytes_per_element / (1024**3)  # Convert to GB
 
-    def _generate_quadrature(self):
-        """Generate optimized quadrature rules based on element type"""
-        if self.element_type == "tetrahedron":
-            # For SVK, one-point quadrature is often sufficient for tetrahedral elements
-            points = torch.tensor([
-                [0.25, 0.25, 0.25]
-            ], dtype=self.dtype, device=self.device)
-            weights = torch.tensor([1.0/6.0], dtype=self.dtype, device=self.device)
-        else:  # hexahedron
-            # 2×2×2 Gaussian quadrature
-            gp = 1.0 / math.sqrt(3)
-            points = []
-            weights = []
-            for i in [-gp, gp]:
-                for j in [-gp, gp]:
-                    for k in [-gp, gp]:
-                        points.append([i, j, k])
-                        weights.append(1.0)
-            points = torch.tensor(points, dtype=self.dtype, device=self.device)
-            weights = torch.tensor(weights, dtype=self.dtype, device=self.device)
-        
-        return points, weights
-    
-    def _precompute_derivatives_in_chunks(self):
-        """Precompute derivatives in a format optimized for batch operations"""
-        print("Precomputing derivatives for efficient batch processing...")
-        
-        # Count total quadrature points per element
-        num_qp = len(self.quadrature_points)
-        
-        # Initialize storage as tensors rather than lists of lists
-        self.dN_dx_all = torch.zeros((self.num_elements, num_qp, self.nodes_per_element, 3), 
-                                   dtype=self.dtype, device=self.device)
-        self.detJ_all = torch.zeros((self.num_elements, num_qp), 
-                                  dtype=self.dtype, device=self.device)
-        
-        # Process elements in chunks
-        for chunk_start in range(0, self.num_elements, self.batch_size):
-            chunk_end = min(chunk_start + self.batch_size, self.num_elements)
-            
-            for e in range(chunk_start, chunk_end):
-                element_nodes = self.elements[e].long()
-                element_coords = self.coordinates[element_nodes]
-                
-                for q_idx in range(num_qp):
-                    qp = self.quadrature_points[q_idx]
-                    dN_dx, detJ = self._compute_derivatives(element_coords, qp)
-                    
-                    # Store in tensor format
-                    self.dN_dx_all[e, q_idx] = dN_dx
-                    self.detJ_all[e, q_idx] = detJ
-            
-            # Clear GPU cache after each chunk
-            if torch.cuda.is_available() and (chunk_end - chunk_start) > 1000:
-                torch.cuda.empty_cache()
-        
-        est_memory = self._estimate_precompute_memory()
-        print(f"Precomputation complete. Memory usage: {est_memory:.2f} GB")
-    
-    def _compute_derivatives(self, element_coords, qp):
-        """Compute shape function derivatives for an element at a quadrature point"""
-        if element_coords.shape[0] == 4:  # tetrahedron
-            # Shape function derivatives for tetrahedron (constant)
-            dN_dxi = torch.tensor([
-                [-1.0, -1.0, -1.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0]
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # Jacobian calculation
-            J = torch.matmul(element_coords.T, dN_dxi)
-            detJ = torch.det(J)
-            invJ = torch.linalg.inv(J)
-            
-            # Shape function derivatives w.r.t. physical coordinates
-            dN_dx = torch.matmul(dN_dxi, invJ)
-            
-        else:  # hexahedron with 8 nodes
-            xi, eta, zeta = qp
-            
-            # Precompute terms for efficiency
-            xim = 1.0 - xi
-            xip = 1.0 + xi
-            etam = 1.0 - eta
-            etap = 1.0 + eta
-            zetam = 1.0 - zeta
-            zetap = 1.0 + zeta
-            
-            # Shape function derivatives using vectorized operations
-            dN_dxi = torch.zeros((8, 3), dtype=self.dtype, device=element_coords.device)
-            
-            # First derivatives with respect to xi
-            dN_dxi[:, 0] = torch.tensor([
-                -0.125 * etam * zetam,
-                0.125 * etam * zetam,
-                0.125 * etap * zetam,
-                -0.125 * etap * zetam,
-                -0.125 * etam * zetap,
-                0.125 * etam * zetap,
-                0.125 * etap * zetap,
-                -0.125 * etap * zetap
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # First derivatives with respect to eta
-            dN_dxi[:, 1] = torch.tensor([
-                -0.125 * xim * zetam,
-                -0.125 * xip * zetam,
-                0.125 * xip * zetam,
-                0.125 * xim * zetam,
-                -0.125 * xim * zetap,
-                -0.125 * xip * zetap,
-                0.125 * xip * zetap,
-                0.125 * xim * zetap
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # First derivatives with respect to zeta
-            dN_dxi[:, 2] = torch.tensor([
-                -0.125 * xim * etam,
-                -0.125 * xip * etam,
-                -0.125 * xip * etap,
-                -0.125 * xim * etap,
-                0.125 * xim * etam,
-                0.125 * xip * etam,
-                0.125 * xip * etap,
-                0.125 * xim * etap
-            ], dtype=self.dtype, device=element_coords.device)
-            
-            # Jacobian calculation
-            J = torch.matmul(element_coords.T, dN_dxi)
-            detJ = torch.det(J)
-            invJ = torch.linalg.inv(J)
-            
-            # Shape function derivatives w.r.t. physical coordinates
-            dN_dx = torch.matmul(dN_dxi, invJ)
-            
-        return dN_dx, detJ
-    
-    def _compute_F_batch(self, batch_coords, batch_disps, batch_dN_dx):
-        """
-        Compute deformation gradient F = I + ∇u for a batch of elements using broadcasting
-        
-        Args:
-            batch_coords: Element coordinates [batch_size, nodes_per_element, 3]
-            batch_disps: Element displacements [batch_size, nodes_per_element, 3]
-            batch_dN_dx: Shape function derivatives [batch_size, nodes_per_element, 3]
-            
-        Returns:
-            Batch of deformation gradients [batch_size, 3, 3]
-        """
-        # Initialize deformation gradient as identity for each element in batch
-        batch_size = batch_disps.shape[0]
-        batch_F = torch.eye(3, dtype=self.dtype, device=self.device).expand(batch_size, 3, 3).clone()
-        
-        # Use einsum for efficient batch computation: F += u_i ⊗ ∇N_i
-        # This computes the outer product for each element and node, then sums over nodes
-        batch_F += torch.einsum('bij,bik->bjk', batch_disps, batch_dN_dx)
-        
-        return batch_F
-    
-    def _compute_svk_energy_density_batch(self, batch_F):
-        """
-        Compute Saint Venant-Kirchhoff strain energy density for a batch of deformation gradients
-        
-        Args:
-            batch_F: Tensor of shape [batch_size, 3, 3] containing deformation gradients
-        
-        Returns:
-            Tensor of shape [batch_size] containing energy densities
-        """
-        # Identity matrix expanded to batch size
-        batch_size = batch_F.shape[0]
-        batch_I = torch.eye(3, dtype=self.dtype, device=self.device).expand(batch_size, 3, 3)
-        
-        # Right Cauchy-Green tensor C = F^T F
-        batch_C = torch.bmm(batch_F.transpose(1, 2), batch_F)
-        
-        # Green-Lagrange strain tensor E = (1/2)(C - I)
-        batch_E = 0.5 * (batch_C - batch_I)
-        
-        # Calculate tr(E) and tr(E²)
-        batch_trE = torch.diagonal(batch_E, dim1=1, dim2=2).sum(dim=1)
-        batch_E_squared = torch.bmm(batch_E, batch_E)
-        batch_trE_squared = torch.diagonal(batch_E_squared, dim1=1, dim2=2).sum(dim=1)
-        
-        # SVK strain energy W = (λ/2)(tr(E))² + μtr(E²)
-        batch_W = 0.5 * self.lambda_ * batch_trE**2 + self.mu * batch_trE_squared
-        
-        # Add regularization for severely compressed elements
-        batch_J = torch.linalg.det(batch_F)
-        penalty = torch.where(batch_J < 0.01, 1e6 * (0.01 - batch_J)**2, 
-                            torch.zeros_like(batch_J))
-        
-        return batch_W + penalty
-    
-    def forward(self, u_tensor):
-        """
-        Compute total elastic energy for the displacement field using optimized batch operations
-        
-        Args:
-            u_tensor: Displacement field [num_nodes * 3]
-            
-        Returns:
-            Total strain energy
-        """
-        # Ensure tensor is on the correct device and type
-        if u_tensor.device != self.device or u_tensor.dtype != self.dtype:
-            u_tensor = u_tensor.to(device=self.device, dtype=self.dtype)
-        
-        # Reshape displacement vector
-        u = u_tensor.reshape(self.num_nodes, self.dim)
-        
-        # Initialize total energy
-        total_energy = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        
-        # Get number of quadrature points
-        num_qp = len(self.quadrature_points)
-        
-        # Process elements in batches for memory efficiency
-        for batch_start in range(0, self.num_elements, self.batch_size):
-            batch_end = min(batch_start + self.batch_size, self.num_elements)
-            batch_elements = self.elements[batch_start:batch_end]
-            batch_size = batch_end - batch_start
-            
-            # Gather element coordinates and displacements for the entire batch
-            batch_coords = self.coordinates[batch_elements]  # [batch, nodes_per_elem, 3]
-            batch_disps = u[batch_elements]                 # [batch, nodes_per_elem, 3]
-            
-            # Initialize batch energy
-            batch_energy = torch.zeros(batch_size, device=self.device, dtype=self.dtype)
-            
-            # Process all quadrature points
-            for q_idx in range(num_qp):
-                if self.precomputed:
-                    # Use precomputed derivatives
-                    batch_dN_dx = self.dN_dx_all[batch_start:batch_end, q_idx]  # [batch, nodes, 3]
-                    batch_detJ = self.detJ_all[batch_start:batch_end, q_idx]    # [batch]
-                else:
-                    # Compute derivatives on-the-fly (less efficient)
-                    qp = self.quadrature_points[q_idx]
-                    batch_dN_dx = []
-                    batch_detJ = []
-                    for i in range(batch_size):
-                        dN_dx, detJ = self._compute_derivatives(batch_coords[i], qp)
-                        batch_dN_dx.append(dN_dx)
-                        batch_detJ.append(detJ)
-                    batch_dN_dx = torch.stack(batch_dN_dx)
-                    batch_detJ = torch.tensor(batch_detJ, device=self.device, dtype=self.dtype)
-                
-                # Compute deformation gradients for all elements at once
-                batch_F = self._compute_F_batch(batch_coords, batch_disps, batch_dN_dx)
-                
-                # Compute energy densities for all elements at once
-                batch_energy_density = self._compute_svk_energy_density_batch(batch_F)
-                
-                # Numerical integration
-                batch_energy += batch_energy_density * batch_detJ * self.quadrature_weights[q_idx]
-            
-            # Sum up all element energies in this batch
-            total_energy += torch.sum(batch_energy)
-            
-            # Clean up memory periodically
-            if torch.cuda.is_available() and batch_size > 500:
-                torch.cuda.empty_cache()
-        
-        return total_energy
-    
-    def compute_batch_energy(self, batch_u):
-        """
-        Process batch of displacement fields efficiently
-        
-        Args:
-            batch_u: Batch of displacement fields [batch_size, num_nodes * 3]
-            
-        Returns:
-            Energies for each displacement field [batch_size]
-        """
-        batch_size = batch_u.shape[0]
-        energies = torch.zeros(batch_size, dtype=self.dtype, device=self.device)
-        
-        # For larger batches, process in smaller chunks to save memory
-        max_samples_per_batch = 4
-        for i in range(0, batch_size, max_samples_per_batch):
-            end_idx = min(i + max_samples_per_batch, batch_size)
-            sub_batch = batch_u[i:end_idx]
-            sub_batch_size = end_idx - i
-            
-            # Process each sample in sub-batch
-            for j in range(sub_batch_size):
-                energies[i + j] = self.forward(sub_batch[j])
-            
-            # Free memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        return energies
-    
-    def compute_strains_stresses(self, u_tensor):
-        """
-        Compute strains and stresses across the domain using batch operations
-        
-        Args:
-            u_tensor: Displacement field [num_nodes * 3]
-            
-        Returns:
-            Dictionary with 'strains' and 'stresses' tensors
-        """
-        # Ensure tensor is on correct device/type
-        if u_tensor.device != self.device or u_tensor.dtype != self.dtype:
-            u_tensor = u_tensor.to(device=self.device, dtype=self.dtype)
-        
-        # Reshape displacement vector
-        u = u_tensor.reshape(self.num_nodes, self.dim)
-        
-        # Initialize storage for results
-        strains = torch.zeros((self.num_elements, len(self.quadrature_points), 6), 
-                             dtype=self.dtype, device=self.device)
-        stresses = torch.zeros((self.num_elements, len(self.quadrature_points), 6), 
-                              dtype=self.dtype, device=self.device)
-        
-        # Process elements in batches
-        for batch_start in range(0, self.num_elements, self.batch_size):
-            batch_end = min(batch_start + self.batch_size, self.num_elements)
-            batch_elements = self.elements[batch_start:batch_end]
-            batch_size = batch_end - batch_start
-            
-            # Get coordinates and displacements for this batch
-            batch_coords = self.coordinates[batch_elements]
-            batch_disps = u[batch_elements]
-            
-            # Process each quadrature point
-            for q_idx in range(len(self.quadrature_points)):
-                if self.precomputed:
-                    batch_dN_dx = self.dN_dx_all[batch_start:batch_end, q_idx]
-                    batch_detJ = self.detJ_all[batch_start:batch_end, q_idx]
-                else:
-                    # Compute on-the-fly
-                    qp = self.quadrature_points[q_idx]
-                    batch_dN_dx = []
-                    batch_detJ = []
-                    for i in range(batch_size):
-                        dN_dx, detJ = self._compute_derivatives(batch_coords[i], qp)
-                        batch_dN_dx.append(dN_dx)
-                        batch_detJ.append(detJ)
-                    batch_dN_dx = torch.stack(batch_dN_dx)
-                    batch_detJ = torch.tensor(batch_detJ, device=self.device, dtype=self.dtype)
-                
-                # Compute deformation gradients for all elements at once
-                batch_F = self._compute_F_batch(batch_coords, batch_disps, batch_dN_dx)
-                
-                # Batch identity matrix
-                batch_I = torch.eye(3, dtype=self.dtype, device=self.device).expand(batch_size, 3, 3)
-                
-                # Batch Right Cauchy-Green tensor C = F^T F
-                batch_C = torch.bmm(batch_F.transpose(1, 2), batch_F)
-                
-                # Batch Green-Lagrange strain tensor E = 0.5(C - I)
-                batch_E = 0.5 * (batch_C - batch_I)
-                
-                # Calculate batch Second Piola-Kirchhoff stress tensor
-                # S = λ tr(E) I + 2μ E
-                batch_trE = torch.diagonal(batch_E, dim1=1, dim2=2).sum(dim=1).unsqueeze(-1).unsqueeze(-1)
-                batch_S = self.lambda_ * batch_trE * batch_I + 2 * self.mu * batch_E
-                
-                # Convert tensors to Voigt notation [xx, yy, zz, xy, yz, xz]
-                for b in range(batch_size):
-                    e_idx = batch_start + b
-                    E = batch_E[b]
-                    S = batch_S[b]
-                    
-                    strains[e_idx, q_idx] = torch.tensor([
-                        E[0,0], E[1,1], E[2,2], E[0,1], E[1,2], E[0,2]
-                    ], device=self.device, dtype=self.dtype)
-                    
-                    stresses[e_idx, q_idx] = torch.tensor([
-                        S[0,0], S[1,1], S[2,2], S[0,1], S[1,2], S[0,2]
-                    ], device=self.device, dtype=self.dtype)
-        
-        return {'strains': strains, 'stresses': stresses}
-    
-    def compute_stress_tensor(self, F):
-        """
-        Compute the Second Piola-Kirchhoff stress tensor for a given deformation gradient
-        
-        Args:
-            F: Deformation gradient tensor [3, 3]
-        
-        Returns:
-            Second Piola-Kirchhoff stress tensor [3, 3]
-        """
-        # Identity matrix
-        I = torch.eye(3, dtype=self.dtype, device=self.device)
-        
-        # Right Cauchy-Green tensor
-        C = torch.matmul(F.T, F)
-        
-        # Green-Lagrange strain tensor
-        E = 0.5 * (C - I)
-        
-        # Second Piola-Kirchhoff stress
-        trE = torch.trace(E)
-        S = self.lambda_ * trE * I + 2 * self.mu * E
-        
-        return S
+
+
 
 
 
@@ -1168,9 +350,21 @@ class Routine:
         hid_dim = cfg['model'].get('hid_dim', 64)
         print(f"Output dimension: {output_dim}")
         print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        self.model = Net(self.num_modes, output_dim, hid_layers, hid_dim).to(device).double()
+        # self.model = Net(self.num_modes, output_dim, hid_layers, hid_dim).to(device).double()
 
-        print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
+        # print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
+
+        self.model = ResidualNet(
+            self.num_modes, 
+            output_dim, 
+            hid_layers=hid_layers, 
+            hid_dim=hid_dim,
+            activation=torch.nn.functional.leaky_relu,
+            zero_init_output=True
+        ).to(device).double()
+
+        # After model creation, verify zero property
+        self.model.verify_zero_property()
 
         # Load linear modes
         print("Loading linear eigenmodes...")
@@ -1343,7 +537,7 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 32  # You can add this to config
+        batch_size = 64  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
         print_every = 1
         checkpoint_every = 50
@@ -1382,8 +576,8 @@ class Routine:
         # Use LBFGS optimizer
         optimizer = torch.optim.LBFGS(self.model.parameters(), 
                                     lr=1,
-                                    max_iter=25,
-                                    max_eval=35,
+                                    max_iter=20,
+                                    max_eval=40,
                                     tolerance_grad=1e-05,
                                     tolerance_change=1e-07,
                                     history_size=100,
@@ -1416,28 +610,24 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 0.5
-                deformation_scale_final = 3
+                deformation_scale_init = 0.01
+                deformation_scale_final = 5
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
-                mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)
+                mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
                 mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
                 z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                # Generate mixed batch with varying scales
 
-                # max_scale = 10.0
-                # z = torch.zeros(batch_size, L, device=self.device, dtype=torch.float64)
-                # scales = torch.linspace(0.5, max_scale, batch_size)
-                # for i in range(batch_size):
-                # z[i] = torch.rand(L, device=self.device) * scales[i] * 2 - scales[i]
+                #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
+                #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                z[rest_idx, :] = 0  # Set rest shape latent to zero
+                # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -1449,7 +639,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -1476,13 +666,27 @@ class Routine:
                     
                     # After (if processing a batch):
                     batch_size = u_total_batch.shape[0]
-                    if batch_size > 1:
-                        # Use batch processing for multiple samples
-                        energies = self.energy_calculator(u_total_batch)
-                        energy = torch.mean(energies)  # Average energy across batch
-                    else:
-                        # Use single-sample processing
-                        energy = self.energy_calculator(u_total_batch[0])
+
+                    energies = self.energy_calculator(u_total_batch)
+                    energy = torch.mean(energies)  # Average energy across batch
+             
+
+                    volume_sample_indices = [0, min(5, batch_size-1), rest_idx]  # Rest shape + a couple samples
+                    volume_results = []
+                    for idx in volume_sample_indices:
+                        vol_result = self.energy_calculator.compute_volume_comparison(
+                            l[idx:idx+1], u_total_batch[idx:idx+1])
+                        volume_results.append(vol_result)
+                    
+                    # Calculate average volume metrics across the samples
+                    avg_linear_ratio = sum(r['linear_volume_ratio'] for r in volume_results) / len(volume_results)
+                    avg_neural_ratio = sum(r['neural_volume_ratio'] for r in volume_results) / len(volume_results)
+                    
+                    # Compute volume preservation penalty (squared deviation from 1.0)
+                    vol_penalty = 1000.0 * torch.mean((torch.tensor(
+                        [r['neural_volume_ratio'] for r in volume_results], 
+                        device=self.device, dtype=torch.float64) - 1.0)**2)
+
 
                     # Calculate maximum displacements
                     mean_linear = torch.mean(torch.norm(l.reshape(batch_size, -1, 3), dim=2)).item()
@@ -1498,65 +702,36 @@ class Routine:
                     origin = torch.sum(y[rest_idx]**2)
 
 
-                    displacement_magnitude = torch.norm(l, dim=1, keepdim=True)
-                    displacement_magnitude_mean = torch.mean(displacement_magnitude)
+                 
 
-                    # 1. Scale-normalized energy: E/|u|²
-                    # This measures energy efficiency rather than raw energy
-                    # For linear elasticity, this should be constant (scale-invariant)
-                    scale_factor = torch.clamp(displacement_magnitude_mean, min=1e-6)**2
-                    normalized_energy = energy / scale_factor
+                    # Scale energy by maximum linear displacement to get comparable units
+                    max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
+                    energies_scaling = energies / (max_linear_disp + 1e-8)  # Add epsilon to avoid division by zero
 
-                
-                    # 2. Energy with physically expected scaling
-                    # For Neo-Hookean materials, energy scales approximately with |u|²
-
-                    energy_scaling = torch.log10(torch.square(normalized_energy) + 1)
+                    energy_scaling = torch.mean(energies_scaling)  # Average energy across batch
 
                     # Add incentive for beneficial nonlinearity (energy improvement term)
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
                     energy_linear = self.energy_calculator(u_linear_only).mean()
-                    energy_improvement = (energy_linear - energy)
-                    nonlinear_weight = torch.clamp(normalized_energy, min=0.1, max=10.0)
-                    nonlinear_reward = nonlinear_weight * torch.clamp(energy_improvement, min=0) 
+                    energy_improvement = (torch.relu(energy_linear - energy))/(energy_linear + 1e-8)  
+                    improvement_loss = (energy_linear - energy) / (energy_linear + 1e-8)  
 
-
-
+                                
                     # Get the raw div(P) tensor
                     raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
-                    raw_div_p_L2_mean = torch.mean(torch.norm(raw_div_p, dim=2))
-
-                    # Apply tanh transformation
-                    div_p_magnitude = torch.norm(raw_div_p, dim=2, keepdim=True)
-                    div_p_direction = raw_div_p / (div_p_magnitude + 1e-8)
-
-                    # Apply log scaling to magnitude only
-                    log_div_p_magnitude = torch.log10(div_p_magnitude + 1)
-
-                    # Recombine with original direction
-                    log_scaled_div_p_tensor = log_div_p_magnitude * div_p_direction
-
-                    # log_Scaled_div_p is a tensor of shape [batch_size, num_nodes, 3]
-                    #let's do a mean over the nodes and the batch and resh
-
-                    log_scaled_div_p = torch.mean(torch.norm(log_scaled_div_p_tensor, dim=2))
 
 
-                    #ADD a plotter with only linear modes prediction alongside the neural network prediction
 
-                    div_p_weight = 2.0  # Weight for divergence loss
 
 
                     # Modified loss
-                    loss =  energy + ortho + origin  
+                    loss = -improvement_loss + 1e3 * ortho #+ 1e5*  origin 
+
 
                     loss.backward()
 
-                    # Choose a random latent vector from the batch
-                    random_idx = np.random.randint(1, batch_size)
-                    random_z = z[random_idx].detach().clone()
-                    self.visualize_latent_vector(random_z, iteration, loss_val)
+                    
 
                     # Print stats periodically
                     if iteration % print_every == 0:
@@ -1573,24 +748,31 @@ class Routine:
                         
                         # Energy metrics section
                         print(f"│ ENERGY METRICS:")
-                        print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Normalized Energy:':<20} {normalized_energy.item():<12.6f}")
-                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item():<12.6f} │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
+                        print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Linear Energy:':<20} {energy_linear.item():<12.6f}")
+                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item()*100:.2f}% │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
                         print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f} │ {'Origin Constraint:':<20} {origin.item():<12.6f}")
                         
-                        # Displacement metrics section
-                        print(f"│ DISPLACEMENT METRICS:")
-                        print(f"│ {'Mean Linear:':<20} {mean_linear:<12.6f} │ {'Mean Total:':<20} {mean_total:<12.6f}")
-                        print(f"│ {'Mean Correction:':<20} {mean_correction:<12.6f} │ {'Nonlinear Ratio:':<20} {nonlinear_ratio*100:.2f}%")
+                        # # Displacement metrics section
+                        # print(f"│ DISPLACEMENT METRICS:")
+                        # print(f"│ {'Mean Linear:':<20} {mean_linear:<12.6f} │ {'Mean Total:':<20} {mean_total:<12.6f}")
+                        # print(f"│ {'Mean Correction:':<20} {mean_correction:<12.6f} │ {'Nonlinear Ratio:':<20} {nonlinear_ratio*100:.2f}%")
                         
                         # Divergence metrics section
                         div_p_means = torch.mean(raw_div_p, dim=0).mean(dim=0)
-                        print(f"│ DIVERGENCE METRICS:")
-                        print(f"│ {'Direction:':<20} {'X':<17} {'Y':<17} {'Z':<17}")
-                        print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
-                        print(f"│ {'Div(P) Loss:':<20} {log_scaled_div_p.item():<12.6f} │ {'Raw Div(P) L2:':<20} {raw_div_p_L2_mean.item():<12.6e}")
+                        # print(f"│ DIVERGENCE METRICS:")
+                        # print(f"│ {'Direction:':<20} {'X':<17} {'Y':<17} {'Z':<17}")
+                        # print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
+                        # print(f"│ {'Div(P) Loss:':<20} {log_scaled_div_p.item():<12.6f} │ {'Raw Div(P) L2:':<20} {raw_div_p_L2_mean.item():<12.6e}")
+
+                        # Add volume metrics section
+                        print(f"│ VOLUME PRESERVATION:")
+                        print(f"│ {'Linear Volume Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Volume Ratio:':<20} {avg_neural_ratio:<12.6f}")
+                        print(f"│ {'Linear Volume Change:':<20} {(avg_linear_ratio-1)*100:<12.4f}% │ {'Neural Volume Change:':<20} {(avg_neural_ratio-1)*100:<12.4f}%")
+                        print(f"│ {'Volume Penalty:':<20} {vol_penalty.item():<12.6f}")
+        
                         
                         # Final loss value
                         print(f"{sep_line}")
@@ -1598,7 +780,6 @@ class Routine:
                         print(f"{sep_line}\n")
                     
 
-                                    # Add these lines before return loss
                     energy_val = energy.item()  # Convert tensor to Python scalar
                     ortho_val = ortho.item()
                     origin_val = origin.item()
@@ -1609,7 +790,12 @@ class Routine:
                 # Perform optimization step
                 optimizer.step(closure)
 
-                scheduler.step(loss_val)  # Use the loss value to determine if we should reduce LR
+                scheduler.step(loss_val)  
+
+                # Choose a random latent vector from the batch
+                random_idx = np.random.randint(1, batch_size)
+                random_z = z[random_idx].detach().clone()
+                self.visualize_latent_vector(random_z, iteration, loss_val)
 
             if iteration % 1 == 0:  # Update visualization every 5 iterations
                 pass
@@ -1625,9 +811,6 @@ class Routine:
             # Save checkpoint if this is the best model so far
             if loss_val < best_loss or loss_val < 10:
                 best_loss = loss_val
-                # Estimate checkpoint size
-                checkpoint_size = self.estimate_checkpoint_size()
-                print(f"Estimated checkpoint size: {checkpoint_size:.2f} MB")
                 checkpoint = {
                     'epoch': iteration,
                     'model_state_dict': self.model.state_dict(),
@@ -1654,7 +837,7 @@ class Routine:
             patience += 1
             
             # Early stopping criterion (optional)
-            if loss_val < 1e-8 or patience > 30:
+            if patience > 30: #loss_val < 1e-8 or 
                 print(f"Converged to target loss at iteration {iteration}")
                 break
         
@@ -1664,6 +847,10 @@ class Routine:
         print(f"Training complete. Best loss: {best_loss:.8e}")
         return best_loss
     
+
+
+
+
     def create_live_visualizer(self):
         """Create and return a persistent PyVista plotter for visualization during training"""
         # Convert DOLFINx mesh to PyVista format

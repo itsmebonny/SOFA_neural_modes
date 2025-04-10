@@ -6,7 +6,7 @@ mesh:
 # Material properties
 material:
   youngs_modulus: 10000
-  poissons_ratio: 0.35
+  poissons_ratio: 0.45
   density: 1000
   volume: 10.0
 
@@ -26,14 +26,14 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 12
+  latent_dim: 6
   hid_layers: 32
   hid_dim: 32
   use_modal_derivatives: true
 
 # Training parameters
 training:
-  num_epochs: 15
+  num_epochs: 10
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"

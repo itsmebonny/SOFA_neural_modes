@@ -64,7 +64,7 @@ use_gmsh = True  # Toggle between gmsh (.msh) and box mesh
 mesh_file = "mesh/beam_732.msh"  # Path to .msh file if use_gmsh is True
 # Material properties
 
-E, nu = 10000, 0.35  # Example values for soft tissue
+E, nu = 10000, 0.45  # Example values for soft tissue
 rho = 1000
 
 # Lame's constants
@@ -76,7 +76,7 @@ l_x, l_y, l_z = 1.0, 1.0, 0.01  # Domain dimensions
 n_x, n_y, n_z = 20, 20, 2  # Number of elements
 
 # Number of eigenvalues to compute
-N_eig = 12
+N_eig = 6
 
 # Option to use hybrid mass matrix (set lumping_ratio > 0)
 use_hybrid_mass = True # Set to False to use consistent mass matrix
@@ -456,7 +456,7 @@ def visualize_eigenmodes(domain, V, eigenvectors_np, eigenvalues, num_modes_to_p
         characteristic_length = np.linalg.norm(geometry.max(axis=0) - geometry.min(axis=0))
         max_disp_magnitude = np.max(grid.point_data["magnitude"])
         if max_disp_magnitude > 1e-9:
-             warp_factor = 0.1 * characteristic_length / max_disp_magnitude
+             warp_factor = 0.05 * characteristic_length / max_disp_magnitude
         else:
              warp_factor = 1.0 # No displacement
 
@@ -476,7 +476,7 @@ def visualize_eigenmodes(domain, V, eigenvectors_np, eigenvalues, num_modes_to_p
         plotter.show()
         print(f"  Plot closed.")
 
-visualize_eigenmodes(domain, V, eigenvectors_np, eigenvalues, num_modes_to_plot=min(N_eig, 12))
+visualize_eigenmodes(domain, V, eigenvectors_np, eigenvalues, num_modes_to_plot=min(N_eig, nconv))
 
 
 # --- Functions for latent vector visualization and energy calculation (remain similar) ---

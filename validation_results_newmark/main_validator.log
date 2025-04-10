@@ -1,6 +1,0 @@
-[2025-04-07 16:37:36] main_validator [97mINFO[0m: [97mLoaded config from configs/default.yaml[0m
-[2025-04-07 16:37:37] main_validator [97mINFO[0m: [97mLoading checkpoint from checkpoints/best.pt[0m
-[2025-04-07 16:37:37] main_validator [97mINFO[0m: [97mCheckpoint loaded successfully into model.[0m
-[2025-04-07 16:37:53] main_validator [97mINFO[0m: [97mLoaded config from configs/default.yaml[0m
-[2025-04-07 16:37:54] main_validator [97mINFO[0m: [97mLoading checkpoint from checkpoints/best.pt[0m
-[2025-04-07 16:37:54] main_validator [97mINFO[0m: [97mCheckpoint loaded successfully into model.[0m
