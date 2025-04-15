@@ -165,26 +165,28 @@ class ResidualNet(torch.nn.Module):
         self.activation = activation
         
         # Input projection layer (latent → hidden)
-        self.input_proj = torch.nn.Linear(latent_dim, hid_dim, bias=False)
+        self.input_proj = torch.nn.Linear(latent_dim, hid_dim) #, bias=False)
         
         # Residual blocks
         self.res_blocks = torch.nn.ModuleList()
         for _ in range(hid_layers):
             block = torch.nn.Sequential(
-                torch.nn.Linear(hid_dim, hid_dim, bias=False),
-                torch.nn.LayerNorm(hid_dim, elementwise_affine=False),
-                torch.nn.Linear(hid_dim, hid_dim, bias=False),
-                torch.nn.LayerNorm(hid_dim, elementwise_affine=False)
+                torch.nn.Linear(hid_dim, hid_dim), #, bias=False),
+                torch.nn.LayerNorm(hid_dim), #, elementwise_affine=False),
+                torch.nn.Linear(hid_dim, hid_dim), #, bias=False),
+                torch.nn.LayerNorm(hid_dim) #, elementwise_affine=False)
             )
             self.res_blocks.append(block)
         
         # Output projection (hidden → output)
-        self.output_proj = torch.nn.Linear(hid_dim, output_dim, bias=False)
+        self.output_proj = torch.nn.Linear(hid_dim, output_dim) #, bias=False)
 
         # Initialize weights
         # self._init_weights(zero_init_output)
         #zero last layer weights
         torch.nn.init.zeros_(self.output_proj.weight)
+        torch.nn.init.normal_(self.output_proj.bias, mean=0.0, std=0.01)
+
 
     def _init_weights(self, zero_init_output):
         """Initialize network weights properly for stable training and zero mapping."""
@@ -395,8 +397,6 @@ class Routine:
             zero_init_output=True
         ).to(device).double()
 
-        # After model creation, verify zero property
-        self.model.verify_zero_property()
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
 
@@ -780,7 +780,7 @@ class Routine:
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                # z[rest_idx, :] = 0  # Set rest shape latent to zero
+                z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -792,7 +792,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -879,7 +879,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = -improvement_loss + 1e3 * ortho #+ 1e5*  origin 
+                    loss = -improvement_loss + 1e3 * ortho + 1e2 *  origin 
 
 
                     loss.backward()
