@@ -6,34 +6,19 @@ torch.set_default_dtype(torch.float64)
 from torch.utils.tensorboard import SummaryWriter
 import math
 
-from dolfinx.fem.petsc import assemble_matrix as assemble_matrix_petsc
-from dolfinx.fem import form 
-
-from ufl import TrialFunction, TestFunction, inner, dx, grad, sym, Identity, div
 
 import traceback
 from scipy import sparse
 
-from tests.solver import UFLNeoHookeanModel
-
-
+# --- Import the renamed solver class ---
+from tests.solver import SOFANeoHookeanModel # Use the new class name
 
 # In train.py - add these imports
 import glob
 import json
 import datetime
-
 import matplotlib.pyplot as plt
-
-import pyvista
-from dolfinx import mesh, fem, plot, io, default_scalar_type
-from dolfinx.fem.petsc import LinearProblem
-from dolfinx.io import gmshio
-import gmsh
-from mpi4py import MPI
-import ufl
-from scipy.linalg import eig
- 
+import pyvista # Keep pyvista for visualization
 
 # Add after imports
 from slepc4py import SLEPc
@@ -139,21 +124,21 @@ class ResidualNet(torch.nn.Module):
         self.activation = activation
         
         # Input projection layer (latent → hidden)
-        self.input_proj = torch.nn.Linear(latent_dim, hid_dim, bias=False)
+        self.input_proj = torch.nn.Linear(latent_dim, hid_dim)
         
         # Residual blocks
         self.res_blocks = torch.nn.ModuleList()
         for _ in range(hid_layers):
             block = torch.nn.Sequential(
-                torch.nn.Linear(hid_dim, hid_dim, bias=False),
-                torch.nn.LayerNorm(hid_dim, elementwise_affine=False),
-                torch.nn.Linear(hid_dim, hid_dim, bias=False),
-                torch.nn.LayerNorm(hid_dim, elementwise_affine=False)
+                torch.nn.Linear(hid_dim, hid_dim),
+                torch.nn.LayerNorm(hid_dim),
+                torch.nn.Linear(hid_dim, hid_dim),
+                torch.nn.LayerNorm(hid_dim)
             )
             self.res_blocks.append(block)
         
         # Output projection (hidden → output)
-        self.output_proj = torch.nn.Linear(hid_dim, output_dim, bias=False)
+        self.output_proj = torch.nn.Linear(hid_dim, output_dim)
 
         # Initialize weights
         # self._init_weights(zero_init_output)
@@ -220,19 +205,7 @@ class ResidualNet(torch.nn.Module):
             
         return y
     
-    def verify_zero_property(self, epsilon=1e-6):
-        """Verify that the network maps zero to zero by testing f(0) ≈ 0"""
-        with torch.no_grad():
-            zero_input = torch.zeros(self.latent_dim, device=next(self.parameters()).device)
-            zero_output = self.forward(zero_input)
-            zero_norm = torch.norm(zero_output).item()
-            
-            print(f"Zero-mapping test: ||f(0)|| = {zero_norm:.3e}")
-            passed = zero_norm < epsilon * self.output_dim**0.5
-            print(f"Zero-mapping test {'PASSED' if passed else 'FAILED'}")
-            
-            return passed, zero_norm
-
+   
 
 
 
@@ -298,28 +271,65 @@ class Routine:
         self.device = device
         print(f"Using device: {self.device}")
 
-        # Load mesh from file
-        # Modified to match default.yaml structure
-        filename = cfg.get('mesh', {}).get('filename', cfg.get('data', {}).get('mesh_file', 'mesh/beam_401.msh'))
-        print(f"Loading mesh from file: {filename}")
-        self.domain, self.cell_tags, self.facet_tags = gmshio.read_from_msh(filename, MPI.COMM_WORLD, gdim=3)
-        print("Mesh loaded successfully.")
+        # --- Load Mesh Data and Matrices from SOFA export ---
+        print("Loading SOFA matrices and mesh data...")
+        matrices_cfg = cfg.get('matrices', {})
+        matrices_path = matrices_cfg.get('matrices_path', 'matrices')
+        timestamp = matrices_cfg.get('timestamp', None) # Allow specific timestamp override
 
-        # Define function space - handle both key structures
-        print("Defining function space...")
-        self.fem_degree = cfg.get('mesh', {}).get('fem_degree', 
-                        cfg.get('data', {}).get('fem_degree', 1))  # Default to 1 if not specified
-        print(f"Using FEM degree: {self.fem_degree}")
-        self.V = fem.functionspace(self.domain, ("Lagrange", self.fem_degree, (self.domain.geometry.dim, )))
-        print("Function space defined.")
-        print(f"Function space dimension: {self.V.dofmap.index_map.size_global * 3}")
+        # Load matrices, modes, and mesh data
+        M, A, eigenvalues, eigenvectors, coordinates_np, elements_np, fixed_dofs_np, metadata = self.load_sofa_data(matrices_path, timestamp) # Add fixed_dofs_np
 
-        # Define material properties
+        if M is None or A is None or eigenvalues is None or eigenvectors is None or coordinates_np is None or elements_np is None:
+             raise RuntimeError("Failed to load required data from SOFA export. Check paths and files.")
+
+        # Store loaded data
+        self.M = M
+        self.A = A
+        self.eigenvalues = eigenvalues
+        self.linear_modes = torch.tensor(eigenvectors, device=self.device, dtype=torch.float64)
+        self.coordinates_np = coordinates_np # Keep numpy version for PyVista
+        self.elements_np = elements_np
+        self.fixed_dofs_np = fixed_dofs_np # Store fixed DOFs (numpy array)
+        if self.fixed_dofs_np is not None:
+            self.fixed_dofs_th = torch.tensor(fixed_dofs_np, device=self.device, dtype=torch.long) # Convert to tensor for indexing
+            print(f"Loaded {len(self.fixed_dofs_np)} fixed DOFs.")
+        else:
+            self.fixed_dofs_th = None
+            print("Warning: Fixed DOFs not loaded.")
+
+
+        # Extract necessary info from loaded data
+        self.num_nodes = coordinates_np.shape[0]
+        self.dim = coordinates_np.shape[1]
+        self.output_dim = self.num_nodes * self.dim
+        self.nodes_per_element = elements_np.shape[1]
+        # --- End Data Loading ---
+
+
+        # Define material properties (same as before)
         print("Defining material properties...")
         self.E = float(cfg['material']['youngs_modulus'])
         self.nu = float(cfg['material']['poissons_ratio'])
         self.rho = float(cfg['material']['density'])
         print(f"E = {self.E}, nu = {self.nu}, rho = {self.rho}")
+        self.mu = self.E / (2 * (1 + self.nu))
+        self.lambda_ = self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu))
+        print(f"mu = {self.mu}, lambda = {self.lambda_}")
+
+        # --- Instantiate Energy Calculator using loaded data ---
+        print("Instantiating energy calculator...")
+        # Use the degree from the config file, needed for quadrature
+        self.fem_degree = cfg.get('mesh', {}).get('fem_degree', 1)
+        print(f"Using FEM degree for quadrature: {self.fem_degree}")
+
+        self.energy_calculator = SOFANeoHookeanModel(
+                        coordinates_np, elements_np, # Pass loaded mesh data
+                        self.fem_degree, self.E, self.nu,
+                        precompute_matrices=True, device=self.device, dtype=torch.float64
+                    ).to(self.device)
+        print("Energy calculator instantiated.")
+
 
         # Calculate Lamé parameters from E and nu
         self.mu = self.E / (2 * (1 + self.nu))      # Shear modulus
@@ -334,29 +344,24 @@ class Routine:
             self.g = [0, float(gravity), 0]  # Convert scalar to 3D vector
         print(f"g = {self.g}")
 
-        self.energy_calculator = UFLNeoHookeanModel(
-                        self.domain, self.fem_degree, self.E, self.nu,
-                        precompute_matrices=True, device=self.device
-                    ).to(self.device)
         self.scale = self.compute_safe_scaling_factor()
         print(f"Scaling factor: {self.scale}")
 
-        # Load neural network
+ # Load neural network (same as before)
         print("Loading neural network...")
         self.latent_dim = cfg['model']['latent_dim']
-        self.num_modes = self.latent_dim 
-        output_dim = self.V.dofmap.index_map.size_global * self.domain.geometry.dim
+        self.num_modes = self.latent_dim
+        # output_dim is now derived from loaded coordinates
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
-        print(f"Output dimension: {output_dim}")
-        print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        # self.model = Net(self.num_modes, output_dim, hid_layers, hid_dim).to(device).double()
+        print(f"Output dimension: {self.output_dim}")        
+        # self.model = Net(self.num_modes, self.output_dim, hid_layers, hid_dim).to(device).double()
 
         # print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
         self.model = ResidualNet(
             self.num_modes, 
-            output_dim, 
+            self.output_dim, 
             hid_layers=hid_layers, 
             hid_dim=hid_dim,
             activation=torch.nn.functional.leaky_relu,
@@ -364,25 +369,11 @@ class Routine:
         ).to(device).double()
 
         # After model creation, verify zero property
-        self.model.verify_zero_property()
+        # self.model.verify_zero_property()
 
         # Load linear modes
-        print("Loading linear eigenmodes...")
-        
-        # Check matrices configuration
-        use_sofa = cfg.get('matrices', {}).get('use_sofa_matrices', False)
-        matrices_path = cfg.get('matrices', {}).get('matrices_path', 'matrices')
-        timestamp = cfg.get('matrices', {}).get('timestamp', None)
-        
-        if use_sofa:
-            print(f"Using SOFA matrices from path: {matrices_path}")
-            self.linear_modes = self.compute_linear_modes()
-        else:
-            print("Using FEniCS-generated matrices")
-            self.linear_modes = self.compute_linear_modes()
-        
-        self.linear_modes = torch.tensor(self.linear_modes, device=self.device).double()
         print(f"Linear modes shape: {self.linear_modes.shape}")
+
         print("Linear eigenmodes loaded.")
 
         # Tensorboard setup
@@ -407,10 +398,6 @@ class Routine:
     def reset(self):
             print("Resetting simulation...")
             self.z = torch.zeros(self.latent_dim, device=self.device).double()
-            self.z.requires_grad = True
-            self.uh = fem.Function(self.V)
-            self.uh.name = "Displacement"
-            self.uh.x.array[:] = 0.0
             print("Simulation reset.")
 
     # Replace the energy calculation in train_step with this implementation:
@@ -418,87 +405,198 @@ class Routine:
     
     
 
-    def compute_linear_modes(self):
-        print("Computing linear modes...")
+    
         
-        # Try to load SOFA matrices first
-        M, A, eigenvalues, eigenvectors = self.load_sofa_matrices()
-        
-        print("Using SOFA-generated matrices and modes for linear modes computation")
-        # Store matrices in self for later use
-        self.M = M
-        self.A = A
-        self.eigenvalues = eigenvalues
-        linear_modes = eigenvectors
-        return linear_modes
-        
-    def load_sofa_matrices(self, matrices_path=None, timestamp=None):
+    def load_sofa_data(self, matrices_path=None, timestamp=None):
         """
-        Load mass and stiffness matrices from SOFA export with robust format handling
+        Load matrices, modes, mesh data, and metadata from SOFA export.
+        More robustly handles matrix file formats (.npy vs .npz).
         """
-        print("Attempting to load SOFA matrices and modes...")
+        print("Attempting to load SOFA matrices, modes, and mesh data...")
         if matrices_path is None:
             matrices_path = 'matrices'
-        
+
         if not os.path.exists(matrices_path):
             print(f"Matrices path does not exist: {matrices_path}")
-            return None, None, None, None
-        
-        # Find the latest matrices if timestamp not specified
+            return None, None, None, None, None, None, None
+
+        # Find the latest subdirectory if timestamp not specified
         if timestamp is None:
-            mass_files = glob.glob(f'{matrices_path}/mass_matrix_*.npy')
-            if not mass_files:
-                print(f"No mass matrices found in {matrices_path}")
-                return None, None, None, None
-            
-            # Get latest file by timestamp
-            latest_file = max(mass_files, key=os.path.getctime)
-            timestamp = latest_file.split('mass_matrix_')[1].split('.npy')[0]
-            print(f"Using latest matrices with timestamp {timestamp}")
-        
-        # Load matrices
-        mass_matrix_file = f'{matrices_path}/mass_matrix_{timestamp}.npy'
-        stiff_matrix_file = f'{matrices_path}/stiffness_matrix_{timestamp}.npy'
-        eigenvalues_file =  f'{matrices_path}/{timestamp}/eigenvalues_{timestamp}.npy'
-        eigenvectors_file = f'{matrices_path}/{timestamp}/eigenvectors_{timestamp}.npy'
-        
-        if not os.path.exists(mass_matrix_file) or not os.path.exists(stiff_matrix_file) or not os.path.exists(eigenvalues_file) or not os.path.exists(eigenvectors_file):
-            print(f"Matrix or mode files for timestamp {timestamp} not found")
-            return None, None, None, None
-        
-        print(f"Loading matrices from {mass_matrix_file} and {stiff_matrix_file}")
-        print(f"Loading modes from {eigenvalues_file} and {eigenvectors_file}")
-        
+            subdirs = [d for d in os.listdir(matrices_path) if os.path.isdir(os.path.join(matrices_path, d))]
+            if not subdirs:
+                 print(f"No timestamped subdirectories found in {matrices_path}")
+                 return None, None, None, None, None, None, None
+            # Assuming directory names are timestamps like YYYYMMDD_HHMMSS
+            try:
+                 # Filter out non-timestamp directories if any
+                 valid_subdirs = []
+                 for d in subdirs:
+                     try:
+                         datetime.datetime.strptime(d, '%Y%m%d_%H%M%S')
+                         valid_subdirs.append(d)
+                     except ValueError:
+                         pass # Ignore directories not matching the format
+                 if not valid_subdirs:
+                      print(f"No valid timestamped subdirectories found in {matrices_path}")
+                      return None, None, None, None, None, None, None
+
+                 latest_subdir = max(valid_subdirs, key=lambda d: datetime.datetime.strptime(d, '%Y%m%d_%H%M%S'))
+                 timestamp = latest_subdir
+                 print(f"Using latest data subdirectory: {timestamp}")
+            except ValueError:
+                 print(f"Could not determine latest subdirectory based on timestamp format. Please specify timestamp.")
+                 return None, None, None, None, None, None, None
+
+        data_subdir = os.path.join(matrices_path, timestamp)
+        if not os.path.exists(data_subdir):
+             print(f"Data subdirectory not found: {data_subdir}")
+             return None, None, None, None, None, None, None
+
+        # --- Load Metadata ---
+        metadata_file = os.path.join(data_subdir, f'metadata_{timestamp}.json')
+        if not os.path.exists(metadata_file):
+             print(f"Metadata file not found: {metadata_file}")
+             return None, None, None, None, None, None, None
         try:
-            mass_matrix = np.load(mass_matrix_file, allow_pickle=True)
-            stiff_matrix = np.load(stiff_matrix_file, allow_pickle=True)
+             with open(metadata_file, 'r') as f:
+                 metadata = json.load(f)
+             print("Metadata loaded.")
+        except Exception as e:
+             print(f"Error loading metadata: {e}")
+             return None, None, None, None, None, None, None
+
+        # --- Load Matrices (Robustly) ---
+        mass_matrix = None
+        stiff_matrix = None
+        # Prefer 'npz' as default if not specified, as it's the intended primary format now
+        expected_format = metadata.get('matrix_format', 'npz')
+        alt_format = 'npy' if expected_format == 'npz' else 'npz'
+
+        mass_base_name = f'mass_matrix_{timestamp}'
+        stiff_base_name = f'stiffness_matrix_{timestamp}'
+
+        # Try loading with the expected format first
+        try:
+            mass_file = os.path.join(data_subdir, f'{mass_base_name}.{expected_format}')
+            stiff_file = os.path.join(data_subdir, f'{stiff_base_name}.{expected_format}')
+            if os.path.exists(mass_file) and os.path.exists(stiff_file):
+                if expected_format == 'npz':
+                    mass_matrix = sparse.load_npz(mass_file)
+                    stiff_matrix = sparse.load_npz(stiff_file)
+                    print(f"Loaded sparse matrices (.{expected_format}).")
+                else: # expected 'npy'
+                    mass_matrix = np.load(mass_file, allow_pickle=True)
+                    stiff_matrix = np.load(stiff_file, allow_pickle=True)
+                    print(f"Loaded numpy matrices (.{expected_format}).")
+            else:
+                 print(f"Matrix files not found with expected format '.{expected_format}'.")
+                 raise FileNotFoundError # Trigger fallback
+
+        except (FileNotFoundError, Exception) as e1:
+            print(f"Failed loading with format '.{expected_format}': {e1}. Trying alternative format '.{alt_format}'...")
+            # Try loading with the alternative format
+            try:
+                mass_file = os.path.join(data_subdir, f'{mass_base_name}.{alt_format}')
+                stiff_file = os.path.join(data_subdir, f'{stiff_base_name}.{alt_format}')
+                if os.path.exists(mass_file) and os.path.exists(stiff_file):
+                    if alt_format == 'npz':
+                        mass_matrix = sparse.load_npz(mass_file)
+                        stiff_matrix = sparse.load_npz(stiff_file)
+                        print(f"Loaded sparse matrices (.{alt_format}).")
+                    else: # alt 'npy'
+                        mass_matrix = np.load(mass_file, allow_pickle=True)
+                        stiff_matrix = np.load(stiff_file, allow_pickle=True)
+                        print(f"Loaded numpy matrices (.{alt_format}).")
+                else:
+                    print(f"Matrix files also not found with alternative format '.{alt_format}'.")
+                    return None, None, None, None, None, None, metadata # Give up if neither format found
+
+            except Exception as e2:
+                print(f"Error loading matrices with alternative format '.{alt_format}': {e2}")
+                traceback.print_exc()
+                return None, None, None, None, None, None, metadata # Give up on error
+
+        # Ensure matrices are sparse CSR format if loaded as numpy
+        try:
+            if mass_matrix is not None and not isinstance(mass_matrix, sparse.spmatrix):
+                if mass_matrix.ndim == 0: mass_matrix = mass_matrix.item() # Handle 0-dim array
+                mass_matrix = sparse.csr_matrix(mass_matrix)
+                print("Converted loaded mass matrix to CSR.")
+            if stiff_matrix is not None and not isinstance(stiff_matrix, sparse.spmatrix):
+                if stiff_matrix.ndim == 0: stiff_matrix = stiff_matrix.item() # Handle 0-dim array
+                stiff_matrix = sparse.csr_matrix(stiff_matrix)
+                print("Converted loaded stiffness matrix to CSR.")
+        except Exception as e_conv:
+             print(f"Error converting loaded matrices to CSR: {e_conv}")
+             return None, None, None, None, None, None, metadata
+
+
+        if mass_matrix is None or stiff_matrix is None:
+             print("Failed to load matrices in any format.")
+             return None, None, None, None, None, None, metadata
+
+        print(f"Matrix shapes: Mass {mass_matrix.shape}, Stiffness {stiff_matrix.shape}")
+
+
+        # --- Load Eigenmodes ---
+        eigenvalues_file = os.path.join(data_subdir, metadata.get('eigenvalues_file', ''))
+        eigenvectors_file = os.path.join(data_subdir, metadata.get('eigenvectors_file', ''))
+
+        if not metadata.get('eigenvalues_file') or not metadata.get('eigenvectors_file') or \
+           not os.path.exists(eigenvalues_file) or not os.path.exists(eigenvectors_file):
+            print(f"Eigenmode files not found or not specified in metadata ({data_subdir})")
+            # Allow continuing without modes if matrices loaded? Maybe not for this script.
+            return mass_matrix, stiff_matrix, None, None, None, None, metadata
+
+        try:
             eigenvalues = np.load(eigenvalues_file, allow_pickle=True)
             eigenvectors = np.load(eigenvectors_file, allow_pickle=True)
-            
-            # Handle 0-dimensional array (scalar container)
-            if isinstance(mass_matrix, np.ndarray) and mass_matrix.ndim == 0:
-                print("Detected 0-dimensional array. Extracting contained object...")
-                mass_matrix = mass_matrix.item()
-                stiff_matrix = stiff_matrix.item()
-            
-            # Ensure matrices are in CSR format for efficiency
-            if not isinstance(mass_matrix, sparse.csr_matrix):
-                if hasattr(mass_matrix, 'tocsr'):
-                    mass_matrix = mass_matrix.tocsr()
-                    stiff_matrix = stiff_matrix.tocsr()
-                    print("Converted matrices to CSR format")
-                else:
-                    raise TypeError(f"Cannot convert {type(mass_matrix)} to CSR format")
-            
-            print(f"Matrix shapes: Mass {mass_matrix.shape}, Stiffness {stiff_matrix.shape}")
             print(f"Mode shapes: Eigenvalues {eigenvalues.shape}, Eigenvectors {eigenvectors.shape}")
-            
-            return mass_matrix, stiff_matrix, eigenvalues, eigenvectors
-        
         except Exception as e:
-            print(f"Error loading SOFA matrices: {e}")
+            print(f"Error loading eigenmodes: {e}")
             traceback.print_exc()
-            return None, None, None, None
+            return mass_matrix, stiff_matrix, None, None, None, None, metadata
+
+        # --- Load Mesh Data ---
+        coords_file = os.path.join(data_subdir, metadata.get('coordinates_file', ''))
+        elements_file = os.path.join(data_subdir, metadata.get('elements_file', ''))
+
+        if not metadata.get('coordinates_file') or not metadata.get('elements_file') or \
+           not os.path.exists(coords_file) or not os.path.exists(elements_file):
+            print(f"Mesh data files not found or not specified in metadata ({data_subdir})")
+            return mass_matrix, stiff_matrix, eigenvalues, eigenvectors, None, None, metadata
+
+        try:
+            coordinates_np = np.load(coords_file, allow_pickle=True)
+            elements_np = np.load(elements_file, allow_pickle=True)
+            print(f"Mesh data loaded: Coords {coordinates_np.shape}, Elements {elements_np.shape}")
+        except Exception as e:
+            print(f"Error loading mesh data: {e}")
+            traceback.print_exc()
+            return mass_matrix, stiff_matrix, eigenvalues, eigenvectors, None, None, metadata
+
+        # --- Load Fixed DOFs ---
+        fixed_dofs_np = None
+        fixed_dofs_file_key = 'fixed_dofs_file'
+        if fixed_dofs_file_key in metadata and metadata[fixed_dofs_file_key]:
+            fixed_dofs_file = os.path.join(data_subdir, metadata[fixed_dofs_file_key])
+            if os.path.exists(fixed_dofs_file):
+                try:
+                    fixed_dofs_np = np.load(fixed_dofs_file, allow_pickle=True)
+                    print(f"Fixed DOFs loaded: Shape {fixed_dofs_np.shape}")
+                except Exception as e:
+                    print(f"Error loading fixed DOFs: {e}")
+                    traceback.print_exc()
+            else:
+                print(f"Fixed DOFs file not found: {fixed_dofs_file}")
+        else:
+            print("Fixed DOFs file not specified in metadata or is None.")
+
+
+        print("Successfully loaded all required SOFA data.")
+        return mass_matrix, stiff_matrix, eigenvalues, eigenvectors, coordinates_np, elements_np, fixed_dofs_np, metadata # Added fixed_dofs_np
+
+
 
     def compute_eigenvalue_based_scale(self, mode_index=None):
         """
@@ -543,8 +641,8 @@ class Routine:
         checkpoint_every = 50
         
         # Get rest shape (undeformed configuration)
-        X = torch.zeros((self.V.dofmap.index_map.size_global * self.domain.geometry.dim), 
-                    device=self.device, dtype=torch.float64)
+        coordinates_th = torch.tensor(self.coordinates_np, device=self.device, dtype=torch.float64)
+        X = torch.zeros_like(coordinates_th, device=self.device, dtype=torch.float64)
         X = X.view(1, -1).expand(batch_size, -1)
         
         # Use a subset of linear modes (you might need to adjust indices)
@@ -576,8 +674,8 @@ class Routine:
         # Use LBFGS optimizer
         optimizer = torch.optim.LBFGS(self.model.parameters(), 
                                     lr=1,
-                                    max_iter=20,
-                                    max_eval=40,
+                                    max_iter=40,
+                                    max_eval=100,
                                     tolerance_grad=1e-05,
                                     tolerance_change=1e-07,
                                     history_size=100,
@@ -611,23 +709,23 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 0.01
-                deformation_scale_final = 5
+                deformation_scale_final = 30
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
                 mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
+                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
 
                 #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
                 #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                # z[rest_idx, :] = 0  # Set rest shape latent to zero
+                z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -639,7 +737,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -701,6 +799,16 @@ class Routine:
                     # Compute origin constraint for rest shape
                     origin = torch.sum(y[rest_idx]**2)
 
+                    bc_penalty = 0.0
+                    if self.fixed_dofs_th is not None and len(self.fixed_dofs_th) > 0:
+                        # Get the total displacement at the fixed DOFs for the entire batch
+                        # u_total_batch shape: (batch_size, num_dofs)
+                        # self.fixed_dofs_th shape: (num_fixed_dofs,)
+                        fixed_displacements = u_total_batch[:, self.fixed_dofs_th] # Shape: (batch_size, num_fixed_dofs)
+                        # Calculate the squared L2 norm of displacements at fixed DOFs, averaged over batch
+                        bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
+
+
 
                  
 
@@ -726,7 +834,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = -improvement_loss + 1e3 * ortho #+ 1e5*  origin 
+                    loss = energy + 1e5 * ortho + 1e5 *  origin + 1e5 * bc_penalty 
 
 
                     loss.backward()
@@ -753,7 +861,7 @@ class Routine:
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
-                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f} │ {'Origin Constraint:':<20} {origin.item():<12.6f}")
+                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f} │ {'Origin Constraint:':<20} {origin.item():<12.6f} │ {'BC Penalty:':<20} {bc_penalty.item():<12.6f}")
                         
                         # # Displacement metrics section
                         # print(f"│ DISPLACEMENT METRICS:")
@@ -818,7 +926,7 @@ class Routine:
                     'loss': loss_val,
                 }
                 patience = 0
-                torch.save(checkpoint, os.path.join('checkpoints', 'best.pt'))
+                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa.pt'))
                 print(f"============ BEST MODEL UPDATED ============")
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
                 print(f"============================================")
@@ -852,171 +960,134 @@ class Routine:
 
 
     def create_live_visualizer(self):
-        """Create and return a persistent PyVista plotter for visualization during training"""
-        # Convert DOLFINx mesh to PyVista format
-        topology, cell_types, x = plot.vtk_mesh(self.domain)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, x)
-        
-        # Create a linear function space for visualization
-        self.V_viz = fem.functionspace(self.domain, ("CG", 1, (3,)))
-        self.u_linear_viz = fem.Function(self.V_viz)
-        
-        # Create plotter with two viewports for side-by-side comparison
-        plotter = pyvista.Plotter(shape=(1, 2), title="Neural Modes Training Visualization", 
+        """Create and return a persistent PyVista plotter using loaded mesh data"""
+        print("Creating live visualizer using loaded mesh data...")
+        # Create PyVista grid directly from loaded NumPy arrays
+        # Need element type information. Assuming tetrahedra if nodes_per_element is 4 or 10.
+        # Assuming hexahedra if nodes_per_element is 8 or 27.
+        # PyVista expects cell connectivity in a specific format: [n_points, idx1, idx2, ..., n_points, idx1, ...]
+        num_elements = self.elements_np.shape[0]
+        nodes_per_elem = self.elements_np.shape[1]
+
+        if nodes_per_elem == 4: # Linear Tetrahedron
+            cell_type = pyvista.CellType.TETRA
+            # Format: [4, node0, node1, node2, node3, 4, node0, ...]
+            cells = np.hstack((np.full((num_elements, 1), 4), self.elements_np)).flatten()
+        elif nodes_per_elem == 8: # Linear Hexahedron
+            cell_type = pyvista.CellType.HEXAHEDRON
+            cells = np.hstack((np.full((num_elements, 1), 8), self.elements_np)).flatten()
+        elif nodes_per_elem == 10: # Quadratic Tetrahedron
+             cell_type = pyvista.CellType.QUADRATIC_TETRA
+             cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
+        # Add other element types if needed (e.g., quadratic hex)
+        else:
+             print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Using points.")
+             # Fallback: visualize as points
+             grid = pyvista.PolyData(self.coordinates_np)
+             cell_type = None # Indicate no cells
+             cells = None
+             # Or raise error: raise ValueError(f"Unsupported element type for visualization: {nodes_per_elem} nodes")
+
+        if cell_type is not None:
+             grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
+        else: # Fallback to PolyData (points)
+             grid = pyvista.PolyData(self.coordinates_np)
+
+
+        # Create plotter (same as before)
+        plotter = pyvista.Plotter(shape=(1, 2), title="Neural Modes Training Visualization",
                             window_size=[1600, 720], off_screen=False)
-        
+
         # Store grid and visualization components
-        self.viz_grid = grid
+        self.viz_grid = grid # Store the PyVista grid
         self.viz_plotter = plotter
         self.mesh_actor_left = None
         self.mesh_actor_right = None
         self.info_actor = None
-        
-        # Initialize the render window
+
+        # Initialize the render window (same as before)
         plotter.show(interactive=False, auto_close=False)
-        
-        # Set camera position for both viewports (same as validate_twist.py)
         for i in range(2):
             plotter.subplot(0, i)
             plotter.camera_position = [(20.0, 3.0, 2.0), (0.0, -2.0, 0.0), (0.0, 0.0, 2.0)]
             plotter.camera.zoom(1.5)
-        
-        # Link camera views so they move together
         plotter.link_views()
-        
+
+        print("Visualizer created.")
         return plotter
 
     def visualize_latent_vector(self, z, iteration=None, loss=None):
-        """Update visualization with current training state showing both linear and neural predictions"""
+        """Update visualization using loaded mesh data"""
+        if not hasattr(self, 'viz_plotter') or self.viz_plotter is None:
+             print("Visualizer not initialized. Skipping visualization.")
+             return
         try:
-            # Ensure z is properly formatted
-            if not isinstance(z, torch.Tensor):
-                z = torch.tensor(z, device=self.device, dtype=torch.float64)
-            
-            if z.dim() > 1:
-                z = z.squeeze()
-            
-            # Compute displacements for both visualizations
+            # Ensure z is properly formatted (same as before)
+            # ...
+            if not isinstance(z, torch.Tensor): z = torch.tensor(z, device=self.device, dtype=torch.float64)
+            if z.dim() > 1: z = z.squeeze()
+
+
+            # Compute displacements (same as before)
             with torch.no_grad():
-                # 1. Linear component only
                 linear_contribution = torch.matmul(z, self.linear_modes.T)
-                linear_only_np = linear_contribution.detach().cpu().numpy()
-                
-                # 2. Full neural network prediction (linear + nonlinear correction)
                 neural_correction = self.model(z)
                 u_total = linear_contribution + neural_correction
+                linear_only_np = linear_contribution.detach().cpu().numpy()
                 u_total_np = u_total.detach().cpu().numpy()
-            
-            # Create functions in the original function space
-            u_quadratic_linear = fem.Function(self.V)
-            u_quadratic_linear.x.array[:] = linear_only_np
-            
-            u_quadratic_total = fem.Function(self.V)
-            u_quadratic_total.x.array[:] = u_total_np
-            
-            # Interpolate to the visualization space
-            u_linear_viz_linear = fem.Function(self.V_viz)
-            u_linear_viz_linear.interpolate(u_quadratic_linear)
-            linear_np = u_linear_viz_linear.x.array
-            
-            u_linear_viz_total = fem.Function(self.V_viz)
-            u_linear_viz_total.interpolate(u_quadratic_total)
-            total_np = u_linear_viz_total.x.array
-            
-            # Compute displacement magnitudes for both
-            linear_mag = np.linalg.norm(linear_np.reshape((-1, 3)), axis=1)
-            total_mag = np.linalg.norm(total_np.reshape((-1, 3)), axis=1)
-            
-            # Find global color range for consistent comparison
-            max_mag = max(np.max(linear_mag), np.max(total_mag))
+
+            # --- No dolfinx interpolation needed ---
+            # Displacements are already defined on the nodes
+            linear_np = linear_only_np.reshape((-1, 3))
+            total_np = u_total_np.reshape((-1, 3))
+
+            # Compute magnitudes (same as before)
+            linear_mag = np.linalg.norm(linear_np, axis=1)
+            total_mag = np.linalg.norm(total_np, axis=1)
+            max_mag = max(np.max(linear_mag), np.max(total_mag), 1e-9) # Avoid zero max
             min_mag = min(np.min(linear_mag), np.min(total_mag))
             color_range = [min_mag, max_mag]
-            
-            # Left subplot - Linear modes only
+
+            # --- Update PyVista Plotter ---
+            # Left subplot - Linear
             self.viz_plotter.subplot(0, 0)
-            
-            # Remove previous mesh actor if it exists
-            if self.mesh_actor_left is not None:
-                self.viz_plotter.remove_actor(self.mesh_actor_left)
-            
-            # Create mesh with linear deformation only
+            if self.mesh_actor_left is not None: self.viz_plotter.remove_actor(self.mesh_actor_left)
             linear_grid = self.viz_grid.copy()
-            linear_grid.point_data["displacement"] = linear_np.reshape((-1, 3))
+            linear_grid.points = self.coordinates_np + linear_np # Apply displacement directly
             linear_grid["displacement_magnitude"] = linear_mag
-            
-            # Warp the mesh by the displacement
-            linear_warped = linear_grid.warp_by_vector("displacement", factor=1)
-            
-            # Add mesh to left subplot
             self.mesh_actor_left = self.viz_plotter.add_mesh(
-                linear_warped, 
-                scalars="displacement_magnitude",
-                cmap="viridis", 
-                show_edges=False,
-                clim=color_range,
-                reset_camera=False
+                linear_grid, scalars="displacement_magnitude", cmap="viridis",
+                show_edges=False, clim=color_range, reset_camera=False
             )
-            
-            # Add title to left subplot
             self.viz_plotter.add_text("Linear Modes Only", position="upper_edge", font_size=12, color='black')
-            
-            # Right subplot - Full neural network prediction
+
+            # Right subplot - Neural
             self.viz_plotter.subplot(0, 1)
-            
-            # Remove previous mesh actor if it exists
-            if self.mesh_actor_right is not None:
-                self.viz_plotter.remove_actor(self.mesh_actor_right)
-            
-            # Create mesh with full deformation
+            if self.mesh_actor_right is not None: self.viz_plotter.remove_actor(self.mesh_actor_right)
             total_grid = self.viz_grid.copy()
-            total_grid.point_data["displacement"] = total_np.reshape((-1, 3))
+            total_grid.points = self.coordinates_np + total_np # Apply displacement directly
             total_grid["displacement_magnitude"] = total_mag
-            
-            # Warp the mesh by the displacement
-            total_warped = total_grid.warp_by_vector("displacement", factor=1)
-            
-            # Add mesh to right subplot
             self.mesh_actor_right = self.viz_plotter.add_mesh(
-                total_warped, 
-                scalars="displacement_magnitude",
-                cmap="viridis", 
-                show_edges=False,
-                clim=color_range,
-                reset_camera=False
+                total_grid, scalars="displacement_magnitude", cmap="viridis",
+                show_edges=False, clim=color_range, reset_camera=False
             )
-            
-            # Add title to right subplot
             self.viz_plotter.add_text("Neural Network Prediction", position="upper_edge", font_size=12, color='black')
-            
-            # Update the training info text (on the main plotter)
-            self.viz_plotter.subplot(0, 0)  # Add info to left plot for balance
+
+            # Update info text (same as before)
+            self.viz_plotter.subplot(0, 0)
             if iteration is not None and loss is not None:
-                if self.info_actor is not None:
-                    self.viz_plotter.remove_actor(self.info_actor)
-                
-                # Compute nonlinear contribution percentage
+                if self.info_actor is not None: self.viz_plotter.remove_actor(self.info_actor)
                 nonlinear_mag = np.linalg.norm(neural_correction.detach().cpu().numpy())
-                total_mag = np.linalg.norm(u_total_np)
-                nonlinear_percent = (nonlinear_mag / total_mag) * 100 if total_mag > 0 else 0
-                
+                total_mag_val = np.linalg.norm(u_total_np)
+                nonlinear_percent = (nonlinear_mag / total_mag_val) * 100 if total_mag_val > 1e-9 else 0
                 info_text = f"Iteration: {iteration}\nLoss: {loss:.6e}\nNonlinear Contribution: {nonlinear_percent:.2f}%"
-                self.info_actor = self.viz_plotter.add_text(
-                    info_text, 
-                    position=(10, 10),
-                    font_size=10,
-                    color='black'
-                )
-            
-            # Add colorbar (to the right subplot for space efficiency)
-            self.viz_plotter.subplot(0, 1)
-            self.viz_plotter.add_scalar_bar(title="Displacement Magnitude", n_labels=5, position_x=0.05)
-            
-            # Update the visualization without blocking training
+                self.info_actor = self.viz_plotter.add_text(info_text, position=(10, 10), font_size=10, color='black')
+
+            # Update render window (same as before)
             self.viz_plotter.update()
             self.viz_plotter.render()
-            
+
         except Exception as e:
-            # Don't let visualization errors halt the training process
             print(f"Visualization error (continuing training): {str(e)}")
             import traceback
             print(traceback.format_exc())
@@ -1058,7 +1129,7 @@ class Routine:
         Returns a scaling factor that will produce visible but physically reasonable deformations
         """
         # Get mesh coordinates and compute characteristic length
-        x_coords = self.domain.geometry.x
+        x_coords = self.coordinates_np
         x_range = x_coords[:, 0].max() - x_coords[:, 0].min()
         y_range = x_coords[:, 1].max() - x_coords[:, 1].min() 
         z_range = x_coords[:, 2].max() - x_coords[:, 2].min()
@@ -1066,7 +1137,7 @@ class Routine:
         # Calculate characteristic length (average of dimensions)
         char_length = max(x_range, y_range, z_range)
         # Safety factor to avoid extreme deformations
-        safety_factor = 5
+        safety_factor = 0.7
         
       
         
@@ -1094,7 +1165,7 @@ class Routine:
         
         if is_best:
             print(f"Epoch {epoch+1}: New best model with loss {loss:.6e}")
-            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best.pt'))
+            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_sofa.pt'))
 
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint with robust error handling"""
@@ -1118,301 +1189,310 @@ class Routine:
             print(f"Error loading checkpoint: {str(e)}")
             print("Checkpoint file appears to be corrupted. Starting with fresh model.")
             return float('inf')
-    
     def visualize_latent_dimensions(self, dim1=0, dim2=1, num_points=3):
-        """Visualize neural modes across a grid of two latent dimensions"""
+        """Visualize neural modes across a grid of two latent dimensions using loaded mesh data"""
         print(f"Visualizing neural modes for dimensions {dim1} and {dim2}...")
-        
-        # Convert DOLFINx mesh to PyVista format
-        topology, cell_types, x = plot.vtk_mesh(self.domain)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, x)
-        
-        # Create a linear function space for visualization
-        V_viz = fem.functionspace(self.domain, ("CG", 1, (3,)))
-        u_linear = fem.Function(V_viz)
-        
+
+        # Create base PyVista grid directly from loaded NumPy arrays
+        num_elements = self.elements_np.shape[0]
+        nodes_per_elem = self.elements_np.shape[1]
+
+        if nodes_per_elem == 4: # Linear Tetrahedron
+            cell_type = pyvista.CellType.TETRA
+            cells = np.hstack((np.full((num_elements, 1), 4), self.elements_np)).flatten()
+        elif nodes_per_elem == 8: # Linear Hexahedron
+            cell_type = pyvista.CellType.HEXAHEDRON
+            cells = np.hstack((np.full((num_elements, 1), 8), self.elements_np)).flatten()
+        elif nodes_per_elem == 10: # Quadratic Tetrahedron
+             cell_type = pyvista.CellType.QUADRATIC_TETRA
+             cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
+        # Add other element types if needed (e.g., quadratic hex)
+        else:
+             print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Cannot visualize latent dimensions.")
+             return
+
+        try:
+            grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
+        except Exception as e:
+            print(f"Error creating PyVista grid: {e}. Cannot visualize.")
+            return
+
         # Compute scale for latent vectors
-        scale = self.compute_safe_scaling_factor()    # Larger scale for better visualization
+        scale = self.compute_safe_scaling_factor() * 2.0 # Larger scale for better visualization
         values = np.linspace(-scale, scale, num_points)
-        
+
         # Create plotter with subplots
         plotter = pyvista.Plotter(shape=(num_points, num_points), border=False)
-        
-        # Generate neural modes for each combination of latent values
+
+        # Generate modes and plot
+        max_overall_disp = 0.0 # Track max displacement for consistent color range
+        grids_to_plot = [] # Store grids to determine color range first
+
         for i, val1 in enumerate(values):
-            row_idx = num_points - 1 - i  # Reverse order for proper cartesian layout
+            row_idx = num_points - 1 - i # Reverse order for proper cartesian layout
             for j, val2 in enumerate(values):
-                # Create latent vector with fixed values except for the two selected dims
+                # Create latent vector
                 z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
                 z[dim1] = val1
                 z[dim2] = val2
-                
-                # Compute neural mode
-                # Only use the columns of linear_modes corresponding to dim1 and dim2
-                linear_contribution = (self.linear_modes[:, [dim1, dim2]] @ z[[dim1, dim2]].unsqueeze(1)).squeeze(1)
-                y = self.model(z)
-                u_total =  y + linear_contribution
-                u_total_np = u_total.detach().cpu().numpy()
 
-                # Create a function in the quadratic function space
-                u_quadratic = fem.Function(self.V)
-                u_quadratic.x.array[:] = u_total_np
+                # Compute total displacement
+                with torch.no_grad():
+                    # Consider only the relevant linear modes for this visualization
+                    # This assumes linear_modes columns correspond to latent dimensions
+                    linear_contribution = torch.zeros_like(self.linear_modes[:, 0]) # Zero vector of correct size
+                    if dim1 < self.linear_modes.shape[1]:
+                        linear_contribution += self.linear_modes[:, dim1] * z[dim1]
+                    if dim2 < self.linear_modes.shape[1]:
+                         linear_contribution += self.linear_modes[:, dim2] * z[dim2]
 
-                # Interpolate the quadratic displacement to the linear function space
-                u_linear.interpolate(u_quadratic)
+                    y = self.model(z)
+                    u_total = y + linear_contribution
+                    u_total_np = u_total.detach().cpu().numpy().reshape((-1, 3))
 
-                # Get the displacement values at the linear nodes
-                u_linear_np = u_linear.x.array
-                
-                # Set active subplot
-                plotter.subplot(row_idx, j)
-                
-                # Create mesh with deformation
+                # Create deformed grid
                 local_grid = grid.copy()
-                local_grid.point_data["displacement"] = u_linear_np.reshape((-1, 3))
-                local_grid["displacement_magnitude"] = np.linalg.norm(u_linear_np.reshape((-1, 3)), axis=1)
-                max_disp = np.max(local_grid["displacement_magnitude"])
-                warp_factor = min(1.5, 0.2/max(max_disp, 1e-6)) 
-                warped = local_grid.warp_by_vector("displacement", factor=warp_factor)
-                
-                # Add mesh to plot
-                plotter.add_mesh(warped, scalars="displacement_magnitude", 
-                            cmap="viridis", show_edges=True)
-                
-                # Add compact z-value labels in bottom corner (less intrusive)
-                plotter.add_text(f"{val1:.2f}, {val2:.2f}", position="lower_right", 
-                            font_size=6, color='white')
-                
-                plotter.view_isometric()
-        
+                local_grid.points = self.coordinates_np + u_total_np # Apply displacement directly
+                local_grid["displacement_magnitude"] = np.linalg.norm(u_total_np, axis=1)
+                max_overall_disp = max(max_overall_disp, np.max(local_grid["displacement_magnitude"]))
+                grids_to_plot.append({'grid': local_grid, 'row': row_idx, 'col': j})
+
+        # Now plot with consistent color range
+        color_range = [0, max(max_overall_disp, 1e-9)] # Avoid zero range
+        for item in grids_to_plot:
+            plotter.subplot(item['row'], item['col'])
+            # Use show_edges=False for potentially cleaner visualization with many elements
+            plotter.add_mesh(item['grid'], scalars="displacement_magnitude",
+                             cmap="viridis", show_edges=False, clim=color_range, reset_camera=False)
+            # Add compact z-value labels
+            val1 = values[num_points - 1 - item['row']]
+            val2 = values[item['col']]
+            plotter.add_text(f"{val1:.2f}, {val2:.2f}", position="lower_right", font_size=6, color='white')
+            plotter.view_isometric() # Set consistent view
+
         # Add axis labels at edges of the grid
         for i, val1 in enumerate(values):
             row_idx = num_points - 1 - i
-            # Y-axis labels (left side)
-            plotter.subplot(row_idx, 0)
-            plotter.add_text(f"z{dim1}={val1:.2f}", position=(0.01, 0.5), viewport=True,
-                        font_size=8, color='white')
-        
+            plotter.subplot(row_idx, 0) # Left edge
+            plotter.add_text(f"z{dim1}={val1:.2f}", position=(0.01, 0.5), viewport=True, font_size=8, color='white')
         for j, val2 in enumerate(values):
-            # X-axis labels (bottom)
-            plotter.subplot(num_points-1, j)
-            plotter.add_text(f"z{dim2}={val2:.2f}", position=(0.5, 0.01), viewport=True, 
-                        font_size=8, color='white')
-        
-        # Link camera views for synchronized rotation
+            plotter.subplot(num_points-1, j) # Bottom edge
+            plotter.add_text(f"z{dim2}={val2:.2f}", position=(0.5, 0.01), viewport=True, font_size=8, color='white')
+
+        # Link camera views
         plotter.link_views()
-        
+
         # Add a unified colorbar at the bottom
+        plotter.subplot(num_points-1, 0) # Place relative to a subplot
         plotter.add_scalar_bar("Displacement Magnitude", position_x=0.4, position_y=0.01, width=0.2, height=0.02)
-        
-        # Add a more compact title
+
+        # Add title
         title = f"Neural Modes Matrix: z{dim1} vs z{dim2}"
         plotter.add_text(title, position=(0.5, 0.97), viewport=True, font_size=12, color='black')
-        
+
         print("Showing latent space visualization...")
         plotter.show()
         print("Visualization complete.")
 
-    def estimate_checkpoint_size(self):
-        """Estimate the size of the checkpoint file that will be saved"""
-        # Get model size
-        model_size = 0
-        for param in self.model.parameters():
-            model_size += param.nelement() * param.element_size()
-        
-        # Get optimizer size
-        optimizer_size = 0
-        for buffer in self.optimizer_adam.state.values():
-            if isinstance(buffer, torch.Tensor):
-                optimizer_size += buffer.nelement() * buffer.element_size()
-        
-        # Total size in bytes
-        total_size = model_size + optimizer_size
-        
-        # Convert to human-readable format
-        size_in_mb = total_size / (1024 * 1024)
-        
-        return size_in_mb
 
     def visualize_latent_space(self, num_samples=5, scale=None, modes_to_show=None):
         """
-        Visualize the effect of each latent dimension independently.
-        
+        Visualize the effect of each latent dimension independently using loaded mesh data.
+
         Args:
-            num_samples: Number of samples to take for each mode
-            scale: Range of latent values to sample (-scale to +scale), auto-computed if None
-            modes_to_show: List of specific mode indices to visualize, visualize all if None
+            num_samples: Number of samples to take for each mode (-scale to +scale).
+            scale: Range of latent values to sample, auto-computed if None.
+            modes_to_show: List of specific mode indices to visualize, visualize all if None.
         """
         print("Visualizing latent space modes...")
-        
+
         # Determine which modes to show
         if modes_to_show is None:
             modes_to_show = list(range(self.latent_dim))
-        
         num_modes = len(modes_to_show)
-        
+        if num_modes == 0:
+            print("No modes selected to visualize.")
+            return
+
         # Compute scale for latent vectors if not provided
         if scale is None:
-            scale = self.compute_safe_scaling_factor() * 2.0  # Larger scale to see clear deformations
-        
+            scale = self.compute_safe_scaling_factor() * 2.0 # Larger scale to see clear deformations
+
         # Create values to sample for each mode
         values = np.linspace(-scale, scale, num_samples)
-        
-        # Convert DOLFINx mesh to PyVista format
-        topology, cell_types, x = plot.vtk_mesh(self.domain)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, x)
-        
-        # Create a linear function space for visualization
-        V_viz = fem.functionspace(self.domain, ("CG", 1, (3,)))
-        u_linear = fem.Function(V_viz)
-        
+
+        # Create base PyVista grid directly from loaded NumPy arrays
+        num_elements = self.elements_np.shape[0]
+        nodes_per_elem = self.elements_np.shape[1]
+
+        if nodes_per_elem == 4: # Linear Tetrahedron
+            cell_type = pyvista.CellType.TETRA
+            cells = np.hstack((np.full((num_elements, 1), 4), self.elements_np)).flatten()
+        elif nodes_per_elem == 8: # Linear Hexahedron
+            cell_type = pyvista.CellType.HEXAHEDRON
+            cells = np.hstack((np.full((num_elements, 1), 8), self.elements_np)).flatten()
+        elif nodes_per_elem == 10: # Quadratic Tetrahedron
+             cell_type = pyvista.CellType.QUADRATIC_TETRA
+             cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
+        # Add other element types if needed
+        else:
+             print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Cannot visualize latent space.")
+             return
+
+        try:
+            grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
+        except Exception as e:
+            print(f"Error creating PyVista grid: {e}. Cannot visualize.")
+            return
+
         # Create plotter with mode rows and sample columns
-        plotter = pyvista.Plotter(shape=(num_modes, num_samples), border=False, 
+        plotter = pyvista.Plotter(shape=(num_modes, num_samples), border=False,
                                 window_size=[1600, 200 * num_modes])
-        
+
         # Visualize each mode with varying values
+        max_overall_disp = 0.0
+        grids_to_plot = []
+
         for i, mode_idx in enumerate(modes_to_show):
+            if mode_idx >= self.latent_dim:
+                print(f"Warning: Skipping mode index {mode_idx} as it exceeds latent dimension {self.latent_dim}.")
+                continue
+            if mode_idx >= self.linear_modes.shape[1]:
+                 print(f"Warning: Skipping mode index {mode_idx} as it exceeds available linear modes {self.linear_modes.shape[1]}.")
+                 continue
+
             for j, val in enumerate(values):
                 # Create a zero latent vector
                 z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
-                
                 # Set only the current mode to the current value
                 z[mode_idx] = val
-                
-                # Compute the linear component and neural model prediction
-                linear_contribution = (self.linear_modes[:, mode_idx] * val)
-                y = self.model(z)
-                u_total = y +  linear_contribution
-                u_total_np = u_total.detach().cpu().numpy()
-                
-                # Create a function in the original function space
-                u_quadratic = fem.Function(self.V)
-                u_quadratic.x.array[:] = u_total_np
-                
-                # Interpolate to the visualization space if needed
-                u_linear.interpolate(u_quadratic)
-                u_linear_np = u_linear.x.array
-                
-                # Set active subplot
-                plotter.subplot(i, j)
-                
-                # Create mesh with deformation
+
+                # Compute total displacement
+                with torch.no_grad():
+                    linear_contribution = self.linear_modes[:, mode_idx] * val # Assumes linear_modes columns match latent dims
+                    y = self.model(z)
+                    u_total = y + linear_contribution
+                    u_total_np = u_total.detach().cpu().numpy().reshape((-1, 3))
+
+                # Create deformed grid
                 local_grid = grid.copy()
-                local_grid.point_data["displacement"] = u_linear_np.reshape((-1, 3))
-                local_grid["displacement_magnitude"] = np.linalg.norm(u_linear_np.reshape((-1, 3)), axis=1)
-                
-                # Compute max displacement for adaptive scaling
-                max_disp = np.max(local_grid["displacement_magnitude"])
-                warp_factor = min(1.5, 0.2/max(max_disp, 1e-6))  # Adaptive but reasonable scaling
-                
-                # Warp the mesh by the displacement
-                warped = local_grid.warp_by_vector("displacement", factor=warp_factor)
-                
-                # Add mesh to plot
-                plotter.add_mesh(warped, scalars="displacement_magnitude", 
-                            cmap="viridis", show_edges=True)
-                
-                # Add value label
-                plotter.add_text(f"z{mode_idx}={val:.2f}", position="lower_right", 
-                            font_size=8, color='white')
-                
-                # Set camera position consistently
-                plotter.view_isometric()
-        
+                local_grid.points = self.coordinates_np + u_total_np # Apply displacement directly
+                local_grid["displacement_magnitude"] = np.linalg.norm(u_total_np, axis=1)
+                max_overall_disp = max(max_overall_disp, np.max(local_grid["displacement_magnitude"]))
+                grids_to_plot.append({'grid': local_grid, 'row': i, 'col': j})
+
+        # Plot with consistent color range
+        color_range = [0, max(max_overall_disp, 1e-9)] # Avoid zero range
+        for item in grids_to_plot:
+            plotter.subplot(item['row'], item['col'])
+            # Use show_edges=False for potentially cleaner visualization
+            plotter.add_mesh(item['grid'], scalars="displacement_magnitude",
+                             cmap="viridis", show_edges=False, clim=color_range, reset_camera=False)
+            # Add value label
+            mode_idx = modes_to_show[item['row']]
+            val = values[item['col']]
+            plotter.add_text(f"z{mode_idx}={val:.2f}", position="lower_right", font_size=8, color='white')
+            plotter.view_isometric() # Set consistent view
+
         # Add row labels for modes
         for i, mode_idx in enumerate(modes_to_show):
-            plotter.subplot(i, 0)
-            plotter.add_text(f"Mode {mode_idx}", position="left_edge", 
-                        font_size=12, color='white')
-        
+            plotter.subplot(i, 0) # Left edge
+            plotter.add_text(f"Mode {mode_idx}", position="left_edge", font_size=12, color='white')
+
         # Link all camera views
         plotter.link_views()
-        
+
         # Add a unified colorbar
-        plotter.subplot(0, 0)
-        plotter.add_scalar_bar("Displacement Magnitude", position_x=0.4, position_y=0.05, 
+        plotter.subplot(0, 0) # Place relative to a subplot
+        plotter.add_scalar_bar("Displacement Magnitude", position_x=0.4, position_y=0.05,
                         width=0.5, height=0.02, title_font_size=12, label_font_size=10)
-        
+
         # Add overall title
-        plotter.add_text("Neural Latent Space Mode Atlas", position="upper_edge", 
+        plotter.add_text("Neural Latent Space Mode Atlas", position="upper_edge",
                     font_size=16, color='black')
-        
+
         print("Showing latent space visualization...")
         plotter.show()
         print("Visualization complete.")
-        
-        return plotter  # Return plotter in case further customization is needed
+        return plotter # Return plotter in case further customization is needed
+
     
     
     
 
 def main():
     print("Starting main function...")
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Hybrid Simulation')
+    parser = argparse.ArgumentParser(description='Hybrid Simulation Training from SOFA Data')
+
     parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path')
     parser.add_argument('--resume', action='store_true', help='resume from checkpoint')
     parser.add_argument('--skip-training', action='store_true', help='skip training and load best model')
     parser.add_argument('--checkpoint', type=str, default=None, help='specific checkpoint path to load')
     args = parser.parse_args()
-    
+
     cfg = load_config(args.config)
-    setup_logger(None, log_dir=os.path.join(cfg['training']['checkpoint_dir'], cfg.get('training', {}).get('log_dir', 'logs')))
+    # Ensure log directory exists relative to checkpoint dir
+    checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
+    log_dir_cfg = cfg.get('training', {}).get('log_dir', 'logs')
+    log_dir_abs = os.path.join(checkpoint_dir, log_dir_cfg)
+    setup_logger(None, log_dir=log_dir_abs)
     print("Arguments parsed and logger setup.")
 
-    # Check for skip_training in both command line and config
     skip_training = args.skip_training or cfg.get('training', {}).get('skip_training', False)
-    checkpoint_path = args.checkpoint or cfg.get('training', {}).get('checkpoint_path')
-    
-    if checkpoint_path is None:
-        checkpoint_path = os.path.join('checkpoints', 'best.pt')
-    
+    checkpoint_path = args.checkpoint # Use command line arg first
+    if checkpoint_path is None: # If not provided, check config
+         checkpoint_path = cfg.get('training', {}).get('checkpoint_path')
+    if checkpoint_path is None: # If still not provided, use default best_sofa.pt
+         checkpoint_path = os.path.join(checkpoint_dir, 'best_sofa.pt') # Use checkpoint_dir
+
     print(f"Skip training: {skip_training}")
-    print(f"Checkpoint path: {checkpoint_path if os.path.exists(checkpoint_path) else 'Not found'}")
+    print(f"Checkpoint path: {checkpoint_path} (Exists: {os.path.exists(checkpoint_path)})")
 
-    engine = Routine(cfg)
-    print("Engine initialized.")
+    # --- Initialize Routine (now uses loaded data) ---
+    try:
+        engine = Routine(cfg)
+        print("Engine initialized.")
+    except Exception as e:
+        print(f"FATAL ERROR during Routine initialization: {e}")
+        print("Did you run the script sofa_linear_modes_viz.py?")
+        traceback.print_exc()
+        sys.exit(1)
+    # --- End Initialization ---
 
-    # Training or loading logic
+    # Training or loading logic (same as before)
     if skip_training:
         print("Skipping training as requested...")
         if os.path.exists(checkpoint_path):
             print(f"Loading model from {checkpoint_path}")
             engine.load_checkpoint(checkpoint_path)
         else:
-            print(f"Warning: No checkpoint found at {checkpoint_path}, using untrained model")
+            print(f"Warning: No checkpoint found at {checkpoint_path}, using untrained model.")
     else:
-        # Normal training loop
         num_epochs = cfg['training']['num_epochs']
         print(f"Starting training for {num_epochs} epochs...")
         best_loss = engine.train(num_epochs)
         print("Training complete.")
-        
-        # Load the best model before evaluation
-        best_checkpoint_path = os.path.join('checkpoints', 'best.pt')
+        best_checkpoint_path = os.path.join(checkpoint_dir, 'best_sofa.pt') # Use checkpoint_dir
         if os.path.exists(best_checkpoint_path):
             print("Loading best model for evaluation...")
             engine.load_checkpoint(best_checkpoint_path)
         else:
-            print("No best model checkpoint found, using final model")
+            print("No best model checkpoint found, using final model.")
 
+    # --- Evaluation / Visualization (same as before, but uses updated methods) ---
     latent_dim = engine.latent_dim
     print(f"Latent dimension: {latent_dim}")
 
-
-    # Add latent space visualization
     print("\nVisualizing latent space dimensions...")
-    # Visualize first two dimensions by default
-    engine.visualize_latent_dimensions(dim1=1, dim2=2, num_points=5)
-    
-    # Optionally visualize other dimension pair
-    engine.visualize_latent_dimensions(dim1=0, dim2=2, num_points=5)
+    engine.visualize_latent_dimensions(dim1=0, dim2=1, num_points=5) # Example pair
+    if latent_dim > 2:
+         engine.visualize_latent_dimensions(dim1=1, dim2=2, num_points=5) # Another pair if possible
 
     print("\nVisualizing latent space modes...")
-    # Visualize all latent dimensions
     engine.visualize_latent_space(num_samples=5)
-    
+
     print("Main function complete.")
+
 
 def load_config(config_file):
     import yaml

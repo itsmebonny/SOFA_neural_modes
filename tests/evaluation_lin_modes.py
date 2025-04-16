@@ -65,7 +65,7 @@ mesh_file = "mesh/beam_732.msh"  # Path to .msh file if use_gmsh is True
 # Material properties
 
 E, nu = 10000, 0.45  # Example values for soft tissue
-rho = 1000
+rho = 1
 
 # Lame's constants
 mu = E / (2 * (1 + nu))

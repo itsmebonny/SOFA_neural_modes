@@ -170,6 +170,10 @@ class AnimationStepController(Sofa.Core.Controller):
             mass_matrix[:, dof] = 0
             # No need to set mass diagonal
 
+        fixed_dofs = np.array(fixed_dofs)
+        print(f"Number of fixed DOFs: {len(fixed_dofs)}")
+
+
         # Convert back to CSR for efficient computation
         stiff_matrix = stiff_matrix.tocsr()
         mass_matrix = mass_matrix.tocsr()
@@ -178,33 +182,79 @@ class AnimationStepController(Sofa.Core.Controller):
         self.mass_matrix = mass_matrix
         
         print("Boundary conditions applied to matrices")
-        
-        # Create directory for matrices
+
+        # Create directory for matrices and mesh data
         matrices_dir = 'matrices'
         os.makedirs(matrices_dir, exist_ok=True)
-        matrices_dir = 'matrices'
-        os.makedirs(matrices_dir, exist_ok=True)
-        if not os.path.exists(f'{matrices_dir}/{self.timestamp}'):
-            os.makedirs(f'{matrices_dir}/{self.timestamp}')
-        
-        # Save matrices
-        np.save(f'{matrices_dir}/mass_matrix_{self.timestamp}.npy', self.mass_matrix)
-        np.save(f'{matrices_dir}/stiffness_matrix_{self.timestamp}.npy', self.stiffness_matrix)
-        
-        # Save metadata
+        output_subdir = os.path.join(matrices_dir, self.timestamp)
+        os.makedirs(output_subdir, exist_ok=True)
+
+
+        # --- Save Fixed DOFs ---
+        fixed_dofs_path = os.path.join(output_subdir, f'fixed_dofs_{self.timestamp}.npy')
+        try:
+            np.save(fixed_dofs_path, fixed_dofs)
+            print(f"Fixed DOFs saved to {fixed_dofs_path}")
+            fixed_dofs_saved = True
+        except Exception as e:
+            print(f"Error saving fixed DOFs: {e}")
+            fixed_dofs_saved = False
+
+        # --- Save Matrices ---
+        # Use scipy.sparse.save_npz for sparse matrices
+        try:
+            sparse.save_npz(os.path.join(output_subdir, f'mass_matrix_{self.timestamp}.npz'), self.mass_matrix)
+            sparse.save_npz(os.path.join(output_subdir, f'stiffness_matrix_{self.timestamp}.npz'), self.stiffness_matrix)
+            print("Sparse matrices saved in .npz format.")
+        except Exception as e:
+            print(f"Error saving sparse matrices: {e}. Trying numpy save...")
+            # Fallback to numpy save if sparse fails (might lose sparsity)
+            np.save(os.path.join(output_subdir, f'mass_matrix_{self.timestamp}.npy'), self.mass_matrix)
+            np.save(os.path.join(output_subdir, f'stiffness_matrix_{self.timestamp}.npy'), self.stiffness_matrix)
+
+        # --- Save Mesh Data ---
+        try:
+            coordinates = self.MO1.rest_position.value
+            # Assuming topology container is named 'triangleTopo' and holds tetrahedra
+            # Adjust 'triangleTopo' if your topology container has a different name
+            # Adjust '.tetrahedra' if it holds different element types (e.g., .hexahedra)
+            elements = self.surface_topo.tetrahedra.value
+
+            np.save(os.path.join(output_subdir, f'coordinates_{self.timestamp}.npy'), coordinates)
+            np.save(os.path.join(output_subdir, f'elements_{self.timestamp}.npy'), elements)
+            print(f"Mesh data saved: Coordinates shape {coordinates.shape}, Elements shape {elements.shape}")
+            mesh_saved = True
+        except AttributeError as e:
+             print(f"Error accessing mesh data (check component names 'MO1', 'surface_topo', '.tetrahedra'): {e}")
+             mesh_saved = False
+        except Exception as e:
+             print(f"An unexpected error occurred while saving mesh data: {e}")
+             mesh_saved = False
+
+
+        # --- Save Metadata ---
         metadata = {
             'timestamp': self.timestamp,
-            'mesh_file': self.mesh_filename,
+            'mesh_file_source': self.mesh_filename, # Original source mesh
             'young_modulus': self.young_modulus,
             'poisson_ratio': self.poisson_ratio,
             'density': self.density,
-            'size': self.mass_matrix.shape[0]
+            'num_dofs': self.mass_matrix.shape[0],
+            'matrix_format': 'npz' if 'sparse' in locals() and 'save_npz' in sparse.__dict__ else 'npy',
+            'coordinates_file': f'coordinates_{self.timestamp}.npy' if mesh_saved else None,
+            'elements_file': f'elements_{self.timestamp}.npy' if mesh_saved else None,
+            'fixed_dofs_file': f'fixed_dofs_{self.timestamp}.npy' if fixed_dofs_saved else None, 
+            'eigenvalues_file': f'eigenvalues_{self.timestamp}.npy',
+            'eigenvectors_file': f'eigenvectors_{self.timestamp}.npy',
+            'frequencies_file': f'frequencies_{self.timestamp}.npy'
         }
-        
-        with open(f'{matrices_dir}/metadata_{self.timestamp}.json', 'w') as f:
+
+        metadata_path = os.path.join(output_subdir, f'metadata_{self.timestamp}.json')
+        with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        
-        print(f"Matrices saved to {matrices_dir} with timestamp {self.timestamp}")
+
+        print(f"Matrices, mesh data, and metadata saved to {output_subdir}")
+
         
         # Now compute eigenmodes directly
         print(f"Computing {self.num_modes_to_show} eigenmodes using SLEPc...")
@@ -479,6 +529,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     visual = exactSolution.addChild("visual")
     visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
     visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
+
+
 
     # Create and add controller with all components
     controller = AnimationStepController(rootNode, 

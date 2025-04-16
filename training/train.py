@@ -31,7 +31,7 @@ import gmsh
 from mpi4py import MPI
 import ufl
 from scipy.linalg import eig
-from tests.solver import EnergyModel, ModularNeoHookeanEnergy, UFLNeoHookeanModel
+from tests.solver import UFLNeoHookeanModel
 
 # Add after imports
 from slepc4py import SLEPc
@@ -103,14 +103,14 @@ class Net(torch.nn.Module):
         super(Net, self).__init__()
         
         # Input layer
-        layers = [torch.nn.Linear(latent_dim, hid_dim, bias=False)]
+        layers = [torch.nn.Linear(latent_dim, hid_dim)]
         
         # Hidden layers
         for _ in range(hid_layers-1):
-            layers.append(torch.nn.Linear(hid_dim, hid_dim, bias=False))
+            layers.append(torch.nn.Linear(hid_dim, hid_dim))
             
         # Output layer
-        layers.append(torch.nn.Linear(hid_dim, output_dim, bias=False))
+        layers.append(torch.nn.Linear(hid_dim, output_dim))
         
         self.layers = torch.nn.ModuleList(layers)
 
@@ -375,27 +375,38 @@ class Routine:
         # self.linear_modes = self.linear_modes[:, 6:]
         print(f"Linear eigenmodes loaded. Shape: {self.linear_modes.shape}")
 
+        # Convert boundary DOFs to tensor for use in training
+        if hasattr(self, 'boundary_dofs') and self.boundary_dofs is not None:
+            # Ensure boundary_dofs are unique and sorted if necessary
+            unique_boundary_dofs = np.unique(self.boundary_dofs)
+            self.boundary_dofs_th = torch.tensor(unique_boundary_dofs, device=self.device, dtype=torch.long)
+            print(f"Stored {len(self.boundary_dofs_th)} unique boundary DOFs for penalty.")
+        else:
+            self.boundary_dofs_th = None
+            print("Warning: Boundary DOFs not found or stored. BC penalty will not be applied.")
+
+
         # print("Loading neural network...")
         self.num_modes = self.latent_dim  # Make them the same
         output_dim = self.V.dofmap.index_map.size_global * self.domain.geometry.dim
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
-        # print(f"Output dimension: {output_dim}")
-        # self.model = Net(
-        #     self.num_modes, 
-        #     output_dim, 
-        #     hid_layers=hid_layers, 
-        #     hid_dim=hid_dim
-        # ).to(device).double()
-        # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        self.model = ResidualNet(
+        print(f"Output dimension: {output_dim}")
+        self.model = Net(
             self.num_modes, 
             output_dim, 
             hid_layers=hid_layers, 
-            hid_dim=hid_dim,
-            activation=torch.nn.functional.leaky_relu,
-            zero_init_output=True
+            hid_dim=hid_dim
         ).to(device).double()
+        # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
+        # self.model = ResidualNet(
+        #     self.num_modes, 
+        #     output_dim, 
+        #     hid_layers=hid_layers, 
+        #     hid_dim=hid_dim,
+        #     activation=torch.nn.functional.leaky_relu,
+        #     zero_init_output=True
+        # ).to(device).double()
 
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
@@ -458,7 +469,9 @@ class Routine:
         # Create boundary condition using the function
         boundary_dofs = fem.locate_dofs_geometrical(self.V, x_min_boundary)
         bc = fem.dirichletbc(u_fixed, boundary_dofs)
-        
+        self.boundary_dofs = boundary_dofs # Store the boundary DOFs
+
+
         # ---- Assemble matrices WITHOUT boundary conditions (new approach) ----
         print("Assembling A matrix WITHOUT boundary conditions")
         A = assemble_matrix_petsc(form(a_form)) # No bcs here
@@ -764,16 +777,16 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 2
-                deformation_scale_final = 20
+                deformation_scale_final = 30
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init)# * (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
                 mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
+                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
 
                 #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
                 #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
@@ -794,16 +807,18 @@ class Routine:
                 constraint_dir = constraint_dir / constraint_norms
                 constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
-                # Track these values outside the closure
+                # Track th0ese values outside the closure
                 energy_val = 0
                 ortho_val = 0
                 origin_val = 0
+                bc_penalty_val = 0 # Add variable for BC penalty
                 loss_val = 0
-                
+
                 # Define closure for optimizer
                 def closure():
-                    nonlocal energy_val, ortho_val, origin_val, loss_val, lbfgs_iter, iteration, best_loss
+                    nonlocal energy_val, ortho_val, origin_val, bc_penalty_val, loss_val, lbfgs_iter, iteration, best_loss # Add bc_penalty_val
                     nonlocal z, l, rest_idx, constraint_dir
+
 
                     lbfgs_iter += 1
                     
@@ -854,6 +869,16 @@ class Routine:
                     # Compute origin constraint for rest shape
                     origin = torch.sum(y[rest_idx]**2)
 
+                    bc_penalty = torch.tensor(0.0, device=self.device, dtype=torch.float64) # Initialize as tensor
+                    if self.boundary_dofs_th is not None and len(self.boundary_dofs_th) > 0:
+                        # Get the total displacement at the fixed DOFs for the entire batch
+                        # u_total_batch shape: (batch_size, num_dofs)
+                        # self.boundary_dofs_th shape: (num_fixed_dofs,)
+                        fixed_displacements = u_total_batch[:, self.boundary_dofs_th] # Shape: (batch_size, num_fixed_dofs)
+                        # Calculate the squared L2 norm of displacements at fixed DOFs, averaged over batch
+                        bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
+              
+
 
                  
 
@@ -879,7 +904,16 @@ class Routine:
 
 
                     # Modified loss
-                    loss = -improvement_loss + 1e3 * ortho + 1e2 *  origin 
+                    loss = energy + 1e5 * ortho + 1e5 *  origin + 1e2 * bc_penalty 
+
+                    # --- NaN Safeguard ---
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"\n !!! WARNING: Loss became {loss.item()} at iteration {iteration}, LBFGS step {lbfgs_iter} !!!")
+                        print(f"    Components: Energy={energy.item():.4e}, Ortho={ortho.item():.4e}, Origin={origin.item():.4e}")
+                        # Option 1: Raise error to stop LBFGS step (recommended)
+                        # raise ValueError("Loss is NaN or Inf, stopping optimization step.")
+                        # Option 2: Return a large value (might mess up line search)
+                        return torch.tensor(float('inf'), device=self.device, dtype=torch.float64) 
 
 
                     loss.backward()
@@ -906,7 +940,7 @@ class Routine:
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
-                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f} │ {'Origin Constraint:':<20} {origin.item():<12.6f}")
+                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f} │ {'Origin Constraint:':<20} {origin.item():<12.6f} | {'BC Penalty:':<20} {bc_penalty.item():<12.6f}")
                         
                         # # Displacement metrics section
                         # print(f"│ DISPLACEMENT METRICS:")
@@ -963,7 +997,7 @@ class Routine:
             self.writer.add_scalar('train/origin', origin_val, iteration)
             
             # Save checkpoint if this is the best model so far
-            if loss_val < best_loss or loss_val < 10:
+            if loss_val < best_loss:
                 best_loss = loss_val
                 checkpoint = {
                     'epoch': iteration,
@@ -1566,73 +1600,208 @@ class Routine:
     
     def analyze_latent_correlations(self, delta=0.01, save_path=None):
         """
-        Analyze correlations between latent dimensions by computing gradient at origin.
+        Analyze correlations between latent dimensions based on the gradient of the 
+        TOTAL displacement (linear + neural) at the origin.
         
         Args:
             delta: Small perturbation for finite difference approximation
             save_path: Path to save visualization
         """
-        print("Analyzing latent space correlations...")
+        print("Analyzing latent space correlations (based on total displacement)...")
         
-        # Get latent dimension
-        latent_dim = self.model.latent_dim
-        
+        # Get latent dimension and linear modes
+        latent_dim = self.latent_dim
+        # Ensure linear_modes are available and correctly sliced if needed
+        linear_modes = self.linear_modes[:, :latent_dim] 
+
         # Create base zero latent vector (origin)
         z0 = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
         
-        # Get base output at origin
+        # Get base TOTAL output at origin
         with torch.no_grad():
-            output0 = self.model(z0).flatten()
+            linear_output0 = torch.matmul(z0, linear_modes.T) # Should be zero
+            neural_output0 = self.model(z0).flatten()
+            total_output0 = linear_output0 + neural_output0 # Effectively neural_output0
         
         # Initialize correlation matrix and norm vectors
         corr_matrix = torch.zeros((latent_dim, latent_dim), device=self.device, dtype=torch.float64)
         norm_squared = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
         
-        # Compute perturbed outputs for each latent dimension
-        perturbed_outputs = []
+        # Store perturbed TOTAL outputs
+        perturbed_total_outputs = []
         for i in range(latent_dim):
             # Perturb the i-th dimension
             zi = z0.clone()
             zi[i] += delta
             
-            # Compute output with perturbation
+            # Compute TOTAL output with perturbation
             with torch.no_grad():
-                outputi = self.model(zi).flatten()
+                linear_output_i = torch.matmul(zi, linear_modes.T)
+                neural_output_i = self.model(zi).flatten()
+                total_output_i = linear_output_i + neural_output_i
             
-            # Store direction vector (scaled gradient)
-            perturbed_outputs.append(outputi)
+            # Store perturbed total output
+            perturbed_total_outputs.append(total_output_i)
         
-        # Compute E = [e1|e2|...|en] matrix where each ei is a gradient direction
-        # And compute correlation matrix ET E incrementally
+        # --- Calculate direction vectors based on TOTAL displacement ---
+        direction_vectors = []
         for i in range(latent_dim):
-            # Direction vector for dimension i (gradient approximation)
-            dir_i = (perturbed_outputs[i] - output0) / delta
-            
+            # Direction vector for dimension i (gradient approximation of total displacement)
+            dir_i = (perturbed_total_outputs[i] - total_output0) / delta
+            direction_vectors.append(dir_i)
             # Update squared norm
             norm_squared[i] = torch.dot(dir_i, dir_i)
-            
-            # Compute correlations
+
+        # Compute E = [e1|e2|...|en] matrix where each ei is a gradient direction of total displacement
+        # And compute correlation matrix ET E incrementally
+        unnormalized_corr_matrix = torch.zeros_like(corr_matrix) # Store unnormalized version
+        for i in range(latent_dim):
+            dir_i = direction_vectors[i]
             for j in range(latent_dim):
-                dir_j = (perturbed_outputs[j] - output0) / delta
+                dir_j = direction_vectors[j]
                 dot_product = torch.dot(dir_i, dir_j)
-                corr_matrix[i, j] = dot_product
+                unnormalized_corr_matrix[i, j] = dot_product
+        # --- End of modification ---
+
+        # --- Add eigenvalue calculation and print statement here ---
+        try:
+            # Calculate eigenvalues of the unnormalized correlation matrix (E^T E)
+            # Use eigvalsh since the matrix is symmetric
+            eigenvalues_unnormalized = torch.linalg.eigvalsh(unnormalized_corr_matrix)
+            print(f"Eigenvalues of unnormalized correlation matrix (E^T E based on total displacement): {eigenvalues_unnormalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of unnormalized correlation matrix: {e}")
         
         # Normalize to get correlations (-1 to 1 scale)
+        corr_matrix = unnormalized_corr_matrix.clone() # Start with unnormalized values
         for i in range(latent_dim):
             for j in range(latent_dim):
                 denominator = torch.sqrt(norm_squared[i] * norm_squared[j])
                 if denominator > 1e-10:
                     corr_matrix[i, j] /= denominator
-        
-        # Visualize the correlation matrix
-        fig = self.visualize_correlation_matrix(corr_matrix, save_path)
-        
-        print("Latent correlation analysis complete.")
-        return corr_matrix, fig
-    
+                else:
+                    # Handle case where norm is zero
+                    if i != j:
+                        corr_matrix[i, j] = 0.0
+                    else:
+                        corr_matrix[i, j] = 1.0 if norm_squared[i] > 1e-10 else 0.0
 
-    def visualize_correlation_matrix(self, corr_matrix, save_path=None):
+        # --- Add eigenvalue calculation for normalized matrix ---
+        try:
+            # Calculate eigenvalues of the normalized correlation matrix
+            # Use eigvalsh since the matrix is symmetric
+            eigenvalues_normalized = torch.linalg.eigvalsh(corr_matrix)
+            print(f"Eigenvalues of normalized correlation matrix (based on total displacement): {eigenvalues_normalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of normalized correlation matrix: {e}")
+
+        # Visualize the correlation matrix
+        fig = self.visualize_correlation_matrix(corr_matrix, save_path, title_suffix="(Total Displacement)")
+        
+        print("Latent correlation analysis (total displacement) complete.")
+        return corr_matrix, fig
+
+    def analyze_linear_mode_correlations(self, delta=0.01, save_path=None):
+        """
+        Analyze correlations between latent dimensions based ONLY on the linear modes.
+        This should ideally result in an identity matrix if linear modes are orthogonal.
+        
+        Args:
+            delta: Small perturbation (value doesn't strictly matter here but kept for consistency)
+            save_path: Path to save visualization
+        """
+        print("Analyzing latent space correlations (based on linear modes ONLY)...")
+        
+        # Get latent dimension and linear modes
+        latent_dim = self.latent_dim
+        linear_modes = self.linear_modes[:, :latent_dim] 
+
+        # Create base zero latent vector (origin)
+        z0 = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+        
+        # Get base LINEAR output at origin (should be zero)
+        with torch.no_grad():
+            linear_output0 = torch.matmul(z0, linear_modes.T) 
+        
+        # Initialize correlation matrix and norm vectors
+        corr_matrix = torch.zeros((latent_dim, latent_dim), device=self.device, dtype=torch.float64)
+        norm_squared = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+        
+        # Store perturbed LINEAR outputs
+        perturbed_linear_outputs = []
+        for i in range(latent_dim):
+            # Perturb the i-th dimension
+            zi = z0.clone()
+            zi[i] += delta # Use delta=1 for direct mode extraction
+            
+            # Compute LINEAR output with perturbation
+            with torch.no_grad():
+                linear_output_i = torch.matmul(zi, linear_modes.T)
+            
+            # Store perturbed linear output
+            perturbed_linear_outputs.append(linear_output_i)
+        
+        # --- Calculate direction vectors based on LINEAR displacement ---
+        # Note: With delta=1, dir_i is essentially the i-th linear mode vector
+        direction_vectors = []
+        for i in range(latent_dim):
+            # Direction vector for dimension i (gradient approximation of linear displacement)
+            # Equivalent to (linear_modes[:, i] * delta) / delta = linear_modes[:, i]
+            dir_i = (perturbed_linear_outputs[i] - linear_output0) / delta 
+            direction_vectors.append(dir_i)
+            # Update squared norm
+            norm_squared[i] = torch.dot(dir_i, dir_i)
+
+        # Compute E = [e1|e2|...|en] matrix where each ei is a linear mode vector
+        # And compute correlation matrix ET E incrementally
+        unnormalized_corr_matrix = torch.zeros_like(corr_matrix) # Store unnormalized version
+        for i in range(latent_dim):
+            dir_i = direction_vectors[i]
+            for j in range(latent_dim):
+                dir_j = direction_vectors[j]
+                dot_product = torch.dot(dir_i, dir_j)
+                unnormalized_corr_matrix[i, j] = dot_product
+        # --- End of modification ---
+
+        # --- Add eigenvalue calculation and print statement here ---
+        try:
+            # Calculate eigenvalues of the unnormalized correlation matrix (E^T E)
+            eigenvalues_unnormalized = torch.linalg.eigvalsh(unnormalized_corr_matrix)
+            print(f"Eigenvalues of unnormalized correlation matrix (E^T E based on linear modes): {eigenvalues_unnormalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of unnormalized linear correlation matrix: {e}")
+        
+        # Normalize to get correlations (-1 to 1 scale)
+        corr_matrix = unnormalized_corr_matrix.clone() # Start with unnormalized values
+        for i in range(latent_dim):
+            for j in range(latent_dim):
+                denominator = torch.sqrt(norm_squared[i] * norm_squared[j])
+                if denominator > 1e-10:
+                    corr_matrix[i, j] /= denominator
+                else:
+                    # Handle case where norm is zero
+                    if i != j:
+                        corr_matrix[i, j] = 0.0
+                    else:
+                        corr_matrix[i, j] = 1.0 if norm_squared[i] > 1e-10 else 0.0
+
+        # --- Add eigenvalue calculation for normalized matrix ---
+        try:
+            # Calculate eigenvalues of the normalized correlation matrix
+            eigenvalues_normalized = torch.linalg.eigvalsh(corr_matrix)
+            print(f"Eigenvalues of normalized correlation matrix (based on linear modes): {eigenvalues_normalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of normalized linear correlation matrix: {e}")
+
+        # Visualize the correlation matrix
+        fig = self.visualize_correlation_matrix(corr_matrix, save_path, title_suffix="(Linear Modes Only)")
+        
+        print("Linear mode correlation analysis complete.")
+        return corr_matrix, fig
+
+    def visualize_correlation_matrix(self, corr_matrix, save_path=None, title_suffix=""):
         """Visualize the correlation matrix between latent dimensions."""
+        # ... (rest of visualize_correlation_matrix method - maybe add title_suffix to the title) ...
         import matplotlib.pyplot as plt
         import numpy as np
         import seaborn as sns
@@ -1658,16 +1827,25 @@ class Routine:
         plt.yticks(np.arange(latent_dim) + 0.5, [f'z{i}' for i in range(latent_dim)], rotation=0)
         
         # Add title
-        plt.title('Neural Modes Latent Space Correlation Matrix', fontsize=14)
+        plt.title(f'Latent Space Correlation Matrix {title_suffix}', fontsize=14) # Added suffix
         plt.tight_layout()
         
         # Save if requested
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Correlation matrix visualization saved to {save_path}")
+            # Modify save path slightly if needed to avoid overwriting
+            base, ext = os.path.splitext(save_path)
+            if "Linear" in title_suffix:
+                save_path_mod = f"{base}_linear{ext}"
+            else:
+                save_path_mod = save_path # Keep original for total displacement
+            plt.savefig(save_path_mod, dpi=300, bbox_inches='tight')
+            print(f"Correlation matrix visualization saved to {save_path_mod}")
         
         plt.show()
         return plt.gcf()
+    
+
+
 
 def main():
     print("Starting main function...")
@@ -1735,9 +1913,16 @@ def main():
     # Visualize all latent dimensions
     engine.visualize_latent_space(num_samples=5)
 
-    print("\nAnalyzing latent space correlations...")
-    correlation_matrix_path = os.path.join('checkpoints', 'latent_correlations.png')
-    corr_matrix, _ = engine.analyze_latent_correlations(delta=0.01, save_path=correlation_matrix_path)
+
+
+    print("\nAnalyzing latent space correlations (TOTAL displacement)...")
+    correlation_matrix_path = os.path.join('checkpoints', 'latent_correlations_total.png')
+    corr_matrix_total, _ = engine.analyze_latent_correlations(delta=0.0001, save_path=correlation_matrix_path)
+
+    print("\nAnalyzing latent space correlations (LINEAR modes only)...")
+    linear_correlation_matrix_path = os.path.join('checkpoints', 'latent_correlations_linear.png')
+    corr_matrix_linear, _ = engine.analyze_linear_mode_correlations(delta=1.0, save_path=linear_correlation_matrix_path) # delta=1 is fine here
+
 
     print("\nPlotting training metrics...")
     metrics_plot_path = os.path.join('checkpoints', 'training_metrics.png')
