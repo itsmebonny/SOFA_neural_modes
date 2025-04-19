@@ -26,14 +26,14 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 10
+  latent_dim: 6
   hid_layers: 32
   hid_dim: 32
   use_modal_derivatives: true
 
 # Training parameters
 training:
-  num_epochs: 50
+  num_epochs: 500
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"

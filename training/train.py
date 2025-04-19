@@ -5,6 +5,8 @@ import torch
 torch.set_default_dtype(torch.float64)
 from torch.utils.tensorboard import SummaryWriter
 import math
+from torch.func import vmap, jvp
+
 
 from dolfinx.fem.petsc import assemble_matrix as assemble_matrix_petsc
 from dolfinx.fem import form 
@@ -114,12 +116,9 @@ class Net(torch.nn.Module):
         
         self.layers = torch.nn.ModuleList(layers)
 
-        # Initialize weights of all layers
-        for i in range(len(self.layers)-1):
-            torch.nn.init.kaiming_normal_(self.layers[i].weight, nonlinearity='leaky_relu')
-        
+       
         # Initialize the last layer with smaller weights to avoid large initial outputs
-        torch.nn.init.normal_(self.layers[-1].weight, mean=0.0, std=0.01)
+        torch.nn.init.zeros_(self.layers[-1].weight)
         
     def forward(self, x):
         # Handle both single vectors and batches
@@ -159,33 +158,33 @@ class ResidualNet(torch.nn.Module):
             zero_init_output: Whether to initialize the output layer to near-zero weights
         """
         super(ResidualNet, self).__init__()
-        
+
         self.latent_dim = latent_dim
         self.output_dim = output_dim
         self.activation = activation
-        
-        # Input projection layer (latent → hidden)
-        self.input_proj = torch.nn.Linear(latent_dim, hid_dim) #, bias=False)
-        
-        # Residual blocks
+
+        # Input projection layer (latent → hidden) - No bias
+        self.input_proj = torch.nn.Linear(latent_dim, hid_dim, bias=False)
+
+        # Residual blocks - No bias in linear layers
         self.res_blocks = torch.nn.ModuleList()
         for _ in range(hid_layers):
             block = torch.nn.Sequential(
-                torch.nn.Linear(hid_dim, hid_dim), #, bias=False),
-                torch.nn.LayerNorm(hid_dim), #, elementwise_affine=False),
-                torch.nn.Linear(hid_dim, hid_dim), #, bias=False),
-                torch.nn.LayerNorm(hid_dim) #, elementwise_affine=False)
+            torch.nn.Linear(hid_dim, hid_dim, bias=False),
+            torch.nn.LayerNorm(hid_dim, elementwise_affine=False), # Keep affine=False to avoid learnable shift (bias)
+            torch.nn.Linear(hid_dim, hid_dim, bias=False),
+            torch.nn.LayerNorm(hid_dim, elementwise_affine=False) # Keep affine=False
             )
             self.res_blocks.append(block)
-        
-        # Output projection (hidden → output)
-        self.output_proj = torch.nn.Linear(hid_dim, output_dim) #, bias=False)
+
+        # Output projection (hidden → output) - No bias
+        self.output_proj = torch.nn.Linear(hid_dim, output_dim, bias=False)
 
         # Initialize weights
         # self._init_weights(zero_init_output)
         #zero last layer weights
         torch.nn.init.zeros_(self.output_proj.weight)
-        torch.nn.init.normal_(self.output_proj.bias, mean=0.0, std=0.01)
+        # torch.nn.init.normal_(self.output_proj.bias, mean=0.0, std=0.01)
 
 
     def _init_weights(self, zero_init_output):
@@ -260,54 +259,6 @@ class ResidualNet(torch.nn.Module):
             print(f"Zero-mapping test {'PASSED' if passed else 'FAILED'}")
             
             return passed, zero_norm
-
-# Add this class near the top of your file, after imports
-class LBFGSScheduler:
-    """Custom learning rate scheduler for LBFGS optimizer"""
-    def __init__(self, optimizer, factor=0.5, patience=3, threshold=0.01, min_lr=1e-6, verbose=True):
-        """
-        Args:
-            optimizer: LBFGS optimizer
-            factor: Factor by which to reduce learning rate
-            patience: Number of epochs with no significant improvement before reducing LR
-            threshold: Minimum relative improvement to reset patience counter
-            min_lr: Minimum learning rate
-            verbose: Whether to print learning rate changes
-        """
-        self.optimizer = optimizer
-        self.factor = factor
-        self.patience = patience
-        self.threshold = threshold
-        self.min_lr = min_lr
-        self.verbose = verbose
-        
-        self.best_loss = float('inf')
-        self.wait_epochs = 0
-        self.last_epoch = 0
-        
-    def step(self, loss):
-        """Call after each epoch to update learning rate if needed"""
-        self.last_epoch += 1
-        
-        # Check if current loss is better than best loss
-        if loss < self.best_loss * (1.0 - self.threshold):
-            # We have sufficient improvement
-            self.best_loss = loss
-            self.wait_epochs = 0
-        else:
-            # No significant improvement
-            self.wait_epochs += 1
-            
-            # If we've waited enough epochs with no improvement, reduce learning rate
-            if self.wait_epochs >= self.patience:
-                for param_group in self.optimizer.param_groups:
-                    old_lr = param_group['lr']
-                    if old_lr > self.min_lr:
-                        new_lr = max(old_lr * self.factor, self.min_lr)
-                        param_group['lr'] = new_lr
-                        if self.verbose:
-                            print(f"Epoch {self.last_epoch}: reducing learning rate from {old_lr:.6f} to {new_lr:.6f}")
-                        self.wait_epochs = 0  # Reset wait counter
 
 class Routine:
     def __init__(self, cfg):
@@ -392,21 +343,25 @@ class Routine:
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
         print(f"Output dimension: {output_dim}")
-        self.model = Net(
-            self.num_modes, 
-            output_dim, 
-            hid_layers=hid_layers, 
-            hid_dim=hid_dim
-        ).to(device).double()
-        # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
-        # self.model = ResidualNet(
+
+
+        # self.model = Net(
         #     self.num_modes, 
         #     output_dim, 
         #     hid_layers=hid_layers, 
-        #     hid_dim=hid_dim,
-        #     activation=torch.nn.functional.leaky_relu,
-        #     zero_init_output=True
+        #     hid_dim=hid_dim
         # ).to(device).double()
+        # print(f"Network architecture: {hid_layers} hidden layers with {hid_dim} neurons each")
+
+
+        self.model = ResidualNet(
+            self.num_modes, 
+            output_dim, 
+            hid_layers=hid_layers, 
+            hid_dim=hid_dim,
+            activation=torch.nn.functional.leaky_relu,
+            zero_init_output=True
+        ).to(device).double()
 
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
@@ -470,6 +425,7 @@ class Routine:
         boundary_dofs = fem.locate_dofs_geometrical(self.V, x_min_boundary)
         bc = fem.dirichletbc(u_fixed, boundary_dofs)
         self.boundary_dofs = boundary_dofs # Store the boundary DOFs
+        self.bc = bc
 
 
         # ---- Assemble matrices WITHOUT boundary conditions (new approach) ----
@@ -741,23 +697,14 @@ class Routine:
         
         # Use LBFGS optimizer
         optimizer = torch.optim.LBFGS(self.model.parameters(), 
-                                    lr=1,
+                                    lr=5,
                                     max_iter=20,
-                                    max_eval=40,
                                     tolerance_grad=1e-05,
                                     tolerance_change=1e-07,
                                     history_size=100,
                                     line_search_fn="strong_wolfe")
         
-        # Add scheduler for learning rate reduction
-        scheduler = LBFGSScheduler(
-            optimizer,
-            factor=0.5,  # Reduce LR by factor of 5 when plateau is detected
-            patience=100,  # More patience for batch training
-            threshold=0.01,  # Consider 1% improvement as significant
-            min_lr=1e-6,  # Don't go below this LR
-            verbose=True   # Print LR changes
-        )
+
         patience = 0
         # Main training loop
 
@@ -788,12 +735,12 @@ class Routine:
                 # Generate samples with current scale
                 z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
 
-                #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
-                #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
+                #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scales
+                z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                z[rest_idx, :] = 0  # Set rest shape latent to zero
+                # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -805,7 +752,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track th0ese values outside the closure
                 energy_val = 0
@@ -854,6 +801,64 @@ class Routine:
                     vol_penalty = 1000.0 * torch.mean((torch.tensor(
                         [r['neural_volume_ratio'] for r in volume_results], 
                         device=self.device, dtype=torch.float64) - 1.0)**2)
+                    
+                    # # We need gradients w.r.t. z for JVP, and w.r.t. u_total_batch for energy gradient
+                    # # Recompute l inside closure if needed, or ensure z requires grad if l depends on it outside
+                    # # Assuming z is generated outside and doesn't require grad initially for JVP purposes.
+                    # # Let's make a version of z that requires grad for the energy gradient part.
+                    # z_for_grad = z.detach().clone().requires_grad_(True)
+                    # l_for_grad = torch.matmul(z_for_grad, linear_modes.T) # Recompute l with grad tracking
+
+                    # y = self.model(z_for_grad) # Pass grad-tracking z
+                    # u_total_batch = l_for_grad + y
+                    # # Ensure energy calculation tracks gradients w.r.t. u_total_batch
+                    # energies = self.energy_calculator(u_total_batch) # Assumes energy_calculator is differentiable
+                    # energy = torch.mean(energies)
+                    # # --- End Energy Calculation ---
+
+                    # # --- Standard Loss Components ---
+                    # # Use y computed with grad-tracking z here as well
+                    # ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2) # constraint_dir is from non-grad z
+                    # origin = torch.sum(y[rest_idx]**2)
+                    # bc_penalty = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+                    # if self.boundary_dofs_th is not None and len(self.boundary_dofs_th) > 0:
+                    #     fixed_displacements = u_total_batch[:, self.boundary_dofs_th]
+                    #     log_cosh_penalty = torch.log(torch.cosh(fixed_displacements))
+                    #     bc_penalty = torch.mean(log_cosh_penalty)
+
+                    # # --- Energy-based Monotonicity Penalty ---
+                    # monotonicity_penalty = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+                    # mono_weight = 1e2 # TUNABLE WEIGHT
+
+                    # # Exclude the rest shape (z=0)
+                    # valid_indices = torch.arange(batch_size, device=self.device) #!= rest_idx
+                    # z_valid_no_grad = z[valid_indices] # Use original z for JVP
+                    # l_valid_no_grad = l[valid_indices] # Use original l
+
+                    # if z_valid_no_grad.shape[0] > 0:
+                    #     # 1. Compute JVP: J(z) * z
+                    #     def single_model_forward(latent_vec):
+                    #         # Ensure model uses non-grad-tracking input for JVP
+                    #         return self.model(latent_vec.detach())
+                    #     compute_jvp_batch = vmap(lambda zi: jvp(single_model_forward, (zi,), (zi,))[1])
+                    #     jvp_results = compute_jvp_batch(z_valid_no_grad) # Shape: (batch_size-1, output_dim)
+
+                    #     # 2. Compute v = l + J(z)*z
+                    #     v = l_valid_no_grad + jvp_results
+
+                    #     # 3. Compute Energy Gradient: ∇_u E(u(z))
+                    #     # We need the gradient of the *sum* of energies w.r.t u_total_batch
+                    #     # to get per-sample gradients correctly scaled.
+                    #     # Use retain_graph=True if energies or u_total_batch are needed later in loss
+                    #     grad_E_all = torch.autograd.grad(torch.sum(energies), u_total_batch, retain_graph=True, create_graph=True)[0]
+                    #     grad_E_valid = grad_E_all[valid_indices] # Select gradients for valid indices
+
+                    #     # 4. Compute Dot Product: ∇_u E ⋅ v
+                    #     dot_products = torch.sum(grad_E_valid * v, dim=1) # Shape: (batch_size-1,)
+
+                    #     # 5. Apply Penalty: relu(-dot_product)
+                    #     penalty_values = torch.relu(-dot_products)
+                    #     monotonicity_penalty = torch.mean(penalty_values)
 
 
                     # Calculate maximum displacements
@@ -866,17 +871,25 @@ class Routine:
                     # Compute orthogonality constraint (using the same approach as reference)
                     ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
                     
-                    # Compute origin constraint for rest shape
+                    # # Compute origin constraint for rest shape
                     origin = torch.sum(y[rest_idx]**2)
+
+                    # origin = energies[rest_idx]  # Use energy for rest shape as origin constraint
 
                     bc_penalty = torch.tensor(0.0, device=self.device, dtype=torch.float64) # Initialize as tensor
                     if self.boundary_dofs_th is not None and len(self.boundary_dofs_th) > 0:
-                        # Get the total displacement at the fixed DOFs for the entire batch
-                        # u_total_batch shape: (batch_size, num_dofs)
-                        # self.boundary_dofs_th shape: (num_fixed_dofs,)
                         fixed_displacements = u_total_batch[:, self.boundary_dofs_th] # Shape: (batch_size, num_fixed_dofs)
-                        # Calculate the squared L2 norm of displacements at fixed DOFs, averaged over batch
-                        bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
+
+                        # --- Option 1: Log-Cosh Loss ---
+                        # Calculate log(cosh(error)) for each element, then average
+                        log_cosh_penalty = torch.log(torch.cosh(fixed_displacements))
+                        bc_penalty = torch.mean(log_cosh_penalty) # Average over all fixed DOFs and batch
+                        # --- End Option 1 ---
+
+                        # --- Option 2: L2 Loss (Current Method) ---
+                        # bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
+                        # --- End Option 2 ---
+
               
 
 
@@ -904,7 +917,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e5 * ortho + 1e5 *  origin + 1e2 * bc_penalty 
+                    loss = -improvement_loss+1 + 1e2 * ortho +  1e1 * bc_penalty  #+ 1e4 *  origin
 
                     # --- NaN Safeguard ---
                     if torch.isnan(loss) or torch.isinf(loss):
@@ -936,7 +949,7 @@ class Routine:
                         # Energy metrics section
                         print(f"│ ENERGY METRICS:")
                         print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Linear Energy:':<20} {energy_linear.item():<12.6f}")
-                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item()*100:.2f}% │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
+                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item()*100:.2f}% │ {'Monotonicity:':<20} {energy_scaling.item():<12.6f}")
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
@@ -954,11 +967,11 @@ class Routine:
                         # print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
                         # print(f"│ {'Div(P) Loss:':<20} {log_scaled_div_p.item():<12.6f} │ {'Raw Div(P) L2:':<20} {raw_div_p_L2_mean.item():<12.6e}")
 
-                        # Add volume metrics section
-                        print(f"│ VOLUME PRESERVATION:")
-                        print(f"│ {'Linear Volume Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Volume Ratio:':<20} {avg_neural_ratio:<12.6f}")
-                        print(f"│ {'Linear Volume Change:':<20} {(avg_linear_ratio-1)*100:<12.4f}% │ {'Neural Volume Change:':<20} {(avg_neural_ratio-1)*100:<12.4f}%")
-                        print(f"│ {'Volume Penalty:':<20} {vol_penalty.item():<12.6f}")
+                        # # Add volume metrics section
+                        # print(f"│ VOLUME PRESERVATION:")
+                        # print(f"│ {'Linear Volume Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Volume Ratio:':<20} {avg_neural_ratio:<12.6f}")
+                        # print(f"│ {'Linear Volume Change:':<20} {(avg_linear_ratio-1)*100:<12.4f}% │ {'Neural Volume Change:':<20} {(avg_neural_ratio-1)*100:<12.4f}%")
+                        # print(f"│ {'Volume Penalty:':<20} {vol_penalty.item():<12.6f}")
         
                         
                         # Final loss value
@@ -977,7 +990,6 @@ class Routine:
                 # Perform optimization step
                 optimizer.step(closure)
 
-                scheduler.step(loss_val)  
 
                 # Choose a random latent vector from the batch
                 random_idx = np.random.randint(1, batch_size)
@@ -1025,7 +1037,7 @@ class Routine:
             patience += 1
             
             # Early stopping criterion (optional)
-            if patience > 30: #loss_val < 1e-8 or 
+            if patience > 200: #loss_val < 1e-8 or 
                 print(f"Converged to target loss at iteration {iteration}")
                 break
         
