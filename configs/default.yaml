@@ -12,11 +12,11 @@ material:
 
 # Physics simulation parameters
 physics:
-  gravity: [0, -9.8, 0]  # Format as array for proper SOFA integration
+  gravity: [0, 0, 0]  # Format as array for proper SOFA integration
   dt: 0.01
   rayleigh_stiffness: 0.1
   rayleigh_mass: 0.1
-  solver_iterations: 1000
+  solver_iterations: 5000
   solver_tolerance: 1e-10
   solver_threshold: 1e-10
 

@@ -6,6 +6,7 @@ from Sofa import SofaDeformable
 from time import process_time, time
 import datetime
 from sklearn.preprocessing import MinMaxScaler
+from training.train_sofa import Routine
 # add network path to the python path
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '../network'))
@@ -33,7 +34,10 @@ class AnimationStepController(Sofa.Core.Controller):
         self.surface_topo = kwargs.get('surface_topo')
         self.MO1 = kwargs.get('MO1')
         self.fixed_box = kwargs.get('fixed_box')
-     
+        self.exactSolution = kwargs.get('exactSolution')
+        self.cff = kwargs.get('cff')
+
+
         self.key = kwargs.get('key')
         self.iteration = kwargs.get("sample")
         self.start_time = 0
@@ -95,321 +99,28 @@ class AnimationStepController(Sofa.Core.Controller):
 
 
     def onAnimateBeginEvent(self, event):
+        self.MO1.position.value = self.MO1.rest_position.value
+        if np.linalg.norm(self.MO1.position.value) - np.linalg.norm(self.MO1.rest_position.value) < 1e-5:
+            print("Corrected position")
         self.start_time = process_time()
+        # Generate random points on a unit sphere
+        x, y, z = np.random.randn(3)
+        norm = np.sqrt(x**2 + y**2 + z**2)
+        x, y, z = x / norm, y / norm, z / norm
+        # Scale the random vector by the total mass
+        self.externalForce = np.array([x, y, z]) * np.random.uniform(0, 10) 
 
+        if hasattr(self.exactSolution, 'force'):
+            self.exactSolution.removeObject(self.cff)
+        self.cff = self.exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=self.externalForce, showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
+        self.cff.init()
     
     def onAnimateEndEvent(self, event):
-        
-        
-        # Compute matrices and eigenmodes on the first step
-        if self.current_mode_index == -1:
-            self.computeMatricesAndModes()
-            self.current_mode_index = 0
-            self.mode_animation_step = 0
-            return
-            
-
-        
-        # Display the current mode if modes were computed successfully
-        if self.show_modes and self.modes_computed and self.eigenvectors is not None:
-            self.displayMode(self.current_mode_index)
-            self.current_mode_index = (self.current_mode_index + 1) % self.num_modes_to_show
-            self.mode_animation_step += 1
         
         self.end_time = process_time()
             
     
-    def computeMatricesAndModes(self):
-        """Compute mass and stiffness matrices, then solve for eigenmodes"""
-        print("Computing mass and stiffness matrices...")
-        self.mass_matrix = self.mass.assembleMMatrix()
-        self.stiffness_matrix = self.fem.assembleKMatrix()
-        
-        print(f"Mass matrix shape: {self.mass_matrix.shape}")
-        print(f"Stiffness matrix shape: {self.stiffness_matrix.shape}")
-        
-        # Get fixed DOFs from BoxROI
-        fixed_indices = self.fixed_box.indices.value
-        print(f"Number of fixed points: {len(fixed_indices)}")
-        
-        # Convert point indices to DOF indices (each point has 3 DOFs - x, y, z)
-        fixed_dofs = []
-        for idx in fixed_indices:
-            fixed_dofs.extend([3*idx, 3*idx+1, 3*idx+2])  # x, y, z components
-        
-        fixed_dofs = np.array(fixed_dofs)
-        print(f"Number of fixed DOFs: {len(fixed_dofs)}")
-        
-        # Convert matrices to CSR format for efficient modification
-        if not isinstance(self.stiffness_matrix, sparse.csr_matrix):
-            stiff_matrix = sparse.csr_matrix(self.stiffness_matrix)
-        else:
-            stiff_matrix = self.stiffness_matrix
-            
-        if not isinstance(self.mass_matrix, sparse.csr_matrix):
-            mass_matrix = sparse.csr_matrix(self.mass_matrix)
-        else:
-            mass_matrix = self.mass_matrix
-        
-        # Get size of the system
-        n = stiff_matrix.shape[0]
-
-        
-        
-        # Convert to LIL format first for efficient modification
-        stiff_matrix = stiff_matrix.tolil()
-        mass_matrix = mass_matrix.tolil()
-
-        # Apply constraints
-        for dof in fixed_dofs:
-            stiff_matrix[dof, :] = 0
-            stiff_matrix[:, dof] = 0
-            stiff_matrix[dof, dof] = 1.0
-            
-            mass_matrix[dof, :] = 0
-            mass_matrix[:, dof] = 0
-            # No need to set mass diagonal
-
-        fixed_dofs = np.array(fixed_dofs)
-        print(f"Number of fixed DOFs: {len(fixed_dofs)}")
-
-
-        # Convert back to CSR for efficient computation
-        stiff_matrix = stiff_matrix.tocsr()
-        mass_matrix = mass_matrix.tocsr()
-        stiff_matrix = -stiff_matrix  # Negate the stiffness matrix
-        self.stiffness_matrix = stiff_matrix
-        self.mass_matrix = mass_matrix
-        
-        print("Boundary conditions applied to matrices")
-
-        # Create directory for matrices and mesh data
-        matrices_dir = 'matrices'
-        os.makedirs(matrices_dir, exist_ok=True)
-        output_subdir = os.path.join(matrices_dir, self.timestamp)
-        os.makedirs(output_subdir, exist_ok=True)
-
-
-        # --- Save Fixed DOFs ---
-        fixed_dofs_path = os.path.join(output_subdir, f'fixed_dofs_{self.timestamp}.npy')
-        try:
-            np.save(fixed_dofs_path, fixed_dofs)
-            print(f"Fixed DOFs saved to {fixed_dofs_path}")
-            fixed_dofs_saved = True
-        except Exception as e:
-            print(f"Error saving fixed DOFs: {e}")
-            fixed_dofs_saved = False
-
-        # --- Save Matrices ---
-        # Use scipy.sparse.save_npz for sparse matrices
-        try:
-            sparse.save_npz(os.path.join(output_subdir, f'mass_matrix_{self.timestamp}.npz'), self.mass_matrix)
-            sparse.save_npz(os.path.join(output_subdir, f'stiffness_matrix_{self.timestamp}.npz'), self.stiffness_matrix)
-            print("Sparse matrices saved in .npz format.")
-        except Exception as e:
-            print(f"Error saving sparse matrices: {e}. Trying numpy save...")
-            # Fallback to numpy save if sparse fails (might lose sparsity)
-            np.save(os.path.join(output_subdir, f'mass_matrix_{self.timestamp}.npy'), self.mass_matrix)
-            np.save(os.path.join(output_subdir, f'stiffness_matrix_{self.timestamp}.npy'), self.stiffness_matrix)
-
-        # --- Save Mesh Data ---
-        try:
-            coordinates = self.MO1.rest_position.value
-            # Assuming topology container is named 'triangleTopo' and holds tetrahedra
-            # Adjust 'triangleTopo' if your topology container has a different name
-            # Adjust '.tetrahedra' if it holds different element types (e.g., .hexahedra)
-            elements = self.surface_topo.tetrahedra.value
-
-            np.save(os.path.join(output_subdir, f'coordinates_{self.timestamp}.npy'), coordinates)
-            np.save(os.path.join(output_subdir, f'elements_{self.timestamp}.npy'), elements)
-            print(f"Mesh data saved: Coordinates shape {coordinates.shape}, Elements shape {elements.shape}")
-            mesh_saved = True
-        except AttributeError as e:
-             print(f"Error accessing mesh data (check component names 'MO1', 'surface_topo', '.tetrahedra'): {e}")
-             mesh_saved = False
-        except Exception as e:
-             print(f"An unexpected error occurred while saving mesh data: {e}")
-             mesh_saved = False
-
-
-        # --- Save Metadata ---
-        metadata = {
-            'timestamp': self.timestamp,
-            'mesh_file_source': self.mesh_filename, # Original source mesh
-            'young_modulus': self.young_modulus,
-            'poisson_ratio': self.poisson_ratio,
-            'density': self.density,
-            'num_dofs': self.mass_matrix.shape[0],
-            'matrix_format': 'npz' if 'sparse' in locals() and 'save_npz' in sparse.__dict__ else 'npy',
-            'coordinates_file': f'coordinates_{self.timestamp}.npy' if mesh_saved else None,
-            'elements_file': f'elements_{self.timestamp}.npy' if mesh_saved else None,
-            'fixed_dofs_file': f'fixed_dofs_{self.timestamp}.npy' if fixed_dofs_saved else None, 
-            'eigenvalues_file': f'eigenvalues_{self.timestamp}.npy',
-            'eigenvectors_file': f'eigenvectors_{self.timestamp}.npy',
-            'frequencies_file': f'frequencies_{self.timestamp}.npy'
-        }
-
-        metadata_path = os.path.join(output_subdir, f'metadata_{self.timestamp}.json')
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-        print(f"Matrices, mesh data, and metadata saved to {output_subdir}")
-
-        
-        # Now compute eigenmodes directly
-        print(f"Computing {self.num_modes_to_show} eigenmodes using SLEPc...")
-        try:
-            # Convert sparse matrices to PETSc format
-            from petsc4py import PETSc
-            from slepc4py import SLEPc
-            
-            # Convert to CSR format first if needed
-            if not isinstance(self.stiffness_matrix, sparse.csr_matrix):
-                K_csr = self.stiffness_matrix.tocsr()
-                M_csr = self.mass_matrix.tocsr() 
-            else:
-                K_csr = self.stiffness_matrix
-                M_csr = self.mass_matrix
-            
-            # Create PETSc matrices
-            n = K_csr.shape[0]
-            K_petsc = PETSc.Mat().createAIJ(size=(n, n), 
-                                        csr=(K_csr.indptr, K_csr.indices, K_csr.data))
-            M_petsc = PETSc.Mat().createAIJ(size=(n, n), 
-                                        csr=(M_csr.indptr, M_csr.indices, M_csr.data))
-            K_petsc.assemble()
-            M_petsc.assemble()
-            
-            # Set up SLEPc eigensolver
-            eigensolver = SLEPc.EPS().create()
-            eigensolver.setOperators(K_petsc, M_petsc)
-            eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-            eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-            eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-            eigensolver.setTarget(0.0)
-
-            st = eigensolver.getST()
-            st.setType(SLEPc.ST.Type.SINVERT)
-            st.setShift(0.0)
-                        
-            # Set dimensions and solve
-            eigensolver.setDimensions(nev=self.num_modes_to_show)
-            eigensolver.setFromOptions()
-            
-            print("Solving eigenvalue problem...")
-            eigensolver.solve()
-            
-            # Get number of converged eigenvalues
-            nconv = eigensolver.getConverged()
-            print(f"Number of converged eigenvalues: {nconv}")
-            
-            if nconv > 0:
-                # Extract eigenvalues and eigenvectors
-                eigenvalues = []
-                eigenvectors = np.zeros((n, nconv))
-                
-                for i in range(min(nconv, self.num_modes_to_show)):
-                    eigenvalue = eigensolver.getEigenvalue(i).real
-                    eigenvalues.append(eigenvalue)
-                    
-                    # Extract eigenvector
-                    vr = K_petsc.createVecRight()
-                    eigensolver.getEigenvector(i, vr)
-                    eigenvectors[:, i] = vr.getArray()
-                    
-                # Convert to numpy arrays
-                self.eigenvalues = np.array(eigenvalues)
-                self.eigenvectors = eigenvectors
-                
-                # Sort eigenvalues (smallest first)
-                idx = self.eigenvalues.argsort()
-                self.eigenvalues = self.eigenvalues[idx]
-                self.eigenvectors = self.eigenvectors[:, idx]
-                
-                # Calculate natural frequencies
-                self.frequencies = np.sqrt(np.abs(self.eigenvalues)) / (2 * np.pi)
-
-                #save the eigenvalues and eigenvector as the matrices 
-                np.save(f'{matrices_dir}/{self.timestamp}/eigenvalues_{self.timestamp}.npy', self.eigenvalues)
-                np.save(f'{matrices_dir}/{self.timestamp}/eigenvectors_{self.timestamp}.npy', self.eigenvectors)
-                np.save(f'{matrices_dir}/{self.timestamp}/frequencies_{self.timestamp}.npy', self.frequencies)
-                
-                print("Eigenmode computation successful with SLEPc!")
-                for i in range(min(nconv, len(self.eigenvalues))):
-                    print(f"Mode {i+1}: λ = {self.eigenvalues[i]:.6e}, f = {self.frequencies[i]:.4f} Hz")
-                    
-                # [Rest of your code for saving eigenmodes]
-                self.modes_computed = True
-                
-            else:
-                print("No eigenvalues converged!")
-                self.modes_computed = False
-                
-        except Exception as e:
-            print(f"Error computing eigenmodes with SLEPc: {e}")
-            import traceback
-            traceback.print_exc()
-            self.modes_computed = False
-
-    def displayMode(self, mode_index):
-        """Directly display an eigenmode with proper scaling"""
-        if not self.modes_computed or self.eigenvectors is None:
-            print("No modes computed yet")
-            return
-        
-        # Get number of nodes in the mesh
-        num_nodes = self.MO1.rest_position.shape[0]
-        
-        # Safety check
-        if mode_index >= self.eigenvectors.shape[1]:
-            mode_index = 0
-        
-        # Get the current eigenmode
-        current_mode = self.eigenvectors[:, mode_index]
-        
-        # Reshape the mode for easier processing
-        mode_reshaped = current_mode.reshape(-1, 3)
-        
-        # Calculate model characteristic size (diagonal of bounding box)
-        bbox_min = np.min(self.MO1.rest_position.value, axis=0)
-        bbox_max = np.max(self.MO1.rest_position.value, axis=0)
-        model_size = np.linalg.norm(bbox_max - bbox_min)
-        
-        # Normalize the mode by its maximum displacement
-        max_displacement = np.max(np.linalg.norm(mode_reshaped, axis=1))
-        if max_displacement > 1e-10:  # Avoid division by zero
-            normalized_mode = current_mode / max_displacement
-        else:
-            normalized_mode = current_mode
-        
-        # Calculate proper scaling factor (10% of model size)
-        scale_factor = 0.1 * model_size
-        
-        # Apply the scaling
-        displacement = scale_factor * normalized_mode
-        
-        # Reshape and apply the displacement
-        if len(displacement) == 3 * num_nodes:
-            displacement_reshaped = displacement.reshape(num_nodes, 3)
-        else:
-            print(f"Warning: Mode shape ({len(displacement)}) doesn't match expected size ({3 * num_nodes}).")
-            if len(displacement) > 3 * num_nodes:
-                displacement_reshaped = displacement[:3 * num_nodes].reshape(num_nodes, 3)
-            else:
-                padded = np.zeros(3 * num_nodes)
-                padded[:len(displacement)] = displacement
-                displacement_reshaped = padded.reshape(num_nodes, 3)
-        
-        # Update the mechanical object positions
-        with self.MO1.position.writeable() as pos:
-            pos[:] = self.MO1.rest_position + displacement_reshaped
-        
-        # Print mode information
-        print(f"Displaying mode {mode_index + 1}/{self.eigenvectors.shape[1]}")
-        print(f"Eigenvalue: {self.eigenvalues[mode_index]:.6e}, Frequency: {self.frequencies[mode_index]:.4f} Hz")
-        print(f"Scale factor: {scale_factor:.4f} (based on model size: {model_size:.4f})")
-            
-        
+    
     
 
     def close(self):
@@ -440,6 +151,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     rootNode.dt = config['physics'].get('dt', 0.01)
     rootNode.gravity = config['physics'].get('gravity', [0, 0, 0])
     rootNode.name = 'root'
+    rootNode.bbox = "-10 -2 -2 10 2 2"
 
     # Add required plugins
     required_plugins = [
@@ -499,9 +211,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     rayleighStiffness = config['physics'].get('rayleigh_stiffness', 0.1)
     rayleighMass = config['physics'].get('rayleigh_mass', 0.1)
     
-    solver = exactSolution.addObject('EulerImplicitSolver', name="ODEsolver", 
-                                   rayleighStiffness=rayleighStiffness, 
-                                   rayleighMass=rayleighMass)
+    solver = exactSolution.addObject('StaticSolver', name="ODEsolver", 
+                                   newton_iterations=20,
+                                   printLog=True)
     
     linear_solver = exactSolution.addObject('CGLinearSolver', 
                                           template="CompressedRowSparseMatrixMat3x3d",
@@ -514,7 +226,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                 name="FEM", 
                                 materialName="NeoHookean", 
                                 ParameterSet=mu_lam_str)
-                            
+    # fem = exactSolution.addObject('TetrahedronFEMForceField', name="FEM", youngModulus=5000, poissonRatio=0.4, method="large", updateStiffnessMatrix="false")
+
     
     # Get constraint box from config
     fixed_box_coords = config['constraints'].get('fixed_box', [-0.01, -0.01, -0.02, 1.01, 0.01, 0.02])
@@ -522,8 +235,17 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       name='ROI',
                                       box=" ".join(str(x) for x in fixed_box_coords), 
                                       drawBoxes=True)
-    
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
+
+    force_box_coords = config['constraints'].get('force_box', [9.99, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box = exactSolution.addObject('BoxROI',
+                                        name='ForceROI',
+                                        box=" ".join(str(x) for x in force_box_coords), 
+                                        drawBoxes=True)
+    cff = exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
+
+    
+
     
     # Add visual model
     visual = exactSolution.addChild("visual")
@@ -533,7 +255,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
 
 
     # Create and add controller with all components
-    controller = AnimationStepController(rootNode, 
+    controller = AnimationStepController(rootNode,
+                                         exactSolution=exactSolution, 
                                        mass=mass, 
                                        fem=fem,
                                        linear_solver=linear_solver,
@@ -550,6 +273,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                        total_mass=total_mass,
                                        mesh_filename=mesh_filename,
                                        num_modes_to_show=num_modes_to_show,
+                                       cff=cff,
                                        **kwargs)
     rootNode.addObject(controller)
 
@@ -621,7 +345,8 @@ if __name__ == "__main__":
     if args.gui:
         Sofa.Gui.GUIManager.Init("myscene", "qglviewer")
         Sofa.Gui.GUIManager.createGUI(root, __file__)
-        Sofa.Gui.GUIManager.SetDimension(800, 600)
+        Sofa.Gui.GUIManager.SetDimension(1000, 800)
+        
         Sofa.Gui.GUIManager.MainLoop(root)
         Sofa.Gui.GUIManager.closeGUI()
     else:
