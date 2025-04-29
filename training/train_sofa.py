@@ -1,3 +1,8 @@
+
+
+
+
+
 import argparse
 import os, sys, logging
 import numpy as np
@@ -11,7 +16,7 @@ import traceback
 from scipy import sparse
 
 # --- Import the renamed solver class ---
-from tests.solver import SOFANeoHookeanModel # Use the new class name
+from tests.solver import SOFANeoHookeanModel 
 
 # In train.py - add these imports
 import glob
@@ -19,6 +24,8 @@ import json
 import datetime
 import matplotlib.pyplot as plt
 import pyvista # Keep pyvista for visualization
+import seaborn as sns          # Add seaborn
+
 
 # Add after imports
 from slepc4py import SLEPc
@@ -123,27 +130,30 @@ class ResidualNet(torch.nn.Module):
         self.output_dim = output_dim
         self.activation = activation
         
-        # Input projection layer (latent → hidden)
-        self.input_proj = torch.nn.Linear(latent_dim, hid_dim)
-        
+        # Input projection layer (latent → hidden), no bias
+        self.input_proj = torch.nn.Linear(latent_dim, hid_dim, bias=False)
+
         # Residual blocks
         self.res_blocks = torch.nn.ModuleList()
         for _ in range(hid_layers):
+            # Linear layers within blocks also have no bias
+            # LayerNorm layers also have no learnable affine parameters (weight and bias)
             block = torch.nn.Sequential(
-                torch.nn.Linear(hid_dim, hid_dim),
-                torch.nn.LayerNorm(hid_dim),
-                torch.nn.Linear(hid_dim, hid_dim),
-                torch.nn.LayerNorm(hid_dim)
+            torch.nn.Linear(hid_dim, hid_dim, bias=False),
+            torch.nn.LayerNorm(hid_dim, elementwise_affine=False), # No learnable scale/shift
+            torch.nn.Linear(hid_dim, hid_dim, bias=False),
+            torch.nn.LayerNorm(hid_dim, elementwise_affine=False)  # No learnable scale/shift
             )
             self.res_blocks.append(block)
-        
-        # Output projection (hidden → output)
-        self.output_proj = torch.nn.Linear(hid_dim, output_dim)
+
+        # Output projection (hidden → output), no bias
+        self.output_proj = torch.nn.Linear(hid_dim, output_dim, bias=False)
 
         # Initialize weights
-        # self._init_weights(zero_init_output)
-        #zero last layer weights
+        # self._init_weights(zero_init_output) # Keep this commented if you want zero init below
+        # Zero last layer weights (as in original selection)
         torch.nn.init.zeros_(self.output_proj.weight)
+        # Note: Biases are handled by bias=False in Linear and elementwise_affine=False in LayerNorm.
 
     def _init_weights(self, zero_init_output):
         """Initialize network weights properly for stable training and zero mapping."""
@@ -769,7 +779,7 @@ class Routine:
                     energy = torch.mean(energies)  # Average energy across batch
              
 
-                    volume_sample_indices = [0, min(5, batch_size-1), rest_idx]  # Rest shape + a couple samples
+                    volume_sample_indices = [0, min(10, batch_size-1), rest_idx]  # Rest shape + a couple samples
                     volume_results = []
                     for idx in volume_sample_indices:
                         vol_result = self.energy_calculator.compute_volume_comparison(
@@ -787,11 +797,11 @@ class Routine:
 
 
                     # Calculate maximum displacements
-                    mean_linear = torch.mean(torch.norm(l.reshape(batch_size, -1, 3), dim=2)).item()
-                    mean_total = torch.mean(torch.norm(u_total_batch.reshape(batch_size, -1, 3), dim=2)).item()
-                    mean_correction = torch.mean(torch.norm(y.reshape(batch_size, -1, 3), dim=2)).item()
+                    # mean_linear = torch.mean(torch.norm(l.reshape(batch_size, -1, 3), dim=2)).item()
+                    # mean_total = torch.mean(torch.norm(u_total_batch.reshape(batch_size, -1, 3), dim=2)).item()
+                    # mean_correction = torch.mean(torch.norm(y.reshape(batch_size, -1, 3), dim=2)).item()
 
-                    nonlinear_ratio = mean_correction / mean_total
+                    # nonlinear_ratio = mean_correction / mean_total
                     
                     # Compute orthogonality constraint (using the same approach as reference)
                     ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
@@ -826,7 +836,7 @@ class Routine:
 
                                 
                     # Get the raw div(P) tensor
-                    raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
+                    # raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
 
 
@@ -869,7 +879,7 @@ class Routine:
                         # print(f"│ {'Mean Correction:':<20} {mean_correction:<12.6f} │ {'Nonlinear Ratio:':<20} {nonlinear_ratio*100:.2f}%")
                         
                         # Divergence metrics section
-                        div_p_means = torch.mean(raw_div_p, dim=0).mean(dim=0)
+                        # div_p_means = torch.mean(raw_div_p, dim=0).mean(dim=0)
                         # print(f"│ DIVERGENCE METRICS:")
                         # print(f"│ {'Direction:':<20} {'X':<17} {'Y':<17} {'Z':<17}")
                         # print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
@@ -917,7 +927,7 @@ class Routine:
             self.writer.add_scalar('train/origin', origin_val, iteration)
             
             # Save checkpoint if this is the best model so far
-            if loss_val < best_loss or loss_val < 10:
+            if loss_val < best_loss:
                 best_loss = loss_val
                 checkpoint = {
                     'epoch': iteration,
@@ -944,10 +954,10 @@ class Routine:
             iteration += 1
             patience += 1
             
-            # Early stopping criterion (optional)
-            if patience > 30: #loss_val < 1e-8 or 
-                print(f"Converged to target loss at iteration {iteration}")
-                break
+            # # Early stopping criterion (optional)
+            # if patience > 30: #loss_val < 1e-8 or 
+            #     print(f"Converged to target loss at iteration {iteration}")
+            #     break
         
         # Restore original forward method
         self.model.forward = original_forward
@@ -1416,83 +1426,393 @@ class Routine:
         print("Visualization complete.")
         return plotter # Return plotter in case further customization is needed
 
+    def analyze_latent_correlations(self, delta=0.01, save_path=None):
+        """
+        Analyze correlations between latent dimensions based on the gradient of the
+        TOTAL displacement (linear + neural) at the origin.
+
+        Args:
+            delta: Small perturbation for finite difference approximation
+            save_path: Path to save visualization
+        """
+        print("Analyzing latent space correlations (based on total displacement)...")
+        self.model.eval() # Ensure model is in evaluation mode
+
+        # Get latent dimension and linear modes
+        latent_dim = self.latent_dim
+        # Ensure linear_modes are available and correctly sliced if needed
+        linear_modes = self.linear_modes[:, :latent_dim]
+
+        # Create base zero latent vector (origin)
+        z0 = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+
+        # Get base TOTAL output at origin
+        with torch.no_grad():
+            linear_output0 = torch.matmul(z0, linear_modes.T) # Should be zero
+            neural_output0 = self.model(z0).flatten()
+            total_output0 = linear_output0 + neural_output0 # Effectively neural_output0
+
+        # Initialize correlation matrix and norm vectors
+        corr_matrix = torch.zeros((latent_dim, latent_dim), device=self.device, dtype=torch.float64)
+        norm_squared = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+
+        # Store perturbed TOTAL outputs
+        perturbed_total_outputs = []
+        for i in range(latent_dim):
+            # Perturb the i-th dimension
+            zi = z0.clone()
+            zi[i] += delta
+
+            # Compute TOTAL output with perturbation
+            with torch.no_grad():
+                linear_output_i = torch.matmul(zi, linear_modes.T)
+                neural_output_i = self.model(zi).flatten()
+                total_output_i = linear_output_i + neural_output_i
+
+            # Store perturbed total output
+            perturbed_total_outputs.append(total_output_i)
+
+        # --- Calculate direction vectors based on TOTAL displacement ---
+        direction_vectors = []
+        for i in range(latent_dim):
+            # Direction vector for dimension i (gradient approximation of total displacement)
+            dir_i = (perturbed_total_outputs[i] - total_output0) / delta
+            direction_vectors.append(dir_i)
+            # Update squared norm
+            norm_squared[i] = torch.dot(dir_i, dir_i)
+
+        # Compute E = [e1|e2|...|en] matrix where each ei is a gradient direction of total displacement
+        # And compute correlation matrix ET E incrementally
+        unnormalized_corr_matrix = torch.zeros_like(corr_matrix) # Store unnormalized version
+        for i in range(latent_dim):
+            dir_i = direction_vectors[i]
+            for j in range(latent_dim):
+                dir_j = direction_vectors[j]
+                unnormalized_corr_matrix[i, j] = torch.dot(dir_i, dir_j)
+        # --- End of modification ---
+
+        # --- Add eigenvalue calculation and print statement here ---
+        try:
+            # Calculate eigenvalues of the unnormalized correlation matrix (E^T E)
+            # Use eigvalsh since the matrix is symmetric
+            eigenvalues_unnormalized = torch.linalg.eigvalsh(unnormalized_corr_matrix)
+            print(f"Eigenvalues of unnormalized correlation matrix (E^T E based on total displacement): {eigenvalues_unnormalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of unnormalized correlation matrix: {e}")
+
+        # Normalize to get correlations (-1 to 1 scale)
+        corr_matrix = unnormalized_corr_matrix.clone() # Start with unnormalized values
+        for i in range(latent_dim):
+            for j in range(latent_dim):
+                norm_i = torch.sqrt(norm_squared[i])
+                norm_j = torch.sqrt(norm_squared[j])
+                if norm_i > 1e-9 and norm_j > 1e-9:
+                    corr_matrix[i, j] /= (norm_i * norm_j)
+                else:
+                    corr_matrix[i, j] = 0.0 # Avoid division by zero
+
+        # --- Add eigenvalue calculation for normalized matrix ---
+        try:
+            # Calculate eigenvalues of the normalized correlation matrix
+            # Use eigvalsh since the matrix is symmetric
+            eigenvalues_normalized = torch.linalg.eigvalsh(corr_matrix)
+            print(f"Eigenvalues of normalized correlation matrix (based on total displacement): {eigenvalues_normalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of normalized correlation matrix: {e}")
+
+        # Visualize the correlation matrix
+        fig = self.visualize_correlation_matrix(corr_matrix, save_path, title_suffix="(Total Displacement)")
+
+        print("Latent correlation analysis (total displacement) complete.")
+        return corr_matrix, fig
+
+    def analyze_linear_mode_correlations(self, delta=1.0, save_path=None):
+        """
+        Analyze correlations between latent dimensions based ONLY on the linear modes.
+        This should ideally result in an identity matrix if linear modes are orthogonal.
+
+        Args:
+            delta: Perturbation value (set to 1.0 to directly use modes).
+            save_path: Path to save visualization
+        """
+        print("Analyzing latent space correlations (based on linear modes ONLY)...")
+
+        # Get latent dimension and linear modes
+        latent_dim = self.latent_dim
+        linear_modes = self.linear_modes[:, :latent_dim]
+
+        # Create base zero latent vector (origin)
+        z0 = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+
+        # Get base LINEAR output at origin (should be zero)
+        with torch.no_grad():
+            linear_output0 = torch.matmul(z0, linear_modes.T)
+
+        # Initialize correlation matrix and norm vectors
+        corr_matrix = torch.zeros((latent_dim, latent_dim), device=self.device, dtype=torch.float64)
+        norm_squared = torch.zeros(latent_dim, device=self.device, dtype=torch.float64)
+
+        # Store perturbed LINEAR outputs
+        perturbed_linear_outputs = []
+        for i in range(latent_dim):
+            # Perturb the i-th dimension
+            zi = z0.clone()
+            zi[i] += delta # Use delta=1 for direct mode extraction
+
+            # Compute LINEAR output with perturbation
+            with torch.no_grad():
+                linear_output_i = torch.matmul(zi, linear_modes.T)
+
+            # Store perturbed linear output
+            perturbed_linear_outputs.append(linear_output_i)
+
+        # --- Calculate direction vectors based on LINEAR displacement ---
+        # Note: With delta=1, dir_i is essentially the i-th linear mode vector
+        direction_vectors = []
+        for i in range(latent_dim):
+            # Direction vector for dimension i (gradient approximation of linear displacement)
+            # Equivalent to (linear_modes[:, i] * delta) / delta = linear_modes[:, i]
+            dir_i = (perturbed_linear_outputs[i] - linear_output0) / delta
+            direction_vectors.append(dir_i)
+            # Update squared norm
+            norm_squared[i] = torch.dot(dir_i, dir_i)
+
+        # Compute E = [e1|e2|...|en] matrix where each ei is a linear mode vector
+        # And compute correlation matrix ET E incrementally
+        unnormalized_corr_matrix = torch.zeros_like(corr_matrix) # Store unnormalized version
+        for i in range(latent_dim):
+            dir_i = direction_vectors[i]
+            for j in range(latent_dim):
+                dir_j = direction_vectors[j]
+                unnormalized_corr_matrix[i, j] = torch.dot(dir_i, dir_j)
+        # --- End of modification ---
+
+        # --- Add eigenvalue calculation and print statement here ---
+        try:
+            # Calculate eigenvalues of the unnormalized correlation matrix (E^T E)
+            eigenvalues_unnormalized = torch.linalg.eigvalsh(unnormalized_corr_matrix)
+            print(f"Eigenvalues of unnormalized correlation matrix (E^T E based on linear modes): {eigenvalues_unnormalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of unnormalized linear correlation matrix: {e}")
+
+        # Normalize to get correlations (-1 to 1 scale)
+        corr_matrix = unnormalized_corr_matrix.clone() # Start with unnormalized values
+        for i in range(latent_dim):
+            for j in range(latent_dim):
+                norm_i = torch.sqrt(norm_squared[i])
+                norm_j = torch.sqrt(norm_squared[j])
+                if norm_i > 1e-9 and norm_j > 1e-9:
+                    corr_matrix[i, j] /= (norm_i * norm_j)
+                else:
+                    corr_matrix[i, j] = 0.0 # Avoid division by zero
+
+        # --- Add eigenvalue calculation for normalized matrix ---
+        try:
+            # Calculate eigenvalues of the normalized correlation matrix
+            eigenvalues_normalized = torch.linalg.eigvalsh(corr_matrix)
+            print(f"Eigenvalues of normalized correlation matrix (based on linear modes): {eigenvalues_normalized.cpu().numpy()}")
+        except Exception as e:
+            print(f"Could not compute eigenvalues of normalized linear correlation matrix: {e}")
+
+        # Visualize the correlation matrix
+        fig = self.visualize_correlation_matrix(corr_matrix, save_path, title_suffix="(Linear Modes Only)")
+
+        print("Linear mode correlation analysis complete.")
+        return corr_matrix, fig
+
+    def visualize_correlation_matrix(self, corr_matrix, save_path=None, title_suffix=""):
+        """Visualize the correlation matrix between latent dimensions."""
+        # Convert to numpy for visualization
+        corr_np = corr_matrix.detach().cpu().numpy() # Use detach()
+
+        # Create figure
+        plt.figure(figsize=(10, 8))
+
+        # Use seaborn for nicer heatmap
+        mask = np.zeros_like(corr_np, dtype=bool)
+        #mask[np.triu_indices_from(mask)] = True  # Optional: show only lower triangle
+
+        # Plot correlation matrix
+        sns.heatmap(corr_np, mask=mask, cmap='RdBu_r', vmin=-1, vmax=1,
+                    square=True, linewidths=.5, annot=True, fmt='.2f',
+                    cbar_kws={"shrink": .8, "label": "Correlation"})
+
+        # Set labels
+        latent_dim = corr_np.shape[0]
+        plt.xticks(np.arange(latent_dim) + 0.5, [f'z{i}' for i in range(latent_dim)])
+        plt.yticks(np.arange(latent_dim) + 0.5, [f'z{i}' for i in range(latent_dim)], rotation=0)
+
+        # Add title
+        plt.title(f'Latent Space Correlation Matrix {title_suffix}', fontsize=14) # Added suffix
+        plt.tight_layout()
+
+        # Save if requested
+        if save_path:
+            # Modify save path slightly if needed to avoid overwriting
+            base, ext = os.path.splitext(save_path)
+            save_path_mod = save_path # Default
+            if "Linear" in title_suffix:
+                save_path_mod = f"{base}_linear{ext}"
+            else:
+                save_path_mod = f"{base}_total{ext}"
+
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(save_path_mod), exist_ok=True)
+
+            plt.savefig(save_path_mod, dpi=300, bbox_inches='tight')
+            print(f"Correlation matrix visualization saved to {save_path_mod}")
+
+        plt.show(block=False) # Use block=False to avoid stopping execution if run non-interactively
+        plt.pause(1) # Pause briefly to allow plot to render
+        return plt.gcf()
+
     
     
     
 
 def main():
     print("Starting main function...")
-    parser = argparse.ArgumentParser(description='Hybrid Simulation Training from SOFA Data')
-
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path')
-    parser.add_argument('--resume', action='store_true', help='resume from checkpoint')
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Hybrid Simulation SOFA')
+    parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path') # Default to sofa config
+    parser.add_argument('--resume', action='store_true', help='resume from best checkpoint')
     parser.add_argument('--skip-training', action='store_true', help='skip training and load best model')
     parser.add_argument('--checkpoint', type=str, default=None, help='specific checkpoint path to load')
+    parser.add_argument('--analyze', action='store_true', help='perform analysis (visualization, correlations) after training/loading')
+    parser.add_argument('--init-checkpoint', type=str, default=None, help='path to checkpoint to initialize model weights before training (does not load optimizer)')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    # Ensure log directory exists relative to checkpoint dir
-    checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
-    log_dir_cfg = cfg.get('training', {}).get('log_dir', 'logs')
-    log_dir_abs = os.path.join(checkpoint_dir, log_dir_cfg)
-    setup_logger(None, log_dir=log_dir_abs)
+    # Use checkpoint_dir from config for logs
+    log_dir_base = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
+    log_dir_specific = cfg.get('training', {}).get('log_dir', 'logs')
+    setup_logger('train', log_dir=os.path.join(log_dir_base, log_dir_specific)) # Pass logger name
     print("Arguments parsed and logger setup.")
 
+    # Check for skip_training in both command line and config
     skip_training = args.skip_training or cfg.get('training', {}).get('skip_training', False)
-    checkpoint_path = args.checkpoint # Use command line arg first
-    if checkpoint_path is None: # If not provided, check config
-         checkpoint_path = cfg.get('training', {}).get('checkpoint_path')
-    if checkpoint_path is None: # If still not provided, use default best_sofa.pt
-         checkpoint_path = os.path.join(checkpoint_dir, 'best_sofa.pt') # Use checkpoint_dir
+
+    # Determine checkpoint path
+    checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
+    best_checkpoint_filename = 'best_sofa.pt' # Specific name for SOFA training
+    default_checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint_filename)
+
+    # Use specific checkpoint if provided, otherwise default best, handle resume flag
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+        print(f"Using specified checkpoint: {checkpoint_path}")
+    elif args.resume:
+        checkpoint_path = default_checkpoint_path
+        print(f"Attempting to resume from default best checkpoint: {checkpoint_path}")
+    else:
+        checkpoint_path = default_checkpoint_path # Default to best even if not resuming explicitly
+        print(f"Default checkpoint path set to: {checkpoint_path}")
+
 
     print(f"Skip training: {skip_training}")
-    print(f"Checkpoint path: {checkpoint_path} (Exists: {os.path.exists(checkpoint_path)})")
+    print(f"Checkpoint path to load (if exists): {checkpoint_path}")
 
-    # --- Initialize Routine (now uses loaded data) ---
-    try:
-        engine = Routine(cfg)
-        print("Engine initialized.")
-    except Exception as e:
-        print(f"FATAL ERROR during Routine initialization: {e}")
-        print("Did you run the script sofa_linear_modes_viz.py?")
-        traceback.print_exc()
-        sys.exit(1)
-    # --- End Initialization ---
+    engine = Routine(cfg)
+    print("Engine initialized.")
 
-    # Training or loading logic (same as before)
+    # --- Handle Initial Checkpoint Loading (Model Weights Only) ---
+    initial_model_loaded = False
+    if args.init_checkpoint and not args.resume: # Only if --init-checkpoint is given AND we are NOT resuming
+        init_checkpoint_path = args.init_checkpoint
+        if os.path.exists(init_checkpoint_path):
+            try:
+                print(f"Initializing model weights from: {init_checkpoint_path}")
+                checkpoint = torch.load(init_checkpoint_path, map_location=engine.device)
+                if 'model_state_dict' in checkpoint:
+                    engine.model.load_state_dict(checkpoint['model_state_dict'])
+                    print(f"Successfully loaded model weights from epoch {checkpoint.get('epoch', 'N/A')}.")
+                    initial_model_loaded = True
+                else:
+                    print(f"Warning: Checkpoint {init_checkpoint_path} does not contain 'model_state_dict'.")
+            except Exception as e:
+                print(f"Error loading initial checkpoint {init_checkpoint_path}: {e}. Starting with fresh model.")
+        else:
+            print(f"Warning: Initial checkpoint path not found: {init_checkpoint_path}. Starting with fresh model.")
+    # --- End Initial Checkpoint Loading ---
+
+
+    # Training or loading logic
     if skip_training:
         print("Skipping training as requested...")
         if os.path.exists(checkpoint_path):
             print(f"Loading model from {checkpoint_path}")
             engine.load_checkpoint(checkpoint_path)
         else:
-            print(f"Warning: No checkpoint found at {checkpoint_path}, using untrained model.")
+            print(f"Warning: No checkpoint found at {checkpoint_path}, using untrained model")
     else:
+        # Resume or start fresh training
+        start_epoch = 0 # Default start epoch
+        if args.resume: # Resume loads model AND optimizer state
+             if initial_model_loaded:
+                 print("Warning: --init-checkpoint provided but --resume is active. --resume takes precedence for loading.")
+             if os.path.exists(checkpoint_path):
+                 print(f"Resuming training from {checkpoint_path} (loading model and optimizer)")
+                 # load_checkpoint should handle loading both model and optimizer
+                 engine.load_checkpoint(checkpoint_path)
+                 # Potentially extract start_epoch if load_checkpoint doesn't handle it
+                 # start_epoch = checkpoint['epoch'] + 1
+             else:
+                 print(f"Warning: --resume requested but checkpoint {checkpoint_path} not found. Starting fresh.")
+                 if initial_model_loaded:
+                      print("Using model weights initialized from --init-checkpoint.")
+                 # else: starting completely fresh
+
+        elif not initial_model_loaded: # Neither resume nor init-checkpoint used
+             print("Starting training from scratch.")
+        # If initial_model_loaded is True and not resuming, we just proceed with the loaded weights
+
         num_epochs = cfg['training']['num_epochs']
-        print(f"Starting training for {num_epochs} epochs...")
-        best_loss = engine.train(num_epochs)
+        print(f"Starting training for {num_epochs} epochs (from epoch {start_epoch})...")
+        # Modify train call if you implement epoch tracking
+        best_loss = engine.train(num_epochs=num_epochs) # Pass start_epoch if needed
         print("Training complete.")
-        best_checkpoint_path = os.path.join(checkpoint_dir, 'best_sofa.pt') # Use checkpoint_dir
-        if os.path.exists(best_checkpoint_path):
-            print("Loading best model for evaluation...")
-            engine.load_checkpoint(best_checkpoint_path)
+
+        # Load the best model after training finishes before analysis
+        if os.path.exists(default_checkpoint_path):
+            print("Loading best model for analysis...")
+            engine.load_checkpoint(default_checkpoint_path)
         else:
-            print("No best model checkpoint found, using final model.")
+            print("No best model checkpoint found after training, using final model state.")
 
-    # --- Evaluation / Visualization (same as before, but uses updated methods) ---
-    latent_dim = engine.latent_dim
-    print(f"Latent dimension: {latent_dim}")
+    # --- Perform Analysis if requested ---
+    if args.analyze:
+        print("\n--- Starting Post-Training Analysis ---")
+        latent_dim = engine.latent_dim
+        print(f"Latent dimension: {latent_dim}")
 
-    print("\nVisualizing latent space dimensions...")
-    engine.visualize_latent_dimensions(dim1=0, dim2=1, num_points=5) # Example pair
-    if latent_dim > 2:
-         engine.visualize_latent_dimensions(dim1=1, dim2=2, num_points=5) # Another pair if possible
+        # Ensure checkpoint directory exists for saving plots
+        analysis_save_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
+        os.makedirs(analysis_save_dir, exist_ok=True)
 
-    print("\nVisualizing latent space modes...")
-    engine.visualize_latent_space(num_samples=5)
+        # Add latent space visualization (optional, can be time-consuming)
+        # print("\nVisualizing latent space dimensions...")
+        # engine.visualize_latent_dimensions(dim1=1, dim2=0, num_points=3)
+        # engine.visualize_latent_dimensions(dim1=3, dim2=4, num_points=3)
+        # print("\nVisualizing latent space modes...")
+        # engine.visualize_latent_space(num_samples=5)
+
+        print("\nAnalyzing latent space correlations (TOTAL displacement)...")
+        correlation_matrix_path_total = os.path.join(analysis_save_dir, 'latent_correlations_total.png')
+        corr_matrix_total, _ = engine.analyze_latent_correlations(delta=0.001, save_path=correlation_matrix_path_total) # Smaller delta might be needed
+
+        print("\nAnalyzing latent space correlations (LINEAR modes only)...")
+        correlation_matrix_path_linear = os.path.join(analysis_save_dir, 'latent_correlations_linear.png')
+        corr_matrix_linear, _ = engine.analyze_linear_mode_correlations(delta=1.0, save_path=correlation_matrix_path_linear)
+
+        # Plotting training metrics might require loading tensorboard data, skipping for now
+        # print("\nPlotting training metrics...")
+        # metrics_plot_path = os.path.join(analysis_save_dir, 'training_metrics.png')
+        # engine.plot_training_metrics(save_path=metrics_plot_path)
+
+        print("--- Analysis Complete ---")
+    # --- End Analysis Block ---
 
     print("Main function complete.")
-
 
 def load_config(config_file):
     import yaml
