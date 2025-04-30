@@ -37,10 +37,12 @@ class AnimationStepController(Sofa.Core.Controller):
         self.MO1 = kwargs.get('MO1')
         self.fixed_box = kwargs.get('fixed_box')
         self.exactSolution = kwargs.get('exactSolution')
-        self.cff = kwargs.get('cff')
 
+        # Add a placeholder for the force field created/removed each step
+        self.current_torsion_ff = None
 
         self.key = kwargs.get('key')
+
         self.iteration = kwargs.get("sample")
         self.start_time = 0
         self.root = node
@@ -53,13 +55,12 @@ class AnimationStepController(Sofa.Core.Controller):
         self.real_energies = []
         self.predicted_energies = []
         self.linear_energies = []
-        # --- End energy lists ---
 
-        self.num_substeps = kwargs.get('num_substeps', 1) # Get from createScene
-        self.total_external_force_for_step = np.zeros(3) # Target force for the main step
-        self.current_substep = 0 # Counter for substeps within a main step
-        self.current_main_step = 0 # Counter for main steps (optional, mainly for headless)
-        self.max_main_steps = kwargs.get('max_main_steps', 20) # Max steps for headless mode
+        self.num_substeps = kwargs.get('num_substeps', 1)
+        self.total_twist_magnitude_for_step = 0.0 # Target magnitude for the main step
+        self.current_substep = 0
+        self.current_main_step = 0
+        self.max_main_steps = kwargs.get('max_main_steps', 20)
 
 
         
@@ -167,76 +168,69 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateBeginEvent(self, event):
         """
         Called by SOFA's animation loop before each physics step.
-        Manages substep force application.
+        Manages substep torsion application by removing/adding TorsionForceField.
         """
         # --- Check if starting a new MAIN step ---
         if self.current_substep == 0:
-            # Reset position to rest state only at the beginning of a main step
             self.MO1.position.value = self.MO1.rest_position.value
-            # if np.linalg.norm(self.MO1.position.value - self.MO1.rest_position.value) < 1e-5:
-            #     print(f"Main Step {self.current_main_step + 1}: Position reset.")
+            max_twist_magnitude = 50.0 # Adjust as needed (Torque units)
+            self.total_twist_magnitude_for_step = max_twist_magnitude * (self.current_main_step + 1) / self.max_main_steps
+            print(f"Main Step {self.current_main_step + 1}: Target Twist Torque = {self.total_twist_magnitude_for_step:.2f}")
 
-            # Generate and store the TOTAL target force for this new main step
-            x, y, z = np.random.randn(3)
-            norm = np.sqrt(x**2 + y**2 + z**2)
-            if norm < 1e-9: x, y, z = 0, 1, 0
-            else: x, y, z = x / norm, y / norm, z / norm
-            force_magnitude = 25
-            self.total_external_force_for_step = np.array([-1, 0, 0]) * force_magnitude
-            print(f"Main Step {self.current_main_step + 1}: Target force = {self.total_external_force_for_step}")
+        # --- Calculate incremental torque for the CURRENT substep ---
+        incremental_torque = self.total_twist_magnitude_for_step * (self.current_substep + 1) / self.num_substeps
 
-        # --- Calculate and apply force for the CURRENT substep ---
-        # Force ramps from F/N to F
-        incremental_force = self.total_external_force_for_step * (self.current_substep + 1) / self.num_substeps
-
-        # Apply the incremental force using the existing cff object
-        # --- Remove existing CFF if it exists ---
-        if hasattr(self, 'cff') and self.cff is not None:
+        # --- Remove existing TorsionForceField if it exists ---
+        if self.current_torsion_ff is not None:
             try:
-                # Check if the object is still valid and part of the node
-                
-                self.exactSolution.removeObject(self.cff)
-                self.cff = None # Clear the reference regardless
+                # Check if parent node still exists and contains the object
+                if self.exactSolution and self.current_torsion_ff in self.exactSolution.objects:
+                     self.exactSolution.removeObject(self.current_torsion_ff)
+                # else:
+                #      print(f"Warning: TorsionFF parent node invalid or object already removed.")
             except Exception as e:
-                print(f"Warning: Error removing CFF: {e}")
-                self.cff = None # Ensure reference is cleared
+                print(f"Warning: Error removing TorsionFF: {e}")
+            self.current_torsion_ff = None # Clear reference regardless
+        # --- End Remove ---
 
-        # --- Create and add a new CFF ---
+        # --- Create and add a new TorsionForceField ---
         try:
-            # Ensure the ForceROI component exists and is accessible
-            # We assume ForceROI is named 'ForceROI' within exactSolution
-            force_roi = self.exactSolution.getObject('ForceROI')
-            if force_roi is None:
-                raise ValueError("ForceROI object not found in exactSolution node.")
+            # Define axis and origin (could be stored in self if constant)
+            torsion_axis_val = [1.0, 0.0, 0.0]
+            # Assuming beam_end_x is accessible or stored (e.g., from config)
+            # If not, you might need to retrieve it or hardcode it here
+            beam_end_x = 10.0 # Example value, ensure this is correct
+            torsion_origin_val = [beam_end_x, 0.0, 0.0]
 
-            # Create the new CFF object
-            # Using a potentially unique name per step might help debugging but could clutter the scene graph
-            self.cff = self.exactSolution.addObject('ConstantForceField',
-                               name="CFF",
-                               indices="@ForceROI.indices", # Reference indices via link path
-                               totalForce=incremental_force, # Set force
-                               showArrowSize=0.1,
-                               showColor="0.2 0.2 0.8 1")
+            # Ensure the TorsionROI component exists (it should, added in createScene)
+            torsion_roi = self.exactSolution.getObject('TorsionROI')
+            if torsion_roi is None:
+                raise ValueError("TorsionROI object not found in exactSolution node.")
 
-            # --- CRITICAL: Initialize the parent node to register the new component ---
-            # This step is necessary for SOFA to recognize the newly added object
-            # within the current simulation step. Be aware this can have performance
-            # implications and might reset some internal states of the node.
+            # Create the new TorsionForceField object
+            self.current_torsion_ff = self.exactSolution.addObject(
+                'TorsionForceField',
+                name="TorsionFF_Step", # Use a potentially unique name if helpful
+                indices="@TorsionROI.indices", # Reference indices via link path
+                axis=torsion_axis_val,
+                origin=torsion_origin_val,
+                torque=incremental_torque # Set the calculated torque
+            )
+
+            # --- CRITICAL: Initialize the parent node AFTER adding the new object ---
             # print(f"  Substep {self.current_substep + 1}: Initializing exactSolution node.")
-            self.cff.init()
+            self.exactSolution.init() # Initialize the node containing the new TorsionFF
             # --- End Initialization ---
 
-            print(f"  Substep {self.current_substep + 1}/{self.num_substeps}: Applied force = {incremental_force}.")
+            print(f"  Substep {self.current_substep + 1}/{self.num_substeps}: Applied Torsion Torque = {incremental_torque:.2f}")
 
         except Exception as e:
-            print(f"ERROR: Failed to create/add/init ConstantForceField: {e}")
+            print(f"ERROR: Failed to create/add/init TorsionForceField: {e}")
             traceback.print_exc()
-            self.cff = None # Ensure cff is None if creation failed
-            # Stop simulation on error
-            if self.root: self.root.animate = False
+            self.current_torsion_ff = None # Ensure reference is None if creation failed
+            if self.root: self.root.animate = False # Stop simulation
 
-        # --- DO NOT call computeSimulationStep here - DefaultAnimationLoop handles it ---
-        self.start_time = process_time() # Track time for analysis if needed
+        self.start_time = process_time()
     
     def onAnimateEndEvent(self, event):
         """
@@ -586,86 +580,84 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     rayleighStiffness = config['physics'].get('rayleigh_stiffness', 0.1)
     rayleighMass = config['physics'].get('rayleigh_mass', 0.1)
     
-    solver = exactSolution.addObject('StaticSolver', name="ODEsolver", 
+    solver = exactSolution.addObject('StaticSolver', name="ODEsolver",
                                    newton_iterations=20,
                                    printLog=True)
-    
-    linear_solver = exactSolution.addObject('CGLinearSolver', 
+
+    linear_solver = exactSolution.addObject('CGLinearSolver',
                                           template="CompressedRowSparseMatrixMat3x3d",
-                                          iterations=config['physics'].get('solver_iterations', 1000), 
-                                          tolerance=config['physics'].get('solver_tolerance', 1e-6), 
-                                          threshold=config['physics'].get('solver_threshold', 1e-6), 
+                                          iterations=config['physics'].get('solver_iterations', 1000),
+                                          tolerance=config['physics'].get('solver_tolerance', 1e-6),
+                                          threshold=config['physics'].get('solver_threshold', 1e-6),
                                           warmStart=True)
-    
+
     fem = exactSolution.addObject('TetrahedronHyperelasticityFEMForceField',
-                                name="FEM", 
-                                materialName="NeoHookean", 
+                                name="FEM",
+                                materialName="NeoHookean",
                                 ParameterSet=mu_lam_str)
-    # fem = exactSolution.addObject('TetrahedronFEMForceField', name="FEM", youngModulus=5000, poissonRatio=0.4, method="large", updateStiffnessMatrix="false")
 
-    # Add a second beam with linear elasticity to check the difference
-    
-    # Get constraint box from config
-    fixed_box_coords = config['constraints'].get('fixed_box', [-0.01, -0.01, -0.02, 1.01, 0.01, 0.02])
-    fixed_box = exactSolution.addObject('BoxROI', 
-                                      name='ROI',
-                                      box=" ".join(str(x) for x in fixed_box_coords), 
+    # --- Constraints ---
+    # Fixed end
+    fixed_box_coords = config['constraints'].get('fixed_box', [-0.01, -0.01, -0.02, 0.1, 1.01, 1.02]) # Adjusted x_max for fixed end
+    fixed_box = exactSolution.addObject('BoxROI',
+                                      name='FixedROI',
+                                      box=" ".join(str(x) for x in fixed_box_coords),
                                       drawBoxes=True)
-    exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
+    exactSolution.addObject('FixedConstraint', indices="@FixedROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box', [9.99, -0.01, -0.02, 10.1, 1.01, 1.02])
-    force_box = exactSolution.addObject('BoxROI',
-                                        name='ForceROI',
-                                        box=" ".join(str(x) for x in force_box_coords), 
-                                        drawBoxes=True)
-    cff = exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
+    # --- ROI for Torsion Application (End Face) ---
+    # Assuming beam end is at x=10, y=[-0.5, 0.5], z=[-0.5, 0.5] - ADJUST THESE
+    beam_end_x = 10.0
+    beam_half_y = 0.5
+    beam_half_z = 0.5
+    roi_thickness = 0.1 # Thickness of ROI in x-direction
 
-    
+    torsion_roi_coords = [beam_end_x - roi_thickness, -beam_half_y - 0.01, -beam_half_z - 0.01,
+                          beam_end_x + roi_thickness,  beam_half_y + 0.01,  beam_half_z + 0.01]
+    torsion_roi = exactSolution.addObject('BoxROI', name='TorsionROI', drawBoxes=True,
+                                          box=" ".join(map(str, torsion_roi_coords)))
 
-    
-    # Add visual model
+    # --- Torsion Force Field ---
+    torsion_axis_val = [1.0, 0.0, 0.0] # Twist around X-axis
+    torsion_origin_val = [beam_end_x, 0.0, 0.0] # Center of the end face
+
+    torsion_ff = exactSolution.addObject('TorsionForceField',
+                                         name='TorsionFF',
+                                         # 'object' link is implicit to parent's MechanicalObject
+                                         indices="@TorsionROI.indices", # Apply to nodes in the ROI
+                                         axis=torsion_axis_val,         
+                                         origin=torsion_origin_val,       
+                                         torque=0.0)                    
+    # --- End Torsion ---
+
+    # --- Visual Model ---
     visual = exactSolution.addChild("visual")
     visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
     visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
 
-    # #Add a second mechanical object for the neural network
-    # neural_node = rootNode.addChild('NeuralNetwork', activated=True)
-    # neural_node.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
-    # neural_node.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
-    # neural_node.addObject('MechanicalObject', name='DOFs', template='Vec3d', src='@grid')
-    # neural_node.addObject('BarycentricMapping', input='@../DOFs', output='@./')
-
-    # #Add visual model
-    # visual_neural = neural_node.addChild("visual")
-    # visual_neural.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
-    # visual_neural.addObject('BarycentricMapping', input='@../DOFs', output='@./')
-
-
+    # --- Controller Setup ---
     num_substeps = config['physics'].get('num_substeps', 1)
-    max_main_steps = config['simulation'].get('steps', 20) # Get max steps from config if available
+    max_main_steps = config['simulation'].get('steps', 20)
 
-
-
-    # Create and add controller with all components
     controller = AnimationStepController(rootNode,
-                                         exactSolution=exactSolution, 
-                                       fem=fem,
-                                       linear_solver=linear_solver,
-                                       surface_topo=surface_topo,
-                                       MO1=MO1, 
-                                       fixed_box=fixed_box,
-                                       directory=directory, 
-                                       sample=sample,
-                                       key=key, 
-                                       young_modulus=young_modulus,
-                                       poisson_ratio=poisson_ratio,
-                                       density=density,
-                                       volume=volume,
-                                       total_mass=total_mass,
-                                       mesh_filename=mesh_filename,
-                                       num_modes_to_show=num_modes_to_show,
-                                       cff=cff,
-                                       **kwargs)
+                                         exactSolution=exactSolution,
+                                         fem=fem,
+                                         linear_solver=linear_solver,
+                                         surface_topo=surface_topo,
+                                         MO1=MO1,
+                                         fixed_box=fixed_box,
+                                         torsion_ff=torsion_ff, # Pass the TorsionForceField
+                                         directory=directory,
+                                         sample=sample,
+                                         key=key,
+                                         young_modulus=young_modulus,
+                                         poisson_ratio=poisson_ratio,
+                                         density=density,
+                                         volume=volume,
+                                         total_mass=total_mass,
+                                         mesh_filename=mesh_filename,
+                                         num_modes_to_show=num_modes_to_show,
+                                         **kwargs)
     rootNode.addObject(controller)
 
     return rootNode, controller

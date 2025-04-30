@@ -19,10 +19,10 @@ physics:
   solver_iterations: 50000
   solver_tolerance: 1e-6
   solver_threshold: 1e-6
-  num_substeps: 10 # Added for substep logic
+  num_substeps: 50 # Added for substep logic
 
 simulation:
-  steps: 25 # Default number of main steps
+  steps: 50 # Default number of main steps
 
 # Constraint parameters
 constraints:
@@ -37,7 +37,7 @@ model:
 
 # Training parameters
 training:
-  num_epochs: 500
+  num_epochs: 100
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"

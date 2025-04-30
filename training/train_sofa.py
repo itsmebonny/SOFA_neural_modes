@@ -719,7 +719,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 0.01
-                deformation_scale_final = 30
+                deformation_scale_final = 20
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
 
@@ -1630,7 +1630,6 @@ class Routine:
 
         # Use seaborn for nicer heatmap
         mask = np.zeros_like(corr_np, dtype=bool)
-        #mask[np.triu_indices_from(mask)] = True  # Optional: show only lower triangle
 
         # Plot correlation matrix
         sns.heatmap(corr_np, mask=mask, cmap='RdBu_r', vmin=-1, vmax=1,
