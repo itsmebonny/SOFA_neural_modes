@@ -702,6 +702,8 @@ class Routine:
         )
         patience = 0
         # Main training loop
+        example_eigenvalue_scale = self.compute_eigenvalue_based_scale()
+        print(f"Example eigenvalue scale: {example_eigenvalue_scale}")
 
         # Add this near the beginning of the train method, after initializing variables:
         if not hasattr(self, 'viz_plotter'):
@@ -718,24 +720,27 @@ class Routine:
             with torch.no_grad():
                 
                 # Generate latent vectors 
-                deformation_scale_init = 0.01
-                deformation_scale_final = 20
+                deformation_scale_init = 1
+                deformation_scale_final = 5
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) # * (iteration/num_epochs) #linear scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
                 mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
+                mode_scales[4] = mode_scales[0]
+                mode_scales[5] = mode_scales[1]
+                
                 mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
+                z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
 
                 #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
-                #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
+                z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                z[rest_idx, :] = 0  # Set rest shape latent to zero
+                # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -747,7 +752,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -824,7 +829,7 @@ class Routine:
 
                     # Scale energy by maximum linear displacement to get comparable units
                     max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
-                    energies_scaling = energies / (max_linear_disp + 1e-8)  # Add epsilon to avoid division by zero
+                    energies_scaling = torch.sigmoid(energy/1e10) * 1e10
 
                     energy_scaling = torch.mean(energies_scaling)  # Average energy across batch
 
@@ -844,7 +849,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e5 * ortho + 1e5 *  origin + 1e5 * bc_penalty 
+                    loss = energy + 1e6 * ortho + 1e5 * bc_penalty 
 
 
                     loss.backward()
@@ -871,7 +876,7 @@ class Routine:
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
-                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f} │ {'Origin Constraint:':<20} {origin.item():<12.6f} │ {'BC Penalty:':<20} {bc_penalty.item():<12.6f}")
+                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f}  │ {'BC Penalty:':<20} {bc_penalty.item():<12.6f}")
                         
                         # # Displacement metrics section
                         # print(f"│ DISPLACEMENT METRICS:")

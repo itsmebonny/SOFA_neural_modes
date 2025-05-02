@@ -329,6 +329,12 @@ class AnimationStepController(Sofa.Core.Controller):
                 # Calculate natural frequencies
                 self.frequencies = np.sqrt(np.abs(self.eigenvalues)) / (2 * np.pi)
 
+                print("Checking eigenvector norms before saving:")
+                for i in range(min(5, self.eigenvectors.shape[1])):
+                    mode_norm = np.linalg.norm(self.eigenvectors[:, i])
+                    print(f"  Norm of Mode {i}: {mode_norm:.4e}")
+
+
                 #save the eigenvalues and eigenvector as the matrices 
                 np.save(f'{matrices_dir}/{self.timestamp}/eigenvalues_{self.timestamp}.npy', self.eigenvalues)
                 np.save(f'{matrices_dir}/{self.timestamp}/eigenvectors_{self.timestamp}.npy', self.eigenvectors)
