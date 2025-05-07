@@ -1658,3 +1658,421 @@ class SOFANeoHookeanModel(torch.nn.Module):
 
 
 
+class SOFAStVenantKirchhoffModel(torch.nn.Module):
+    """
+    PyTorch-based St. Venant-Kirchhoff (StVK) energy model using precomputed mesh data.
+
+    Implements the StVK formulation:
+    W = 0.5 * λ * (tr(E))² + μ * tr(E²)
+    where E = 0.5 * (FᵀF - I) is the Green-Lagrange strain tensor.
+    """
+
+    def __init__(self, coordinates_np, elements_np, degree, E, nu, precompute_matrices=True, device=None, dtype=torch.float64):
+        """
+        Initialize with mesh data from NumPy arrays.
+
+        Args:
+            coordinates_np: NumPy array of node coordinates [num_nodes, dim]
+            elements_np: NumPy array of element connectivity [num_elements, nodes_per_element]
+            degree: FEM degree (used for quadrature rules)
+            E: Young's modulus
+            nu: Poisson's ratio
+            precompute_matrices: Whether to precompute FEM matrices (highly recommended)
+            device: Computation device (e.g., 'cpu', 'cuda:0')
+            dtype: Data type for computation (e.g., torch.float32, torch.float64)
+        """
+        super(SOFAStVenantKirchhoffModel, self).__init__()
+
+        # Set device and precision
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.dtype = dtype
+        print(f"SOFAStVenantKirchhoffModel: Using device: {self.device}, dtype: {self.dtype}")
+
+        # Material properties (Lamé parameters)
+        self.E = torch.tensor(E, dtype=self.dtype, device=self.device)
+        self.nu = torch.tensor(nu, dtype=self.dtype, device=self.device)
+        if torch.abs(1.0 - 2.0 * self.nu) < 1e-9 or torch.abs(1.0 + self.nu) < 1e-9:
+             print("Warning: nu is close to 0.5 or -1. Adjusting Lamé parameters calculation.")
+             # Use safe nu to avoid division by zero
+             safe_nu = torch.clamp(self.nu, min=-0.99999, max=0.49999)
+             self.lmbda = self.E * safe_nu / ((1 + safe_nu) * (1 - 2 * safe_nu))
+             self.mu = self.E / (2 * (1 + safe_nu))
+        else:
+             self.lmbda = self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu)) # First Lamé parameter
+             self.mu = self.E / (2 * (1 + self.nu))  # Shear modulus (Second Lamé parameter)
+        print(f"Material Properties: E={self.E.item():.2f}, nu={self.nu.item():.2f}, mu={self.mu.item():.2f}, lambda={self.lmbda.item():.2f}")
+
+        # Store degree
+        self.degree = degree
+
+        # --- Load mesh data from arrays ---
+        self.coordinates = torch.tensor(coordinates_np, device=self.device, dtype=self.dtype)
+        self.elements = torch.tensor(elements_np, device=self.device, dtype=torch.long)
+
+        self.num_nodes = self.coordinates.shape[0]
+        self.dim = self.coordinates.shape[1]
+        self.num_elements = self.elements.shape[0]
+        self.nodes_per_element = self.elements.shape[1] # Infer from loaded data
+
+        if self.dim != 3:
+            print(f"Warning: Expected 3D coordinates, but got {self.dim}D.")
+
+        print(f"Mesh info loaded: {self.num_nodes} nodes, {self.num_elements} elements")
+        print(f"Nodes per element: {self.nodes_per_element} (degree={self.degree})")
+        # --- End mesh data loading ---
+
+        # Create element data structure (calls _generate_quadrature and _precompute_derivatives)
+        self._setup_elements(precompute_matrices)
+
+        # Save configuration parameters
+        self.precompute_matrices = precompute_matrices
+
+        # Small value for stability if needed (less critical for StVK than log(J))
+        self.eps = torch.tensor(1e-10, dtype=self.dtype, device=self.device)
+
+
+    def _setup_elements(self, precompute=True):
+        """Setup element data and potentially precompute matrices"""
+        self._generate_quadrature() # Depends on self.nodes_per_element
+
+        if precompute:
+            print("Precomputing element shape function derivatives...")
+            self._precompute_derivatives()
+            self.precomputed = True
+            print("Precomputation finished.")
+        else:
+            print("Derivatives will be computed on-the-fly (less efficient).")
+            self.precomputed = False
+            # Initialize placeholders if needed later, or handle errors
+            self.dN_dx_all = None
+            self.detJ_all = None
+
+    def _generate_quadrature(self):
+        """Generate quadrature rules based ONLY on nodes_per_element."""
+        # --- This function is identical to the one in SOFANeoHookeanModel ---
+        # --- Copy the implementation from SOFANeoHookeanModel._generate_quadrature ---
+        if self.nodes_per_element == 4:  # Linear Tetrahedron
+            # 4-point rule
+            self.quadrature_points = torch.tensor([
+                [0.58541020, 0.13819660, 0.13819660],
+                [0.13819660, 0.58541020, 0.13819660],
+                [0.13819660, 0.13819660, 0.58541020],
+                [0.13819660, 0.13819660, 0.13819660]
+            ], dtype=self.dtype, device=self.device)
+            self.quadrature_weights = torch.tensor([0.25, 0.25, 0.25, 0.25],
+                                                  dtype=self.dtype,
+                                                  device=self.device) / 6.0
+            print(f"Using 4-point quadrature for {self.nodes_per_element}-node elements.")
+        elif self.nodes_per_element == 8: # Linear Hexahedron
+            # 2x2x2 Gaussian quadrature
+            gp = 1.0 / torch.sqrt(torch.tensor(3.0, device=self.device, dtype=self.dtype))
+            self.quadrature_points = torch.tensor([
+                [-gp, -gp, -gp], [ gp, -gp, -gp], [ gp,  gp, -gp], [-gp,  gp, -gp],
+                [-gp, -gp,  gp], [ gp, -gp,  gp], [ gp,  gp,  gp], [-gp,  gp,  gp]
+            ], dtype=self.dtype, device=self.device)
+            self.quadrature_weights = torch.ones(8, dtype=self.dtype, device=self.device)
+            print(f"Using 8-point (2x2x2 Gauss) quadrature for {self.nodes_per_element}-node elements.")
+        elif self.nodes_per_element == 10: # Quadratic Tetrahedron
+             print(f"Warning: Using placeholder 5-point quadrature for {self.nodes_per_element}-node Tet. Verify accuracy.")
+             a = 0.108103018168070
+             b = 0.445948490915965
+             self.quadrature_points = torch.tensor([
+                 [0.25, 0.25, 0.25], [a, a, a], [b, a, a], [a, b, a], [a, a, b]
+             ], dtype=self.dtype, device=self.device)
+             w0 = -0.8 / 6.0; w1 = 0.325 / 6.0
+             self.quadrature_weights = torch.tensor([w0, w1, w1, w1, w1], dtype=self.dtype, device=self.device) * 4.0
+        else:
+            raise NotImplementedError(f"Quadrature rule not implemented for {self.nodes_per_element}-node elements.")
+        self.num_quad_points = len(self.quadrature_points)
+
+
+    def _precompute_derivatives(self):
+        """Precompute shape function derivatives w.r.t. physical coords (dN/dx)
+           and Jacobian determinants (detJ) for all elements and quadrature points."""
+        # --- This function is identical to the one in SOFANeoHookeanModel ---
+        # --- Copy the implementation from SOFANeoHookeanModel._precompute_derivatives ---
+        num_qp = self.num_quad_points
+        self.dN_dx_all = torch.zeros((self.num_elements, num_qp, self.nodes_per_element, self.dim),
+                                    dtype=self.dtype, device=self.device)
+        self.detJ_all = torch.zeros((self.num_elements, num_qp),
+                                   dtype=self.dtype, device=self.device)
+        for e_idx in range(self.num_elements):
+            element_node_indices = self.elements[e_idx]
+            element_coords = self.coordinates[element_node_indices]
+            for q_idx, qp in enumerate(self.quadrature_points):
+                dN_dxi = self._shape_function_derivatives_ref(qp)
+                J = torch.einsum('ni,nj->ij', element_coords, dN_dxi)
+                try:
+                    detJ = torch.linalg.det(J)
+                    invJ = torch.linalg.inv(J)
+                except torch.linalg.LinAlgError as err:
+                     print(f"Error computing inv/det(J) for element {e_idx} at QP {q_idx}: {err}")
+                     detJ = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+                     invJ = torch.zeros_like(J) # Assign zero inverse to avoid NaN
+                if detJ <= 0:
+                     print(f"Warning: Non-positive Jacobian determinant ({detJ.item():.4e}) for element {e_idx} at QP {q_idx}. Check mesh quality.")
+                     # Optionally clamp detJ to self.eps if needed downstream, but keep original for volume
+                dN_dx = torch.einsum('nj,jk->nk', dN_dxi, invJ)
+                self.dN_dx_all[e_idx, q_idx] = dN_dx
+                self.detJ_all[e_idx, q_idx] = detJ
+
+
+    def _shape_function_derivatives_ref(self, qp_ref):
+        """Compute shape function derivatives w.r.t. reference coordinates (ξ, η, ζ)
+           at a given reference quadrature point qp_ref."""
+        # --- This function is identical to the one in SOFANeoHookeanModel ---
+        # --- Copy the implementation from SOFANeoHookeanModel._shape_function_derivatives_ref ---
+        if self.nodes_per_element == 4: # Linear Tetrahedron
+             dN_dxi = torch.tensor([
+                 [-1.0, -1.0, -1.0], [ 1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0], [ 0.0,  0.0,  1.0]
+             ], dtype=self.dtype, device=self.device)
+        elif self.nodes_per_element == 8: # Linear Hexahedron
+            xi, eta, zeta = qp_ref[0], qp_ref[1], qp_ref[2]
+            one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
+            xim, xip, etam, etap, zetam, zetap = one-xi, one+xi, one-eta, one+eta, one-zeta, one+zeta
+            dN_dxi = torch.zeros((8, 3), dtype=self.dtype, device=self.device)
+            eighth = 0.125
+            dN_dxi[0, 0] = -eighth * etam * zetam; dN_dxi[1, 0] =  eighth * etam * zetam; dN_dxi[2, 0] =  eighth * etap * zetam; dN_dxi[3, 0] = -eighth * etap * zetam
+            dN_dxi[4, 0] = -eighth * etam * zetap; dN_dxi[5, 0] =  eighth * etam * zetap; dN_dxi[6, 0] =  eighth * etap * zetap; dN_dxi[7, 0] = -eighth * etap * zetap
+            dN_dxi[0, 1] = -eighth * xim * zetam; dN_dxi[1, 1] = -eighth * xip * zetam; dN_dxi[2, 1] =  eighth * xip * zetam; dN_dxi[3, 1] =  eighth * xim * zetam
+            dN_dxi[4, 1] = -eighth * xim * zetap; dN_dxi[5, 1] = -eighth * xip * zetap; dN_dxi[6, 1] =  eighth * xip * zetap; dN_dxi[7, 1] =  eighth * xim * zetap
+            dN_dxi[0, 2] = -eighth * xim * etam; dN_dxi[1, 2] = -eighth * xip * etam; dN_dxi[2, 2] = -eighth * xip * etap; dN_dxi[3, 2] = -eighth * xim * etap
+            dN_dxi[4, 2] =  eighth * xim * etam; dN_dxi[5, 2] =  eighth * xip * etam; dN_dxi[6, 2] =  eighth * xip * etap; dN_dxi[7, 2] =  eighth * xim * etap
+        else:
+            raise NotImplementedError(f"Shape function derivatives not implemented for {self.nodes_per_element}-node elements.")
+        return dN_dxi
+
+
+    def forward(self, u_tensor):
+        """PyTorch forward method - computes total energy."""
+        return self.compute_energy(u_tensor)
+
+    def compute_energy(self, displacement_batch):
+        """Compute total elastic energy for displacement field(s)."""
+        if not self.precomputed:
+             raise RuntimeError("Energy computation requires precomputed matrices.")
+
+        is_batch = displacement_batch.dim() > 1
+        if not is_batch:
+            displacement_batch = displacement_batch.unsqueeze(0)
+        batch_size = displacement_batch.shape[0]
+        u_reshaped = displacement_batch.view(batch_size, self.num_nodes, self.dim)
+
+        total_energy = torch.zeros(batch_size, dtype=self.dtype, device=self.device)
+        for b in range(batch_size):
+            u_sample = u_reshaped[b]
+            element_disps = u_sample[self.elements]
+            energy_sample = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+
+            for q_idx in range(self.num_quad_points):
+                dN_dx_q = self.dN_dx_all[:, q_idx, :, :]
+                detJ_q = self.detJ_all[:, q_idx]
+                qw_q = self.quadrature_weights[q_idx]
+
+                grad_u = torch.einsum('enj,enk->ejk', element_disps, dN_dx_q)
+                I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(self.num_elements, -1, -1)
+                F = I + grad_u
+
+                # Compute StVK energy density
+                energy_density_q = self._compute_stvk_energy_density(F) # [num_elements]
+
+                # Add weighted contribution: dEnergy = W * detJ_ref * quad_weight
+                energy_sample += torch.sum(energy_density_q * detJ_q * qw_q)
+
+            total_energy[b] = energy_sample
+
+        if not is_batch:
+            total_energy = total_energy.squeeze(0)
+        return total_energy
+
+
+    def _compute_stvk_energy_density(self, F):
+        """
+        Compute St. Venant-Kirchhoff (StVK) strain energy density.
+
+        Args:
+            F: Deformation gradient tensor [*, 3, 3]
+
+        Returns:
+            Energy density W [*]
+        """
+        if F.shape[-2:] != (3, 3):
+             raise ValueError(f"Input F must have shape [..., 3, 3], but got {F.shape}")
+
+        batch_dims = F.shape[:-2]
+        I = torch.eye(3, dtype=self.dtype, device=self.device).expand(*batch_dims, -1, -1)
+
+        # Right Cauchy-Green tensor C = FᵀF [*, 3, 3]
+        C = torch.einsum('...ji,...jk->...ik', F, F) # F.transpose(-1, -2) @ F
+
+        # Green-Lagrange strain tensor E = 0.5 * (C - I) [*, 3, 3]
+        E = 0.5 * (C - I)
+
+        # Trace of E: tr(E) [*]
+        # Use torch.diagonal and sum for batched trace
+        trE = torch.sum(torch.diagonal(E, dim1=-2, dim2=-1), dim=-1)
+
+        # Trace of E squared: tr(E²) = ∑_i,j (E_ij * E_ij) [*]
+        trE2 = torch.einsum('...ij,...ij->...', E, E)
+
+        # StVK energy density W = 0.5 * λ * (tr(E))² + μ * tr(E²) [*]
+        W = 0.5 * self.lmbda * (trE ** 2) + self.mu * trE2
+        return W
+
+    # --- Methods for Gradients and Stress ---
+
+    def compute_gradient(self, displacement_batch):
+        """
+        Compute internal forces (negative gradient of energy w.r.t. displacements).
+        Uses torch.autograd for automatic differentiation.
+        """
+        # --- This function is identical to the one in SOFANeoHookeanModel ---
+        # --- Copy the implementation from SOFANeoHookeanModel.compute_gradient ---
+        if not displacement_batch.requires_grad:
+            displacement_batch = displacement_batch.detach().clone().requires_grad_(True)
+        elif not torch.is_grad_enabled():
+             with torch.enable_grad():
+                 displacement_batch = displacement_batch.detach().clone().requires_grad_(True)
+                 energy = self.compute_energy(displacement_batch)
+                 grad = torch.autograd.grad(
+                     outputs=energy.sum(), inputs=displacement_batch,
+                     create_graph=torch.is_grad_enabled(), retain_graph=True
+                 )[0]
+             return grad
+        energy = self.compute_energy(displacement_batch)
+        grad = torch.autograd.grad(
+            outputs=energy.sum(), inputs=displacement_batch,
+            create_graph=torch.is_grad_enabled(), retain_graph=True
+        )[0]
+        return grad
+
+
+    def compute_div_p(self, displacement_batch):
+        """
+        Compute the divergence of the first Piola-Kirchhoff (PK1) stress tensor,
+        which corresponds to the internal forces (-dE/du).
+        """
+        # --- This function is identical to the one in SOFANeoHookeanModel ---
+        # --- Copy the implementation from SOFANeoHookeanModel.compute_div_p ---
+        is_batch = displacement_batch.dim() > 1
+        if not is_batch:
+            original_shape_was_flat = True
+            displacement_batch = displacement_batch.unsqueeze(0)
+        else:
+             original_shape_was_flat = False
+        batch_size = displacement_batch.shape[0]
+        if not displacement_batch.requires_grad:
+             u_for_grad = displacement_batch.detach().clone().requires_grad_(True)
+        else:
+             u_for_grad = displacement_batch
+        internal_forces_flat = self.compute_gradient(u_for_grad)
+        div_p = internal_forces_flat.view(batch_size, self.num_nodes, self.dim)
+        if original_shape_was_flat:
+            div_p = div_p.squeeze(0)
+        return div_p
+
+
+    def compute_PK1(self, displacement_batch):
+        """
+        Compute the First Piola-Kirchhoff (PK1) stress tensor P for StVK.
+        P = F @ S, where S = λ * tr(E) * I + 2 * μ * E
+        """
+        if not self.precomputed:
+             raise RuntimeError("PK1 computation requires precomputed matrices.")
+
+        is_batch = displacement_batch.dim() > 1
+        if not is_batch:
+            original_shape_was_flat = True
+            displacement_batch = displacement_batch.unsqueeze(0)
+        else:
+            original_shape_was_flat = False
+        batch_size = displacement_batch.shape[0]
+        u_reshaped = displacement_batch.view(batch_size, self.num_nodes, self.dim)
+
+        pk1 = torch.zeros((batch_size, self.num_elements, self.num_quad_points, self.dim, self.dim),
+                         dtype=self.dtype, device=self.device)
+
+        for b in range(batch_size):
+             u_sample = u_reshaped[b]
+             element_disps = u_sample[self.elements]
+             for q_idx in range(self.num_quad_points):
+                 dN_dx_q = self.dN_dx_all[:, q_idx, :, :]
+                 grad_u = torch.einsum('enj,enk->ejk', element_disps, dN_dx_q)
+                 I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(self.num_elements, -1, -1)
+                 F = I + grad_u
+
+                 # --- Calculate PK1 for StVK ---
+                 C = torch.einsum('...ji,...jk->...ik', F, F)
+                 E = 0.5 * (C - I)
+                 trE = torch.sum(torch.diagonal(E, dim1=-2, dim2=-1), dim=-1)
+                 trE_reshaped = trE.unsqueeze(-1).unsqueeze(-1)
+                 S = self.lmbda * trE_reshaped * I + 2.0 * self.mu * E
+                 P_q = torch.einsum('...ij,...jk->...ik', F, S) # F @ S
+                 # --- End PK1 Calculation ---
+
+                 pk1[b, :, q_idx, :, :] = P_q
+
+        if original_shape_was_flat:
+            pk1 = pk1.squeeze(0)
+        return pk1
+
+    # --- Volume Comparison Methods ---
+    # These can be copied directly from SOFANeoHookeanModel as they depend on
+    # geometry and the deformation gradient F, not the specific energy model.
+
+    def compute_volume_comparison(self, u_linear, u_total):
+        """Compare volumes between original, linear, and total displacements."""
+        # --- Copy implementation from SOFANeoHookeanModel.compute_volume_comparison ---
+        if u_linear.dim() > 1 and u_linear.shape[0] == 1: u_linear = u_linear.squeeze(0)
+        if u_total.dim() > 1 and u_total.shape[0] == 1: u_total = u_total.squeeze(0)
+        original_volume = self._compute_mesh_volume()
+        linear_volume = self._compute_deformed_volume(u_linear)
+        neural_volume = self._compute_deformed_volume(u_total)
+        vol_eps = 1e-12
+        linear_volume_ratio = linear_volume / (original_volume + vol_eps)
+        neural_volume_ratio = neural_volume / (original_volume + vol_eps)
+        linear_deviation = abs(linear_volume_ratio - 1.0)
+        neural_deviation = abs(neural_volume_ratio - 1.0)
+        if linear_deviation > self.eps: improvement_ratio = neural_deviation / linear_deviation
+        elif neural_deviation <= self.eps : improvement_ratio = 0.0
+        else: improvement_ratio = float('inf')
+        volume_info = {
+            'original_volume': original_volume.item() if isinstance(original_volume, torch.Tensor) else original_volume,
+            'linear_volume': linear_volume.item() if isinstance(linear_volume, torch.Tensor) else linear_volume,
+            'neural_volume': neural_volume.item() if isinstance(neural_volume, torch.Tensor) else neural_volume,
+            'linear_volume_ratio': linear_volume_ratio.item() if isinstance(linear_volume_ratio, torch.Tensor) else linear_volume_ratio,
+            'neural_volume_ratio': neural_volume_ratio.item() if isinstance(neural_volume_ratio, torch.Tensor) else neural_volume_ratio,
+            'volume_preservation_improvement_ratio': improvement_ratio
+        }
+        return volume_info
+
+    def _compute_mesh_volume(self):
+        """Calculate the total volume of the original undeformed mesh."""
+        # --- Copy implementation from SOFANeoHookeanModel._compute_mesh_volume ---
+        if not self.precomputed or self.detJ_all is None:
+             print("Warning: Precomputed detJ not available for volume calculation.")
+             return torch.tensor(float('nan'), device=self.device)
+        quad_weights_r = self.quadrature_weights.unsqueeze(0)
+        element_volumes = torch.sum(self.detJ_all * quad_weights_r, dim=1)
+        total_volume = torch.sum(element_volumes)
+        return torch.clamp(total_volume, min=0.0)
+
+    def _compute_deformed_volume(self, displacement):
+        """Calculate the total volume of the mesh after applying displacement."""
+        # --- Copy implementation from SOFANeoHookeanModel._compute_deformed_volume ---
+        if not self.precomputed: raise RuntimeError("Deformed volume requires precomputed matrices.")
+        if displacement.dim() == 1: u_sample = displacement.view(self.num_nodes, self.dim)
+        elif displacement.dim() == 2 and displacement.shape[0] == self.num_nodes: u_sample = displacement
+        else: raise ValueError(f"Invalid displacement shape: {displacement.shape}")
+        element_disps = u_sample[self.elements]
+        total_volume = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        for q_idx in range(self.num_quad_points):
+            dN_dx_q = self.dN_dx_all[:, q_idx, :, :]
+            detJ_ref_q = self.detJ_all[:, q_idx]
+            qw_q = self.quadrature_weights[q_idx]
+            grad_u = torch.einsum('enj,enk->ejk', element_disps, dN_dx_q)
+            I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(self.num_elements, -1, -1)
+            F = I + grad_u
+            J_deformed = torch.linalg.det(F)
+            total_volume += torch.sum(J_deformed * detJ_ref_q * qw_q)
+        return total_volume

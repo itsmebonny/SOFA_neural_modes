@@ -5,7 +5,6 @@ import os
 from Sofa import SofaDeformable
 from time import process_time, time
 import datetime
-from sklearn.preprocessing import MinMaxScaler
 # add network path to the python path
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '../network'))
@@ -17,8 +16,6 @@ import json
 import datetime
 import numpy as np
 
-import glob
-import traceback
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
 

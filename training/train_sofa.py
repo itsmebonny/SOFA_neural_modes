@@ -16,7 +16,7 @@ import traceback
 from scipy import sparse
 
 # --- Import the renamed solver class ---
-from tests.solver import SOFANeoHookeanModel 
+from tests.solver import SOFANeoHookeanModel, SOFAStVenantKirchhoffModel
 
 # In train.py - add these imports
 import glob
@@ -378,8 +378,8 @@ class Routine:
             zero_init_output=True
         ).to(device).double()
 
-        # After model creation, verify zero property
-        # self.model.verify_zero_property()
+        # # After model creation, verify zero property
+        # # self.model.verify_zero_property()
 
         # Load linear modes
         print(f"Linear modes shape: {self.linear_modes.shape}")
@@ -645,7 +645,7 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 64  # You can add this to config
+        batch_size = 8  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
         print_every = 1
         checkpoint_every = 50
@@ -684,8 +684,8 @@ class Routine:
         # Use LBFGS optimizer
         optimizer = torch.optim.LBFGS(self.model.parameters(), 
                                     lr=1,
-                                    max_iter=40,
-                                    max_eval=100,
+                                    max_iter=100,
+                                    max_eval=200,
                                     tolerance_grad=1e-05,
                                     tolerance_change=1e-07,
                                     history_size=100,
@@ -721,7 +721,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 5
+                deformation_scale_final = 15
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -733,14 +733,14 @@ class Routine:
                 mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
+                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
 
                 #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
-                z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
+                #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                # z[rest_idx, :] = 0  # Set rest shape latent to zero
+                z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -752,7 +752,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -829,15 +829,19 @@ class Routine:
 
                     # Scale energy by maximum linear displacement to get comparable units
                     max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
-                    energies_scaling = torch.sigmoid(energy/1e10) * 1e10
+                    energies_scaling = energies / max_linear_disp**2
 
-                    energy_scaling = torch.mean(energies_scaling)  # Average energy across batch
+                    energy_scaling = torch.log10(torch.mean(energies_scaling))  # Average energy across batch
 
                     # Add incentive for beneficial nonlinearity (energy improvement term)
                     u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
                     energy_linear = self.energy_calculator(u_linear_only).mean()
                     energy_improvement = (torch.relu(energy_linear - energy))/(energy_linear + 1e-8)  
                     improvement_loss = (energy_linear - energy) / (energy_linear + 1e-8)  
+
+
+                    scale_value = 0.00000000001
+                    energy_tanh = torch.tanh(scale_value * energy)
 
                                 
                     # Get the raw div(P) tensor
@@ -849,8 +853,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e6 * ortho + 1e5 * bc_penalty 
-
+                    loss = energy + 1e1 * ortho + 1e3 * bc_penalty + 1e3 * origin 
 
                     loss.backward()
 
@@ -872,11 +875,11 @@ class Routine:
                         # Energy metrics section
                         print(f"│ ENERGY METRICS:")
                         print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Linear Energy:':<20} {energy_linear.item():<12.6f}")
-                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item()*100:.2f}% │ {'Energy Loss:':<20} {energy_scaling.item():<12.6f}")
+                        print(f"│ {'Energy Improvement:':<20} {energy_improvement.item()*100:.2f}% │ {'Energy Loss:':<20} {energy_tanh.item():<12.6f}")
                         
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
-                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f}  │ {'BC Penalty:':<20} {bc_penalty.item():<12.6f}")
+                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f}  │ {'BC Penalty:':<20} {bc_penalty.item():<12.6f} │ {'Origin Penalty:':<20} {origin.item():<12.6f}")
                         
                         # # Displacement metrics section
                         # print(f"│ DISPLACEMENT METRICS:")
@@ -946,15 +949,15 @@ class Routine:
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
                 print(f"============================================")
             
-            # Save periodic checkpoint
-            if iteration % checkpoint_every == 0:
-                checkpoint = {
-                    'epoch': iteration,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': loss_val,
-                }
-                torch.save(checkpoint, os.path.join('checkpoints', f'model_it{iteration}.pt'))
+            # # Save periodic checkpoint
+            # if iteration % checkpoint_every == 0:
+            #     checkpoint = {
+            #         'epoch': iteration,
+            #         'model_state_dict': self.model.state_dict(),
+            #         'optimizer_state_dict': optimizer.state_dict(),
+            #         'loss': loss_val,
+            #     }
+            #     torch.save(checkpoint, os.path.join('checkpoints', f'model_it{iteration}.pt'))
             
             iteration += 1
             patience += 1
@@ -970,7 +973,258 @@ class Routine:
         print(f"Training complete. Best loss: {best_loss:.8e}")
         return best_loss
     
+    # def train(self, num_epochs=1000):
+    #     """
+    #     Train the model using batched processing with strong orthogonality constraints.
+    #     Similar to the reference implementation with St. Venant-Kirchhoff energy.
+    #     """
+    #     print("Starting training...")
+        
+    #     # Setup training parameters
+    #     batch_size = 16  # You can add this to config
+    #     rest_idx = 0    # Index for rest shape in batch
+    #     print_every = 1
+    #     checkpoint_every = 50
+        
+    #     # Get rest shape (undeformed configuration)
+    #     coordinates_th = torch.tensor(self.coordinates_np, device=self.device, dtype=torch.float64)
+    #     X = torch.zeros_like(coordinates_th, device=self.device, dtype=torch.float64)
+    #     X = X.view(1, -1).expand(batch_size, -1)
+        
+    #     # Use a subset of linear modes (you might need to adjust indices)
+    #     L = self.num_modes  # Use at most L linear modes
+    #     linear_modes = self.linear_modes[:, :L].detach()  # Use the first L modes, detach as it's fixed
+        
+    #     # Setup iteration counter and best loss tracking
+    #     iteration = 0
+    #     best_loss = float('inf')
+        
+    #     # Make sure model accepts batched inputs
+    #     original_forward = self.model.forward
+        
+    #     def new_forward(x):
+    #         is_batch = x.dim() > 1
+    #         if not is_batch:
+    #             x = x.unsqueeze(0)
+    #         result = original_forward(x)
+    #         if not is_batch:
+    #             result = result.squeeze(0)
+    #         return result
+            
+    #     self.model.forward = new_forward
+        
+    #     optimizer = torch.optim.LBFGS(self.model.parameters(), 
+    #                                 lr=1,
+    #                                 max_iter=200,
+    #                                 max_eval=200,
+    #                                 tolerance_grad=1e-06,
+    #                                 tolerance_change=1e-06,
+    #                                 history_size=200,
+    #                                 line_search_fn="strong_wolfe")
+        
+    #     scheduler = LBFGSScheduler(
+    #         optimizer,
+    #         factor=0.5,
+    #         patience=100,
+    #         threshold=0.01,
+    #         min_lr=1e-6,
+    #         verbose=True
+    #     )
+    #     patience_counter = 0
+    #     example_eigenvalue_scale = self.compute_eigenvalue_based_scale()
+    #     print(f"Example eigenvalue scale: {example_eigenvalue_scale}")
 
+    #     if not hasattr(self, 'viz_plotter'):
+    #         self.create_live_visualizer()
+
+    #     while iteration < num_epochs:
+    #         lbfgs_iter = 0
+    #         with torch.no_grad():
+    #             # Curriculum scaling (currently overridden by current_scale = 1)
+    #             # deformation_scale_init = 10.0 
+    #             # deformation_scale_final = 15.0
+    #             # if num_epochs <= 1:
+    #             #     scale_fraction = 1.0
+    #             # else:
+    #             #     scale_fraction = iteration / (num_epochs - 1)
+    #             # curriculum_calculated_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * scale_fraction
+    #             # curriculum_calculated_scale = min(curriculum_calculated_scale, deformation_scale_final)
+
+    #             # User override for z generation scale
+    #             current_scale_for_z = self.compute_eigenvalue_based_scale()[:L]*10
+    #             # Generate samples with the chosen scale
+    #             z = torch.rand(batch_size, L, device=self.device) * current_scale_for_z * 2 - current_scale_for_z
+                
+    #             #z[rest_idx, :] = 0
+                
+    #             l = torch.matmul(z, linear_modes.T)
+                
+    #             constraint_dir = torch.matmul(z, linear_modes.T)
+    #             constraint_norms = torch.norm(constraint_dir, p=2, dim=1, keepdim=True)
+    #             constraint_norms = torch.clamp(constraint_norms, min=1e-8)
+    #             constraint_dir = constraint_dir / constraint_norms
+    #             #constraint_dir[rest_idx] = 0
+            
+    #             energy_val = 0.0
+    #             ortho_val = 0.0
+    #             origin_val = 0.0
+    #             loss_val = 0.0
+    #             bc_penalty_val = 0.0
+    #             pot_energy_residual_loss_val = 0.0 # Renamed from force_loss_val
+                
+    #             def closure():
+    #                 nonlocal energy_val, ortho_val, origin_val, loss_val, lbfgs_iter, iteration, best_loss
+    #                 nonlocal z, l, rest_idx, constraint_dir, linear_modes
+    #                 nonlocal bc_penalty_val, pot_energy_residual_loss_val # Renamed
+
+    #                 lbfgs_iter += 1
+    #                 optimizer.zero_grad()
+                    
+    #                 y = self.model(z)
+    #                 u_total_batch = l + y
+                    
+    #                 energies = self.energy_calculator(u_total_batch) # This is E_int(u_total)
+    #                 # energy_term_for_loss = torch.mean(energies) # Keep if direct energy minimization is also desired
+             
+    #                 volume_sample_indices = [0, min(10, batch_size-1) if batch_size > 1 else 0, rest_idx]
+    #                 volume_results = []
+    #                 for idx in volume_sample_indices:
+    #                     vol_result = self.energy_calculator.compute_volume_comparison(
+    #                         l[idx:idx+1], u_total_batch[idx:idx+1])
+    #                     volume_results.append(vol_result)
+    #                 avg_linear_ratio = sum(r['linear_volume_ratio'] for r in volume_results) / len(volume_results)
+    #                 avg_neural_ratio = sum(r['neural_volume_ratio'] for r in volume_results) / len(volume_results)
+    #                 vol_penalty_val = 1000.0 * torch.mean((torch.tensor(
+    #                     [r['neural_volume_ratio'] for r in volume_results], 
+    #                     device=self.device, dtype=torch.float64) - 1.0)**2)
+                    
+    #                 ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
+    #                 origin = torch.sum(y[rest_idx]**2)
+
+    #                 bc_penalty = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+    #                 if self.fixed_dofs_th is not None and len(self.fixed_dofs_th) > 0:
+    #                     fixed_displacements = u_total_batch[:, self.fixed_dofs_th]
+    #                     bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
+
+    #                 # --- Potential Energy Residual Loss ---
+    #                 # Approximated external forces: f_e_approx = -Phi @ z
+    #                 approximated_external_forces = -torch.einsum('dl,bl->bd', linear_modes, z)
+                                        
+    #                 # Work done by approximated external forces: W_ext_approx = f_e_approx^T @ u_total
+    #                 # u_total_batch is (batch_size, output_dim)
+    #                 # approximated_external_forces is (batch_size, output_dim)
+    #                 external_work_approx_batch = torch.einsum('bd,bd->b', approximated_external_forces, u_total_batch)
+                    
+    #                 # Potential energy residual term per sample: E_int(u_total) - W_ext_approx
+    #                 potential_energy_residuals = energies + external_work_approx_batch # Shape: (batch_size,)
+    #                 residual_mean = torch.mean(potential_energy_residuals)
+                    
+    #                 # Loss term (mean squared error of the potential energy residuals)
+    #                 pot_res_loss_weight = 1 # Example weight, needs tuning. Was 1 for force_loss.
+    #                 # potential_energy_residual_loss = pot_res_loss_weight * torch.mean(potential_energy_residuals**2)
+    #                 # --- End Potential Energy Residual Loss ---
+
+    #                                     # Huber Loss (alternative):
+    #                 beta_huber = 1.0 # Hyperparameter for Huber loss
+    #                 potential_energy_residual_loss = pot_res_loss_weight * torch.nn.functional.huber_loss(
+    #                     potential_energy_residuals, 
+    #                     torch.zeros_like(potential_energy_residuals), 
+    #                     reduction='mean', 
+    #                     delta=beta_huber
+    #                 )
+                 
+    #                 max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2)) if batch_size > 0 else torch.tensor(1.0, device=self.device)
+    #                 max_linear_disp = torch.clamp(max_linear_disp, min=1e-6)
+    #                 # energies_scaling = energies / max_linear_disp**2 # energies is E_int
+    #                 # energy_scaling_log = torch.log10(torch.mean(energies_scaling)) # For printout
+                    
+    #                 # For printout, use the mean of energies (which is E_int)
+    #                 energy_for_printout = torch.mean(energies).item()
+                    
+    #                 u_linear_only = l.detach()
+    #                 energy_linear_for_printout = self.energy_calculator(u_linear_only).mean().item()
+    #                 energy_improvement_for_printout = (torch.relu(torch.tensor(energy_linear_for_printout) - torch.tensor(energy_for_printout)))/(torch.abs(torch.tensor(energy_linear_for_printout)) + 1e-8)
+                                
+    #                 # Modified loss (based on user's current visible code structure)
+    #                 loss = 1e6 * ortho + 1e6 * bc_penalty  + potential_energy_residual_loss
+
+    #                 loss.backward()
+                    
+    #                 if iteration % print_every == 0: # Print only on first LBFGS eval per iteration
+    #                     progress = f"{iteration}/{num_epochs}"
+    #                     progress_pct = f"({100 * iteration / num_epochs:.1f}%)"
+                        
+    #                     sep_line = "=" * 80
+    #                     print(f"\n{sep_line}")
+    #                     print(f"TRAINING ITERATION {progress} {progress_pct} - Best Loss: {best_loss:.6e}")
+    #                     # print(f"Curriculum Scale (calculated): {curriculum_calculated_scale:.4f}, Scale for Z: {current_scale_for_z:.4f}")
+    #                     print(f"Scale for Z: {current_scale_for_z.mean():.4f}")
+    #                     print(f"{sep_line}")
+                        
+    #                     print(f"│ ENERGY METRICS (Informational):")
+    #                     print(f"│ {'Mean E_int:':<20} {energy_for_printout:<12.6e} │ {'Mean E_linear:':<20} {energy_linear_for_printout:<12.6e}")
+    #                     print(f"│ {'E Improvement:':<20} {energy_improvement_for_printout.item()*100:.2f}% │")
+                        
+    #                     print(f"│ CONSTRAINT METRICS:")
+    #                     print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6e}  │ {'BC Penalty:':<20} {bc_penalty.item():<12.6e}")
+    #                     print(f"│ {'Residual:':<20} {residual_mean.item():<12.6e}  │ {'Mean Ext. Work:':<20} {torch.mean(external_work_approx_batch).item():<12.6e} │")
+                                                
+    #                     print(f"│ VOLUME PRESERVATION:")
+    #                     print(f"│ {'Linear Vol Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Vol Ratio:':<20} {avg_neural_ratio:<12.6f}")
+    #                     print(f"│ {'Volume Penalty:':<20} {vol_penalty_val.item():<12.6e}")
+                        
+    #                     print(f"{sep_line}")
+    #                     print(f"TOTAL LOSS: {loss.item():.6e} - LBFGS iter: {lbfgs_iter}")
+    #                     print(f"{sep_line}\n")
+                    
+    #                 energy_val = energy_for_printout # Store mean E_int for logging
+    #                 ortho_val = ortho.item()
+    #                 origin_val = origin.item()
+    #                 loss_val = loss.item()
+    #                 bc_penalty_val = bc_penalty.item()
+    #                 pot_energy_residual_loss_val = potential_energy_residual_loss.item()
+
+    #                 return loss
+                
+    #             optimizer.step(closure)
+    #             scheduler.step(loss_val)  
+
+    #             if batch_size > 1:
+    #                 vis_indices = [i for i in range(batch_size)]
+    #                 if vis_indices:
+    #                      random_idx = np.random.choice(vis_indices)
+    #                      random_z = z[random_idx].detach().clone()
+    #                      self.visualize_latent_vector(random_z, iteration, loss_val)
+    #             elif batch_size == 1:
+    #                  self.visualize_latent_vector(z[0].detach().clone(), iteration, loss_val)
+
+    #         self.writer.add_scalar('train/loss', loss_val, iteration)
+    #         self.writer.add_scalar('train/mean_internal_energy', energy_val, iteration) # Changed tag
+    #         self.writer.add_scalar('train/ortho', ortho_val, iteration)
+    #         self.writer.add_scalar('train/origin', origin_val, iteration)
+    #         self.writer.add_scalar('train/bc_penalty', bc_penalty_val, iteration)
+    #         self.writer.add_scalar('train/potential_energy_residual_loss', pot_energy_residual_loss_val, iteration) # Changed tag
+    #         self.writer.add_scalar('train/current_scale_for_z', current_scale_for_z.mean(), iteration) # Log actual scale used for z
+            
+    #         if loss_val < best_loss:
+    #             best_loss = loss_val
+    #             checkpoint = {
+    #                 'epoch': iteration,
+    #                 'model_state_dict': self.model.state_dict(),
+    #                 'optimizer_state_dict': optimizer.state_dict(),
+    #                 'loss': loss_val,
+    #             }
+    #             patience_counter = 0
+    #             torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa.pt'))
+    #             print(f"============ BEST MODEL UPDATED (Iter {iteration}, Loss: {loss_val:.6e}) ============")
+    #         else:
+    #             patience_counter +=1
+            
+    #         iteration += 1
+            
+    #     self.model.forward = original_forward
+    #     print(f"Training complete. Best loss: {best_loss:.8e}")
+    #     return best_loss
 
 
 
