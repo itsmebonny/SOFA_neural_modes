@@ -5,7 +5,7 @@ mesh:
 
 # Material properties
 material:
-  youngs_modulus: 10000
+  youngs_modulus: 100
   poissons_ratio: 0.45
   density: 1000
   volume: 10.0

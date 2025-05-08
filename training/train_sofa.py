@@ -721,16 +721,16 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 15
+                deformation_scale_final = 150
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
                 print(f"Current scale: {current_scale}")
-                mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
-                mode_scales[4] = mode_scales[0]
-                mode_scales[5] = mode_scales[1]
+                # mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
+                # mode_scales[4] = mode_scales[0]
+                # mode_scales[5] = mode_scales[1]
                 
-                mode_scales = mode_scales * current_scale
+                # mode_scales = mode_scales * current_scale
 
                 # Generate samples with current scale
                 z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
@@ -740,7 +740,7 @@ class Routine:
 
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
-                z[rest_idx, :] = 0  # Set rest shape latent to zero
+                # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
@@ -752,7 +752,7 @@ class Routine:
                 # Avoid division by zero
                 constraint_norms = torch.clamp(constraint_norms, min=1e-8)
                 constraint_dir = constraint_dir / constraint_norms
-                constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
+                # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
                 energy_val = 0
@@ -853,7 +853,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e1 * ortho + 1e3 * bc_penalty + 1e3 * origin 
+                    loss = energy + 0.0 * ortho + 1e3 * bc_penalty 
 
                     loss.backward()
 

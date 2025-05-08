@@ -99,6 +99,9 @@ class AnimationStepController(Sofa.Core.Controller):
         self.original_positions = None
         self.transition_steps = 20
         self.pause_steps = 30
+
+        self.force_verification_done = False 
+
       
 
 
@@ -188,6 +191,10 @@ class AnimationStepController(Sofa.Core.Controller):
 
 
     def onAnimateBeginEvent(self, event):
+
+
+        num_modes_modal_force = 3
+
         if self.current_substep == 0: # Start of a new main step
             rest_pos = self.MO1.rest_position.value
             self.MO1.position.value = rest_pos
@@ -196,20 +203,10 @@ class AnimationStepController(Sofa.Core.Controller):
             if self.MO_NeuralPred: self.MO_NeuralPred.position.value = rest_pos
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
-            L = self.routine.latent_dim
-            base_z_coeffs = np.random.rand(L) * 2 - 1 # Random coefficients in [-1, 1]
-            
-            eigen_scales_raw = self.routine.compute_eigenvalue_based_scale() # NumPy array or scalar
-            eigen_scales_np = np.zeros(L) # Initialize
-            if isinstance(eigen_scales_raw, (float, np.float64)):
-                if L > 0: eigen_scales_np = np.full(L, eigen_scales_raw)
-            elif isinstance(eigen_scales_raw, np.ndarray):
-                if eigen_scales_raw.ndim == 0 and L > 0: # Scalar numpy array
-                    eigen_scales_np = np.full(L, eigen_scales_raw.item())
-                elif eigen_scales_raw.ndim > 0 :
-                    eigen_scales_np = eigen_scales_raw[:L] if len(eigen_scales_raw) >= L else np.pad(eigen_scales_raw, (0, L - len(eigen_scales_raw)), 'constant')
+            base_z_coeffs = np.random.rand(num_modes_modal_force) #* 2 - 1 # Random coefficients in [-1, 1]
+         
 
-            self.base_z_pattern_for_main_step = base_z_coeffs #* eigen_scales_np
+            self.base_z_pattern_for_main_step = base_z_coeffs 
             print(f"  Base Z pattern for main step (norm): {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}")
             # print(f"  Base Z pattern components (first few): {self.base_z_pattern_for_main_step[:min(L,5)]}")
 
@@ -222,7 +219,7 @@ class AnimationStepController(Sofa.Core.Controller):
         
         # Compute distributed forces: F = Phi * z
         # self.linear_modes_np should be (num_dofs, L)
-        current_step_distributed_forces = self.linear_modes_np @ self.current_applied_z # (num_dofs,)
+        current_step_distributed_forces = self.linear_modes_np[:,:num_modes_modal_force] @ self.current_applied_z # (num_dofs,)
         
         self.last_applied_force_magnitude = np.linalg.norm(current_step_distributed_forces) # Store L2 norm of the distributed force vector
         
@@ -246,6 +243,8 @@ class AnimationStepController(Sofa.Core.Controller):
             finally: self.cff_linear = None
 
         # Create and add new CFFs using 'forces' attribute
+
+        #Try with only one force
         try:
             # Exact Solution
             self.cff_exact = self.exactSolution.addObject('ConstantForceField',
@@ -305,16 +304,56 @@ class AnimationStepController(Sofa.Core.Controller):
             
             l_th_reshaped_np, u_pred_reshaped_np, real_solution_reshaped = None, None, None
 
-            # Use self.current_applied_z for NN prediction
-            if self.current_applied_z is None or np.isnan(self.current_applied_z).any():
-                print(f"  Warning: NaN or None detected in current_applied_z for force norm {self.last_applied_force_magnitude:.4f}")
+            # Use z_actual_sofa (computed from SOFA's real solution) for NN prediction
+            if z_actual_sofa is None or np.isnan(z_actual_sofa).any():
+                print(f"  Warning: NaN or None detected in z_actual_sofa for force norm {self.last_applied_force_magnitude:.4f}. Skipping NN prediction.")
             else:
-                z_for_nn_th = torch.tensor(self.current_applied_z, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
-                # Ensure modes_to_use matches the latent_dim used for z_for_nn_th
-                latent_dim_for_z = len(self.current_applied_z)
-                modes_to_use = self.routine.linear_modes[:, :latent_dim_for_z].to(self.routine.device)
+                # Ensure z_actual_sofa is a 1D array before converting to tensor
+                if z_actual_sofa.ndim > 1:
+                    z_actual_sofa_flat = z_actual_sofa.flatten() # Or handle error if shape is unexpected
+                else:
+                    z_actual_sofa_flat = z_actual_sofa
+
+                z_for_nn_th = torch.tensor(z_actual_sofa_flat, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
+                # Ensure modes_to_use matches the latent_dim of z_actual_sofa
+                latent_dim_for_z = len(z_actual_sofa_flat)
+
+                # Check if routine.linear_modes has enough columns
+                if self.routine.linear_modes.shape[1] < latent_dim_for_z:
+                    print(f"  Error: linear_modes has {self.routine.linear_modes.shape[1]} modes, but z_actual_sofa has {latent_dim_for_z} components. Truncating z_actual_sofa for prediction.")
+                    # Option 1: Truncate z_actual_sofa (if this makes sense for the model)
+                    # z_for_nn_th = z_for_nn_th[:, :self.routine.linear_modes.shape[1]]
+                    # latent_dim_for_z = self.routine.linear_modes.shape[1]
+                    # Option 2: Pad modes (less likely to be correct unless model expects this)
+                    # Option 3: Skip prediction or error out
+                    # For now, let's assume we might need to truncate z if modes are fewer,
+                    # or more likely, ensure latent_dim_for_z doesn't exceed available modes.
+                    # The safer approach is to ensure z_actual_sofa's length matches the expected latent_dim.
+                    # The computeModalCoordinates should return z of length routine.latent_dim.
+                    # If z_actual_sofa_flat is longer than routine.latent_dim, it implies an issue upstream.
+                    # However, if routine.latent_dim is the target, use that.
+                    if latent_dim_for_z > self.routine.latent_dim:
+                         print(f"  Warning: z_actual_sofa ({latent_dim_for_z}) is longer than routine.latent_dim ({self.routine.latent_dim}). Truncating z_actual_sofa.")
+                         z_for_nn_th = z_for_nn_th[:, :self.routine.latent_dim]
+                         latent_dim_for_z = self.routine.latent_dim # Update latent_dim_for_z to match
+                    elif latent_dim_for_z < self.routine.latent_dim:
+                         print(f"  Warning: z_actual_sofa ({latent_dim_for_z}) is shorter than routine.latent_dim ({self.routine.latent_dim}). This might be unexpected.")
+                         # Potentially pad z_for_nn_th with zeros if model expects routine.latent_dim
+                         # z_padding = torch.zeros((1, self.routine.latent_dim - latent_dim_for_z), dtype=z_for_nn_th.dtype, device=z_for_nn_th.device)
+                         # z_for_nn_th = torch.cat((z_for_nn_th, z_padding), dim=1)
+                         # latent_dim_for_z = self.routine.latent_dim # Update latent_dim_for_z
+
+                # Use up to latent_dim_for_z modes, or all available modes if fewer
+                num_available_modes = self.routine.linear_modes.shape[1]
+                modes_to_select = min(latent_dim_for_z, num_available_modes)
                 
-                # l_th is Phi * z_input_to_NN
+                modes_to_use = self.routine.linear_modes[:, :modes_to_select].to(self.routine.device)
+                
+                # Adjust z_for_nn_th if it was longer than available modes
+                if z_for_nn_th.shape[1] > modes_to_select:
+                    z_for_nn_th = z_for_nn_th[:, :modes_to_select]
+
+                # l_th is Phi * z_input_to_NN (which is now z_actual_sofa)
                 l_th = torch.matmul(modes_to_use, z_for_nn_th.T).squeeze() # Squeeze if z_for_nn_th was unsqueezed
 
                 with torch.no_grad():
@@ -353,11 +392,42 @@ class AnimationStepController(Sofa.Core.Controller):
                     print(f"  Error during prediction processing/reshaping/error calc: {e}")
             
             if self.original_positions is not None:
+                print("  Debug: original_positions is not None. Updating visualization MOs.")
                 rest_pos = self.original_positions
                 if self.MO_LinearModes is not None and l_th_reshaped_np is not None:
+                    print(f"  Debug: Updating MO_LinearModes.position. l_th_reshaped_np shape: {l_th_reshaped_np.shape}")
                     self.MO_LinearModes.position.value = rest_pos + l_th_reshaped_np
+                elif self.MO_LinearModes is None:
+                    print("  Debug: MO_LinearModes is None.")
+                elif l_th_reshaped_np is None:
+                    print("  Debug: l_th_reshaped_np is None, cannot update MO_LinearModes.")
+
+                if self.visual_LM is not None and l_th_reshaped_np is not None:
+                    # This might be redundant if MO_LinearModes directly drives the visual,
+                    # but included for completeness if visual_LM has its own position.
+                    print(f"  Debug: Updating visual_LM.position. l_th_reshaped_np shape: {l_th_reshaped_np.shape}")
+                    self.visual_LM.position.value = rest_pos + l_th_reshaped_np
+                elif self.visual_LM is None:
+                    print("  Debug: visual_LM is None.")
+                # No need for another l_th_reshaped_np is None check if covered by MO_LinearModes
+
                 if self.MO_NeuralPred is not None and u_pred_reshaped_np is not None:
+                    print(f"  Debug: Updating MO_NeuralPred.position. u_pred_reshaped_np shape: {u_pred_reshaped_np.shape}")
                     self.MO_NeuralPred.position.value = rest_pos + u_pred_reshaped_np
+                elif self.MO_NeuralPred is None:
+                    print("  Debug: MO_NeuralPred is None.")
+                elif u_pred_reshaped_np is None:
+                    print("  Debug: u_pred_reshaped_np is None, cannot update MO_NeuralPred.")
+
+                if self.visual_NP is not None and u_pred_reshaped_np is not None:
+                    # Similar to visual_LM, might be redundant.
+                    print(f"  Debug: Updating visual_NP.position. u_pred_reshaped_np shape: {u_pred_reshaped_np.shape}")
+                    self.visual_NP.position.value = rest_pos + u_pred_reshaped_np
+                elif self.visual_NP is None:
+                    print("  Debug: visual_NP is None.")
+                # No need for another u_pred_reshaped_np is None check
+            else:
+                print("  Debug: self.original_positions is None. Skipping visualization MO updates.")
             
             self.substep_results.append((
                 self.last_applied_force_magnitude, real_energy, predicted_energy, linear_energy_modes, sofa_linear_energy,
@@ -741,7 +811,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       drawBoxes=True)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box', [9.99, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box_coords = config['constraints'].get('force_box', [0.01, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
@@ -812,7 +882,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO_LinearModes = linearModesViz.addObject('MechanicalObject', name='MO_LinearModes', template='Vec3d', src='@grid')
     # Add visual model
     visualLinearModes = linearModesViz.addChild("visualLinearModes")
-    visualLinearModes.addObject('OglModel', src='@../MO_LinearModes', color='1 1 0 1') # Yellow color
+    visual_LM = visualLinearModes.addObject('OglModel', src='@../MO_LinearModes', color='1 1 0 1') # Yellow color
     visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./')
     # --- End Linear Modes Viz Node ---
 
@@ -824,7 +894,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
     # Add visual model
     visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    visualNeuralPred.addObject('OglModel', src='@../MO_NeuralPred', color='1 0 1 1') # Magenta color
+    visual_NP = visualNeuralPred.addObject('OglModel', src='@../MO_NeuralPred', color='1 0 1 1') # Magenta color
     visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./')
     # --- End Neural Pred Viz Node ---
 
@@ -835,7 +905,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
         'surface_topo': surface_topo, 'MO1': MO1, 'fixed_box': fixed_box,
         'linearSolution': linearSolution, 'MO2': MO2, 'linearFEM': linearFEM,
         'MO_LinearModes': MO_LinearModes, 'MO_NeuralPred': MO_NeuralPred,
-        'visual_LM': visualLinearModes, 'visual_NP': visualNeuralPred, # Corrected visual names
+        'visual_LM': visual_LM, 'visual_NP': visual_NP, # Corrected visual names
         'directory': directory, 'sample': sample, 'key': key,
         'young_modulus': young_modulus, 'poisson_ratio': poisson_ratio,
         'density': density, 'volume': volume, 'total_mass': total_mass,
@@ -879,7 +949,7 @@ if __name__ == "__main__":
     max_main_steps = args.steps if args.steps is not None else config.get('simulation', {}).get('steps', 20)
     num_substeps = args.num_substeps if args.num_substeps is not None else config.get('physics', {}).get('num_substeps', 1)
     # Get max_z_amplitude_scale from args or config
-    max_z_amplitude_scale_val = args.max_z_scale if args.max_z_scale is not None else config.get('simulation', {}).get('max_z_amplitude_scale', 100.0)
+    max_z_amplitude_scale_val = args.max_z_scale if args.max_z_scale is not None else config.get('simulation', {}).get('max_z_amplitude_scale', 1.0)
 
     required_plugins = [
         "Sofa.GL.Component.Rendering3D", "Sofa.GL.Component.Shader", "Sofa.Component.StateContainer",
