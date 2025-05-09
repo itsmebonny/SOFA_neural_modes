@@ -75,8 +75,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- Define Fixed Force Target Magnitude ---
         # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 150
-        00.0 # The maximum force magnitude to reach
+        self.target_force_magnitude = 10
         # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
@@ -287,10 +286,11 @@ class AnimationStepController(Sofa.Core.Controller):
         try:
             current_force_magnitude = self.last_applied_force_magnitude # Get magnitude applied in BeginEvent
             real_solution = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
+            linear_solution = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy() 
             real_energy = self.computeInternalEnergy(real_solution)
             # print(f"  Substep Result: Force Mag={current_force_magnitude:.4f}, Real Energy={real_energy:.4f}")
 
-            z = self.computeModalCoordinates(real_solution)
+            z = self.computeModalCoordinates(linear_solution)
 
             if z is not None and not np.isnan(z).any():
                 self.all_z_coords.append(z.copy()) # Store a copy
@@ -864,7 +864,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       drawBoxes=True)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box', [9.99, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box_coords = config['constraints'].get('force_box', [0.01, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 

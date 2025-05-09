@@ -17,13 +17,13 @@ physics:
   rayleigh_stiffness: 0.1
   rayleigh_mass: 0.1
   solver_iterations: 50000
-  solver_tolerance: 1e-6
-  solver_threshold: 1e-6
-  num_substeps: 50 # Added for substep logic
+  solver_tolerance: 1e-5
+  solver_threshold: 1e-5
+  num_substeps: 200 # Added for substep logic
 
 simulation:
   steps: 50 # Default number of main steps
-
+  max_z_amplitude_scale: 1
 # Constraint parameters
 constraints:
   fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]

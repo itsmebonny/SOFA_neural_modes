@@ -214,15 +214,28 @@ class AnimationStepController(Sofa.Core.Controller):
         # Calculate force for the CURRENT substep based on modal coordinates
         substep_fraction = (self.current_substep % self.num_substeps + 1) / self.num_substeps
         current_amplitude_scale = self.max_z_amplitude_scale * substep_fraction
-        
         self.current_applied_z = self.base_z_pattern_for_main_step * current_amplitude_scale
-        
+
         # Compute distributed forces: F = Phi * z
-        # self.linear_modes_np should be (num_dofs, L)
-        current_step_distributed_forces = self.linear_modes_np[:,:num_modes_modal_force] @ self.current_applied_z # (num_dofs,)
-        
-        self.last_applied_force_magnitude = np.linalg.norm(current_step_distributed_forces) # Store L2 norm of the distributed force vector
-        
+        current_step_distributed_forces = self.linear_modes_np[:, :num_modes_modal_force] @ self.current_applied_z  # (num_dofs,)
+
+        # Reshape forces to (num_nodes, 3)
+        self.force_in_newton = current_step_distributed_forces.reshape(-1, 3)
+
+        # Compute the total force magnitude as the sum of the magnitudes of the forces at each node
+        node_force_magnitudes = np.linalg.norm(self.force_in_newton, axis=1)  # Magnitude of force at each node
+        self.last_applied_force_magnitude_newton = np.sum(node_force_magnitudes)  # Total force magnitude
+        print(f"  Total Force Magnitude (sum of node magnitudes): {self.last_applied_force_magnitude_newton:.4f}")
+
+        # Store the force magnitude for plotting
+        if not hasattr(self, 'all_force_magnitudes_newton'):
+            self.all_force_magnitudes_newton = []
+        self.all_force_magnitudes_newton.append(self.last_applied_force_magnitude_newton)
+
+        # Debug: Print force statistics
+        print(f"  Norm of Force in Newtons: {np.linalg.norm(self.force_in_newton):.4f}")
+        print(f"  Total Force Magnitude (sum of node magnitudes): {self.last_applied_force_magnitude_newton:.4f}")
+        print(f"  Norm of Applied z components: {np.linalg.norm(self.current_applied_z):.4f}")
         forces_reshaped = current_step_distributed_forces.reshape(-1, 3) # (num_nodes, 3)
         
         # Extract forces for the ROI nodes
@@ -275,10 +288,11 @@ class AnimationStepController(Sofa.Core.Controller):
         try:
             # current_force_magnitude is now self.last_applied_force_magnitude (norm of Phi*z)
             real_solution = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
+            linear_solution = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
             real_energy = self.computeInternalEnergy(real_solution)
 
             # Compute actual modal coordinates from SOFA's real solution
-            z_actual_sofa = self.computeModalCoordinates(real_solution) # This is z_actual
+            z_actual_sofa = self.computeModalCoordinates(linear_solution) # This is z_actual
             if z_actual_sofa is not None and not np.isnan(z_actual_sofa).any():
                 self.all_z_coords.append(z_actual_sofa.copy()) # Store z_actual
             print(f"  Random z pattern norm: {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}, Actual z norm: {np.linalg.norm(z_actual_sofa):.4f}")
@@ -564,140 +578,122 @@ class AnimationStepController(Sofa.Core.Controller):
             print("No results collected. Skipping analysis and plotting.")
             return
 
+        # Ensure force magnitudes are available
+        if not hasattr(self, 'all_force_magnitudes_newton') or not self.all_force_magnitudes_newton:
+            print("No force magnitudes collected. Skipping analysis and plotting.")
+            return
+
+        # Check for NaN in MO1 or MO2
+        if self.MO1 is not None and np.isnan(self.MO1.position.value).any():
+            print("MO1 contains NaN values. Skipping saving results.")
+            return
+        if self.MO2 is not None and np.isnan(self.MO2.position.value).any():
+            print("MO2 contains NaN values. Skipping saving results.")
+            return
+
+        # Add force magnitudes to the results
+        for i, force_mag in enumerate(self.all_force_magnitudes_newton):
+            if i < len(self.substep_results):
+                self.substep_results[i] = (force_mag,) + self.substep_results[i]
+
         result_columns = [
-            'AppliedForceNorm', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE', # Changed ForceMag to AppliedForceNorm
+            'ForceMag', 'AppliedForceNorm', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
             'L2Err_Pred_Real', 'RMSE_Pred_Real', 'MSE_Pred_Real',
             'L2Err_Lin_Real', 'RMSE_Lin_Real', 'MSE_Lin_Real',
             'L2Err_Lin_SOFALin', 'RMSE_Lin_SOFALin', 'MSE_Lin_SOFALin'
         ]
+
         try:
             import pandas as pd
             df = pd.DataFrame(self.substep_results, columns=result_columns)
-            avg_results = df.groupby('AppliedForceNorm').mean().reset_index()
-            avg_results = avg_results.sort_values(by='AppliedForceNorm')
+            avg_results = df.groupby('ForceMag').mean().reset_index()
+            avg_results = avg_results.sort_values(by='ForceMag')
 
-            print("\n--- Average Results per Applied Force Norm ---")
-            cols_to_print = ['AppliedForceNorm', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
-                             'RMSE_Pred_Real', 'MSE_Pred_Real',
-                             'RMSE_Lin_Real', 'MSE_Lin_Real',
-                             'RMSE_Lin_SOFALin', 'MSE_Lin_SOFALin']
+            print("\n--- Average Results per Force Magnitude ---")
+            cols_to_print = ['ForceMag', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
+                            'RMSE_Pred_Real', 'MSE_Pred_Real',
+                            'RMSE_Lin_Real', 'MSE_Lin_Real',
+                            'RMSE_Lin_SOFALin', 'MSE_Lin_SOFALin']
             print(avg_results[cols_to_print].to_string(index=False, float_format="%.4e"))
             print("-------------------------------------------\n")
 
-            force_mags_plot = avg_results['AppliedForceNorm'].values # This is now norm(Phi*z)
+            force_mags_plot = avg_results['ForceMag'].values
             avg_real_e = avg_results['RealE'].values
             avg_pred_e = avg_results['PredE'].values
             avg_linear_modes_e = avg_results['LinearModesE'].values
             avg_sofa_linear_e = avg_results['SOFALinearE'].values
             avg_rmse_pred_real = avg_results['RMSE_Pred_Real'].values
-            avg_mse_pred_real = avg_results['MSE_Pred_Real'].values
-            avg_rmse_lin_real = avg_results['RMSE_Lin_Real'].values
-            avg_mse_lin_real = avg_results['MSE_Lin_Real'].values
-            avg_rmse_lin_sofa = avg_results['RMSE_Lin_SOFALin'].values
-            avg_mse_lin_sofa = avg_results['MSE_Lin_SOFALin'].values
+            avg_rmse_lin_real = avg_results['RMSE_Lin_Real'].values  # Ensure this column exists in avg_results
+            avg_rmse_lin_sofa = avg_results['RMSE_Lin_SOFALin'].values  # Ensure this column exists in avg_results
+            # Ensure the required variables are computed
+            avg_mse_pred_real = avg_results['MSE_Pred_Real'].values 
+            avg_mse_lin_real = avg_results['MSE_Lin_Real'].values 
+            avg_mse_lin_sofa = avg_results['MSE_Lin_SOFALin'].values 
 
-            if not self.all_z_coords:
-                print("No valid actual modal coordinates (z_actual_sofa) collected.")
-            else:
-                # ... (z statistics remain the same, analyzing z_actual_sofa) ...
-                all_z_np = np.array(self.all_z_coords) 
-                num_z_samples, latent_dim = all_z_np.shape
-                print(f"\n--- Actual Modal Coordinate (z_actual_sofa) Statistics ({num_z_samples} samples) ---")
-                print("--- Per-Component Statistics ---")
-                z_min_comp = np.min(all_z_np, axis=0)
-                z_max_comp = np.max(all_z_np, axis=0)
-                z_mean_comp = np.mean(all_z_np, axis=0)
-                abs_z_np = np.abs(all_z_np)
-                abs_z_min_comp = np.min(abs_z_np, axis=0)
-                abs_z_max_comp = np.max(abs_z_np, axis=0)
-                abs_z_mean_comp = np.mean(abs_z_np, axis=0)
-                header = f"{'Component':<10} | {'Min':<12} | {'Max':<12} | {'Mean':<12} | {'Abs Min':<12} | {'Abs Max':<12} | {'Abs Mean':<12}"
-                print(header)
-                print("-" * len(header))
-                for i in range(latent_dim):
-                    print(f"{f'z_{i}':<10} | {z_min_comp[i]:<12.4f} | {z_max_comp[i]:<12.4f} | {z_mean_comp[i]:<12.4f} | {abs_z_min_comp[i]:<12.4f} | {abs_z_max_comp[i]:<12.4f} | {abs_z_mean_comp[i]:<12.4f}")
-                print("-" * len(header))
-                print("\n--- Overall Statistics (All Components & Steps) ---")
-                print(f"{'Overall Min:':<15} {np.min(all_z_np):<12.4f}")
-                print(f"{'Overall Max:':<15} {np.max(all_z_np):<12.4f}")
-                print(f"{'Overall Mean:':<15} {np.mean(all_z_np):<12.4f}")
-                print(f"{'Overall Abs Min:':<15} {np.min(abs_z_np):<12.4f}")
-                print(f"{'Overall Abs Max:':<15} {np.max(abs_z_np):<12.4f}")
-                print(f"{'Overall Abs Mean:':<15} {np.mean(abs_z_np):<12.4f}")
-                print("--------------------------------------------------\n")
+
+            # Plotting code uses force_mags_plot for x-axis
+            plot_dir = self.output_subdir if self.save else "."
+            if self.save and not os.path.exists(plot_dir):
+                os.makedirs(plot_dir)
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
+            plt.plot(force_mags_plot, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
+            plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
+            plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            plt.xlabel('Applied Force Magnitude (N)')  # Updated X-axis label
+            plt.ylabel('Average Internal Energy')
+            plt.title('Average Energy vs. Applied Force Magnitude')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_magnitude.png"))
+            plt.close()
+
+            print(f"Plots saved to {plot_dir}")
+            print("Closing simulation")
+
+
+            plt.figure(figsize=(10, 6))
+            # ... (log scale energy plot, ensure valid_indices use correct arrays) ...
+            valid_indices_real = avg_real_e > 0; valid_indices_pred = avg_pred_e > 0
+            valid_indices_linear_modes = avg_linear_modes_e > 0; valid_indices_sofa_linear = avg_sofa_linear_e > 0
+            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
+            if np.any(valid_indices_pred): plt.plot(force_mags_plot[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy', marker='x', linestyle='--')
+            if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
+            if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            plt.xlabel('Applied Force Magnitude (N)'); plt.ylabel('Average Internal Energy (log scale)')
+            plt.title('Average Energy vs. Applied Force Norm (Log Scale)'); plt.yscale('log')
+            plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_norm_log.png"))
+            plt.close()
+
+            # ... (RMSE and MSE plots, ensure x-axis is force_mags_plot and labels are updated) ...
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^')
+            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
+            plt.xlabel('Applied Force Magnitude (N)'); plt.ylabel('Average RMSE')
+            plt.title('Average RMSE vs. Applied Force Norm'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force_norm.png"))
+            plt.close()
+
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE: Pred (l+y) vs Real (MO1)', marker='^')
+            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
+            plt.xlabel('Applied Force Magnitude (N)'); plt.ylabel('Average MSE')
+            plt.title('Average MSE vs. Applied Force Norm'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force_norm.png"))
+            plt.close()
+
+            print(f"Plots saved to {plot_dir}")
+            print("Closing simulation")
 
         except ImportError:
             print("Warning: pandas not found. Cannot compute average results.")
-            # Fallback plotting will use raw substep data
-            force_mags_plot = np.array([r[0] for r in self.substep_results]) # norm(Phi*z)
-            # ... (rest of fallback data extraction) ...
-            avg_real_e = np.array([r[1] for r in self.substep_results])
-            avg_pred_e = np.array([r[2] for r in self.substep_results])
-            avg_linear_modes_e = np.array([r[3] for r in self.substep_results])
-            avg_sofa_linear_e = np.array([r[4] for r in self.substep_results])
-            avg_rmse_pred_real = np.array([r[6] for r in self.substep_results])
-            avg_mse_pred_real = np.array([r[7] for r in self.substep_results])
-            avg_rmse_lin_real = np.array([r[9] for r in self.substep_results])
-            avg_mse_lin_real = np.array([r[10] for r in self.substep_results])
-            avg_rmse_lin_sofa = np.array([r[12] for r in self.substep_results])
-            avg_mse_lin_sofa = np.array([r[13] for r in self.substep_results])
 
-            sort_idx = np.argsort(force_mags_plot)
-            force_mags_plot = force_mags_plot[sort_idx]
-            avg_real_e = avg_real_e[sort_idx]; avg_pred_e = avg_pred_e[sort_idx]; # etc. for all arrays
-
-        plot_dir = self.output_subdir if self.save else "."
-        if self.save and not os.path.exists(plot_dir):
-             os.makedirs(plot_dir)
-
-        # Plotting code uses force_mags_plot for x-axis
-        plt.figure(figsize=(10, 6))
-        plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
-        plt.plot(force_mags_plot, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
-        plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
-        plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
-        plt.xlabel('Applied Force Norm (||Phi*z||)') # Updated X-axis label
-        plt.ylabel('Average Internal Energy')
-        plt.title('Average Energy vs. Applied Force Norm')
-        plt.legend(); plt.grid(True); plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_norm.png"))
-        plt.close() # Close figure
-
-        plt.figure(figsize=(10, 6))
-        # ... (log scale energy plot, ensure valid_indices use correct arrays) ...
-        valid_indices_real = avg_real_e > 0; valid_indices_pred = avg_pred_e > 0
-        valid_indices_linear_modes = avg_linear_modes_e > 0; valid_indices_sofa_linear = avg_sofa_linear_e > 0
-        if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
-        if np.any(valid_indices_pred): plt.plot(force_mags_plot[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy', marker='x', linestyle='--')
-        if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
-        if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
-        plt.xlabel('Applied Force Norm (||Phi*z||)'); plt.ylabel('Average Internal Energy (log scale)')
-        plt.title('Average Energy vs. Applied Force Norm (Log Scale)'); plt.yscale('log')
-        plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_norm_log.png"))
-        plt.close()
-
-        # ... (RMSE and MSE plots, ensure x-axis is force_mags_plot and labels are updated) ...
-        plt.figure(figsize=(10, 6))
-        plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^')
-        plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-        plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
-        plt.xlabel('Applied Force Norm (||Phi*z||)'); plt.ylabel('Average RMSE')
-        plt.title('Average RMSE vs. Applied Force Norm'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force_norm.png"))
-        plt.close()
-
-        plt.figure(figsize=(10, 6))
-        plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE: Pred (l+y) vs Real (MO1)', marker='^')
-        plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-        plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
-        plt.xlabel('Applied Force Norm (||Phi*z||)'); plt.ylabel('Average MSE')
-        plt.title('Average MSE vs. Applied Force Norm'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force_norm.png"))
-        plt.close()
-
-        print(f"Plots saved to {plot_dir}")
-        print("Closing simulation")
 
 
 def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), *args, **kwargs):
@@ -816,10 +812,10 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
                                         drawBoxes=True)
-    cff = exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
 
     
-
+    #NOTES: plot some relative errors between linear modes and fem divided by the norm of biggest displacement
+    # 
     
     # Add visual model
     visual = exactSolution.addChild("visual")
@@ -866,7 +862,6 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            drawBoxes=False) # Maybe hide this box
     # Add a CFF to the linear model as well, controlled separately if needed, or linked
     # For now, just add it so the structure is parallel. It won't be actively controlled by the current controller.
-    linearSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.0)
 
     # Add visual model for the linear solution (optional, maybe different color)
     visualLinear = linearSolution.addChild("visualLinear")
