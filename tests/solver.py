@@ -1654,6 +1654,53 @@ class SOFANeoHookeanModel(torch.nn.Module):
             total_volume += torch.sum(J_deformed * detJ_ref_q * qw_q)
 
         return total_volume
+    
+    def compute_deformation_gradients(self, displacement):
+        """
+        Compute the deformation gradients (F) for a given displacement field.
+
+        Args:
+            displacement: Displacement tensor [num_nodes*dim] or [num_nodes, dim]
+
+        Returns:
+            Deformation gradients F [num_elements, num_quad_points, dim, dim]
+        """
+        if not self.precomputed:
+            raise RuntimeError("Deformation gradient computation requires precomputed matrices.")
+
+        # Ensure displacement is in the correct shape [num_nodes, dim]
+        if displacement.dim() == 1:
+            u_sample = displacement.view(self.num_nodes, self.dim)
+        elif displacement.dim() == 2 and displacement.shape[0] == self.num_nodes:
+            u_sample = displacement
+        else:
+            raise ValueError(f"Invalid displacement shape: {displacement.shape}")
+
+        # Get element displacements [num_elements, nodes_per_element, dim]
+        element_disps = u_sample[self.elements]
+
+        # Initialize deformation gradients tensor
+        deformation_gradients = torch.zeros(
+            (self.num_elements, self.num_quad_points, self.dim, self.dim),
+            dtype=self.dtype, device=self.device
+        )
+
+        # Loop over quadrature points
+        for q_idx in range(self.num_quad_points):
+            # Get precomputed data for this quad point:
+            dN_dx_q = self.dN_dx_all[:, q_idx, :, :]  # [num_elements, nodes_per_element, dim]
+
+            # Compute grad(u) = ∑ u_n * dNn/dx : [num_elements, dim, dim]
+            grad_u = torch.einsum('enj,enk->ejk', element_disps, dN_dx_q)
+
+            # Compute deformation gradient F = I + grad(u) : [num_elements, dim, dim]
+            I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(self.num_elements, -1, -1)
+            F = I + grad_u
+
+            # Store deformation gradients for this quadrature point
+            deformation_gradients[:, q_idx, :, :] = F
+
+        return deformation_gradients
 
 
 
@@ -2076,3 +2123,50 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
             J_deformed = torch.linalg.det(F)
             total_volume += torch.sum(J_deformed * detJ_ref_q * qw_q)
         return total_volume
+
+    def compute_deformation_gradients(self, displacement):
+        """
+        Compute the deformation gradients (F) for a given displacement field.
+
+        Args:
+            displacement: Displacement tensor [num_nodes*dim] or [num_nodes, dim]
+
+        Returns:
+            Deformation gradients F [num_elements, num_quad_points, dim, dim]
+        """
+        if not self.precomputed:
+            raise RuntimeError("Deformation gradient computation requires precomputed matrices.")
+
+        # Ensure displacement is in the correct shape [num_nodes, dim]
+        if displacement.dim() == 1:
+            u_sample = displacement.view(self.num_nodes, self.dim)
+        elif displacement.dim() == 2 and displacement.shape[0] == self.num_nodes:
+            u_sample = displacement
+        else:
+            raise ValueError(f"Invalid displacement shape: {displacement.shape}")
+
+        # Get element displacements [num_elements, nodes_per_element, dim]
+        element_disps = u_sample[self.elements]
+
+        # Initialize deformation gradients tensor
+        deformation_gradients = torch.zeros(
+            (self.num_elements, self.num_quad_points, self.dim, self.dim),
+            dtype=self.dtype, device=self.device
+        )
+
+        # Loop over quadrature points
+        for q_idx in range(self.num_quad_points):
+            # Get precomputed data for this quad point:
+            dN_dx_q = self.dN_dx_all[:, q_idx, :, :]  # [num_elements, nodes_per_element, dim]
+
+            # Compute grad(u) = ∑ u_n * dNn/dx : [num_elements, dim, dim]
+            grad_u = torch.einsum('enj,enk->ejk', element_disps, dN_dx_q)
+
+            # Compute deformation gradient F = I + grad(u) : [num_elements, dim, dim]
+            I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(self.num_elements, -1, -1)
+            F = I + grad_u
+
+            # Store deformation gradients for this quadrature point
+            deformation_gradients[:, q_idx, :, :] = F
+
+        return deformation_gradients
