@@ -19,10 +19,10 @@ physics:
   solver_iterations: 50000
   solver_tolerance: 1e-5
   solver_threshold: 1e-5
-  num_substeps: 200 # Added for substep logic
+  num_substeps: 100 # Added for substep logic
 
 simulation:
-  steps: 50 # Default number of main steps
+  steps: 1 # Default number of main steps
   max_z_amplitude_scale: 1
 # Constraint parameters
 constraints:
