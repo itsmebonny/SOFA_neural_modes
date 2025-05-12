@@ -328,20 +328,39 @@ class AnimationStepController(Sofa.Core.Controller):
 
                 modes_to_use = self.routine.linear_modes[:, :self.routine.latent_dim].to(self.routine.device)
                 l_th = torch.matmul(modes_to_use, z_th.T).squeeze()
-                with torch.no_grad(): y_th = self.routine.model(z_th).squeeze()
+                with torch.no_grad():
+                    y_th = self.routine.model(z_th).squeeze()
                 u_pred_th = l_th + y_th
-                num_nodes_mo1 = self.MO1.position.value.shape[0] # Get num_nodes from MO1
+                num_nodes_mo1 = self.MO1.position.value.shape[0]  # Get num_nodes from MO1
                 try:
-                    l_th_reshaped = l_th.reshape(num_nodes_mo1, 3); l_th_reshaped_np = l_th_reshaped.cpu().numpy()
-                    u_pred_reshaped = u_pred_th.reshape(num_nodes_mo1, 3); u_pred_reshaped_np = u_pred_reshaped.cpu().numpy()
+                    l_th_reshaped = l_th.reshape(num_nodes_mo1, 3)
+                    l_th_reshaped_np = l_th_reshaped.cpu().numpy()
+                    u_pred_reshaped = u_pred_th.reshape(num_nodes_mo1, 3)
+                    u_pred_reshaped_np = u_pred_reshaped.cpu().numpy()
                     real_solution_reshaped = real_solution_disp.reshape(num_nodes_mo1, 3)
+
+                    # Compute energies
                     linear_energy_modes = self.computeInternalEnergy(l_th_reshaped_np)
                     predicted_energy = self.computeInternalEnergy(u_pred_reshaped_np)
-                    diff_pred_real = real_solution_reshaped - u_pred_reshaped_np; l2_err_pred_real = np.linalg.norm(diff_pred_real); mse_pred_real = np.mean(diff_pred_real**2); rmse_pred_real = np.sqrt(mse_pred_real)
-                    diff_lin_real = real_solution_reshaped - l_th_reshaped_np; l2_err_lin_real = np.linalg.norm(diff_lin_real); mse_lin_real = np.mean(diff_lin_real**2); rmse_lin_real = np.sqrt(mse_lin_real)
+
+                    # Compute errors with respect to the real solution
+                    diff_pred_real = real_solution_reshaped - u_pred_reshaped_np
+                    l2_err_pred_real = np.linalg.norm(diff_pred_real)
+                    mse_pred_real = np.mean(diff_pred_real**2)
+                    rmse_pred_real = np.sqrt(mse_pred_real)
+
+                    diff_lin_real = real_solution_reshaped - l_th_reshaped_np
+                    l2_err_lin_real = np.linalg.norm(diff_lin_real)
+                    mse_lin_real = np.mean(diff_lin_real**2)
+                    rmse_lin_real = np.sqrt(mse_lin_real)
+
                     if linear_solution_sofa_reshaped is not None:
-                        diff_lin_sofa = linear_solution_sofa_reshaped - l_th_reshaped_np; l2_err_lin_sofa = np.linalg.norm(diff_lin_sofa); mse_lin_sofa = np.mean(diff_lin_sofa**2); rmse_lin_sofa = np.sqrt(mse_lin_sofa)
-                except (RuntimeError, ValueError) as e: print(f"  Error during prediction processing/reshaping/error calc: {e}")
+                        diff_lin_sofa_real = real_solution_reshaped - linear_solution_sofa_reshaped
+                        l2_err_lin_sofa_real = np.linalg.norm(diff_lin_sofa_real)
+                        mse_lin_sofa_real = np.mean(diff_lin_sofa_real**2)
+                        rmse_lin_sofa_real = np.sqrt(mse_lin_sofa_real)
+                except (RuntimeError, ValueError) as e:
+                    print(f"  Error during prediction processing/reshaping/error calc: {e}")
 
             F_real_np, F_lm_pred_np, F_nn_pred_np, F_sofa_linear_np = None, None, None, None
             norm_diff_F_lm, norm_diff_F_nn, norm_diff_F_sl = float('nan'), float('nan'), float('nan')
