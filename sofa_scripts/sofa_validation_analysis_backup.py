@@ -105,6 +105,13 @@ class AnimationStepController(Sofa.Core.Controller):
         self.original_positions = None
         self.transition_steps = 20  # Steps to transition between modes
         self.pause_steps = 30  # Steps to pause at maximum amplitude
+
+        # --- Add lists for Deformation Gradient Differences ---
+        self.grad_diff_lin_modes_list = []
+        self.grad_diff_nn_pred_list = []
+        self.grad_diff_sofa_linear_list = []
+        # --- End lists for Deformation Gradient Differences ---
+
       
 
 
@@ -282,156 +289,166 @@ class AnimationStepController(Sofa.Core.Controller):
         Called by SOFA's animation loop after each physics step.
         Performs analysis and stores results for the completed substep.
         """
-        # --- Perform Analysis for the completed substep ---
         try:
-            current_force_magnitude = self.last_applied_force_magnitude # Get magnitude applied in BeginEvent
-            real_solution = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
-            linear_solution = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy() 
-            real_energy = self.computeInternalEnergy(real_solution)
-            # print(f"  Substep Result: Force Mag={current_force_magnitude:.4f}, Real Energy={real_energy:.4f}")
-
-            z = self.computeModalCoordinates(linear_solution)
-
+            current_force_magnitude = self.last_applied_force_magnitude # This should be set in onAnimateBeginEvent
+            real_solution_disp = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
+            linear_solution_sofa_disp = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
+            real_energy = self.computeInternalEnergy(real_solution_disp)
+            
+            z = self.computeModalCoordinates(linear_solution_sofa_disp) 
             if z is not None and not np.isnan(z).any():
-                self.all_z_coords.append(z.copy()) # Store a copy
+                self.all_z_coords.append(z.copy())
 
-            # --- Linear Solution (SOFA) Analysis ---
             sofa_linear_energy = float('nan')
-            linear_solution_sofa_reshaped = None # Initialize
+            linear_solution_sofa_reshaped = None
             if self.MO2 and self.linearFEM:
-                linear_solution_sofa = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
-                sofa_linear_energy = self.computeInternalEnergy(linear_solution_sofa)
-                # Reshape for error calculation
+                sofa_linear_energy = self.computeInternalEnergy(linear_solution_sofa_disp)
                 try:
-                    linear_solution_sofa_reshaped = linear_solution_sofa.reshape(self.MO1.position.value.shape[0], 3)
+                    linear_solution_sofa_reshaped = linear_solution_sofa_disp.reshape(self.MO1.position.value.shape[0], 3)
                 except ValueError as e:
                     print(f"  Warning: Could not reshape SOFA linear solution: {e}")
-                    linear_solution_sofa_reshaped = None
-            # --- End Linear Solution (SOFA) Analysis ---
 
-            # --- Initialize Energies and Errors ---
-            predicted_energy = float('nan')
-            linear_energy_modes = float('nan')
-            l2_err_pred_real = float('nan')
-            rmse_pred_real = float('nan')
-            mse_pred_real = float('nan')
-            l2_err_lin_real = float('nan')
-            rmse_lin_real = float('nan')
-            mse_lin_real = float('nan')
-            l2_err_lin_sofa = float('nan')
-            rmse_lin_sofa = float('nan')
-            mse_lin_sofa = float('nan')
-            # ---
+            predicted_energy, linear_energy_modes = float('nan'), float('nan')
+            l2_err_pred_real, rmse_pred_real, mse_pred_real = float('nan'), float('nan'), float('nan')
+            l2_err_lin_real, rmse_lin_real, mse_lin_real = float('nan'), float('nan'), float('nan')
+            l2_err_lin_sofa, rmse_lin_sofa, mse_lin_sofa = float('nan'), float('nan'), float('nan')
+            l_th_reshaped_np, u_pred_reshaped_np, real_solution_reshaped = None, None, None
 
-            # --- Initialize reshaped tensors/arrays to None ---
-            l_th_reshaped_np = None
-            u_pred_reshaped_np = None
-            real_solution_reshaped = None
-            # ---
-
-            if np.isnan(z).any():
-                print(f"  Warning: NaN detected in modal coordinates for force mag {current_force_magnitude:.4f}")
+            if z is None or np.isnan(z).any():
+                print(f"  Warning: NaN or None detected in modal coordinates (z). Skipping NN prediction.")
             else:
-                # --- Neural Network Prediction ---
                 z_th = torch.tensor(z, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
+                if z_th.shape[1] != self.routine.latent_dim:
+                     print(f"Warning: z_th shape {z_th.shape} does not match routine.latent_dim {self.routine.latent_dim}. Adjusting z_th.")
+                     if z_th.shape[1] > self.routine.latent_dim:
+                         z_th = z_th[:, :self.routine.latent_dim]
+                     else: 
+                         padding = torch.zeros((1, self.routine.latent_dim - z_th.shape[1]), dtype=z_th.dtype, device=z_th.device)
+                         z_th = torch.cat((z_th, padding), dim=1)
+
                 modes_to_use = self.routine.linear_modes[:, :self.routine.latent_dim].to(self.routine.device)
                 l_th = torch.matmul(modes_to_use, z_th.T).squeeze()
-
-                with torch.no_grad():
-                    y_th = self.routine.model(z_th).squeeze()
+                with torch.no_grad(): y_th = self.routine.model(z_th).squeeze()
                 u_pred_th = l_th + y_th
-                # --- End Prediction ---
-
-                num_nodes = self.MO1.position.value.shape[0]
-                num_dofs = num_nodes * 3
-
+                num_nodes_mo1 = self.MO1.position.value.shape[0] # Get num_nodes from MO1
                 try:
-                    # --- Reshape and Convert Predictions ---
-                    l_th_reshaped = l_th.reshape(num_nodes, 3)
-                    l_th_reshaped_np = l_th_reshaped.cpu().numpy() # For viz, energy, error
-
-                    u_pred_reshaped = u_pred_th.reshape(num_nodes, 3)
-                    u_pred_reshaped_np = u_pred_reshaped.cpu().numpy() # For viz, energy, error
-
-                    # Reshape real solution once
-                    real_solution_reshaped = real_solution.reshape(num_nodes, 3)
-                    # --- End Reshape ---
-
-                    # --- Energy from Predicted Displacements ---
+                    l_th_reshaped = l_th.reshape(num_nodes_mo1, 3); l_th_reshaped_np = l_th_reshaped.cpu().numpy()
+                    u_pred_reshaped = u_pred_th.reshape(num_nodes_mo1, 3); u_pred_reshaped_np = u_pred_reshaped.cpu().numpy()
+                    real_solution_reshaped = real_solution_disp.reshape(num_nodes_mo1, 3)
                     linear_energy_modes = self.computeInternalEnergy(l_th_reshaped_np)
                     predicted_energy = self.computeInternalEnergy(u_pred_reshaped_np)
-                    # --- End Predicted Energies ---
-
-                    # --- Geometric Error Calculations ---
-                    # 1. Neural Prediction (l+y) vs. Real (MO1)
-                    diff_pred_real = real_solution_reshaped - u_pred_reshaped_np
-                    l2_err_pred_real = np.linalg.norm(diff_pred_real)
-                    mse_pred_real = np.mean(diff_pred_real**2)
-                    rmse_pred_real = np.sqrt(mse_pred_real) # Already calculated, but recalculate for consistency
-
-                    # 2. Linear Modes Prediction (l) vs. Real (MO1)
-                    diff_lin_real = real_solution_reshaped - l_th_reshaped_np
-                    l2_err_lin_real = np.linalg.norm(diff_lin_real)
-                    mse_lin_real = np.mean(diff_lin_real**2)
-                    rmse_lin_real = np.sqrt(mse_lin_real)
-
-                    # 3. Linear Modes Prediction (l) vs. SOFA Linear (MO2)
+                    diff_pred_real = real_solution_reshaped - u_pred_reshaped_np; l2_err_pred_real = np.linalg.norm(diff_pred_real); mse_pred_real = np.mean(diff_pred_real**2); rmse_pred_real = np.sqrt(mse_pred_real)
+                    diff_lin_real = real_solution_reshaped - l_th_reshaped_np; l2_err_lin_real = np.linalg.norm(diff_lin_real); mse_lin_real = np.mean(diff_lin_real**2); rmse_lin_real = np.sqrt(mse_lin_real)
                     if linear_solution_sofa_reshaped is not None:
-                        diff_lin_sofa = linear_solution_sofa_reshaped - l_th_reshaped_np
-                        l2_err_lin_sofa = np.linalg.norm(diff_lin_sofa)
-                        mse_lin_sofa = np.mean(diff_lin_sofa**2)
-                        rmse_lin_sofa = np.sqrt(mse_lin_sofa)
-                    # --- End Error Calculations ---
+                        diff_lin_sofa = linear_solution_sofa_reshaped - l_th_reshaped_np; l2_err_lin_sofa = np.linalg.norm(diff_lin_sofa); mse_lin_sofa = np.mean(diff_lin_sofa**2); rmse_lin_sofa = np.sqrt(mse_lin_sofa)
+                except (RuntimeError, ValueError) as e: print(f"  Error during prediction processing/reshaping/error calc: {e}")
 
-                except (RuntimeError, ValueError) as e:
-                    print(f"  Error during prediction processing/reshaping/error calc: {e}")
-                    # Reset relevant variables if error occurs
-                    l_th_reshaped_np = None
-                    u_pred_reshaped_np = None
-                    # Keep energies/errors as NaN
+            F_real_np, F_lm_pred_np, F_nn_pred_np, F_sofa_linear_np = None, None, None, None
+            norm_diff_F_lm, norm_diff_F_nn, norm_diff_F_sl = float('nan'), float('nan'), float('nan')
 
+            if hasattr(self.routine, 'energy_calculator') and \
+               self.routine.energy_calculator is not None and \
+               hasattr(self.routine.energy_calculator, 'compute_deformation_gradients'):
+                
+                calc_F = self.routine.energy_calculator.compute_deformation_gradients
+                device = self.routine.device
+                dtype = torch.float64 if not hasattr(self.routine, 'dtype') else self.routine.dtype
+                
+                # Determine num_nodes and dim for reshaping
+                # Assuming MO1 is representative for num_nodes
+                num_nodes_for_grad = self.MO1.rest_position.value.shape[0]
+                spatial_dim = 3 # Assuming 3D
 
-            # --- Update Visualization-Only Mechanical Objects ---
+                def get_F_from_disp(disp_np_array):
+                    if disp_np_array is None: return None
+                    disp_flat = disp_np_array.flatten()
+                    disp_tensor = torch.tensor(disp_flat, device=device, dtype=dtype)
+                    
+                    # Reshape to  [num_nodes, dim]
+                    try:
+                        # disp_tensor is 1D (num_dofs,). Reshape to (num_nodes, dim).
+                        disp_tensor_reshaped = disp_tensor.view(num_nodes_for_grad, spatial_dim)
+                    except RuntimeError as e_reshape:
+                        print(f"  Error reshaping displacement to ({num_nodes_for_grad}, {spatial_dim}): {e_reshape}")
+                        print(f"  Original disp_tensor shape: {disp_tensor.shape}")
+                        return None
+
+                    # Add batch dimension for calc_F, as it likely expects (batch_size, num_nodes, dim)
+                    F_tensor = calc_F(disp_tensor_reshaped)
+                    if F_tensor.dim() == 4 and F_tensor.shape[0] == 1: # If calc_F returned batched output
+                        F_tensor = F_tensor.squeeze(0) # Remove batch dimension from F_tensor for consistency
+                    return F_tensor.cpu().numpy()
+
+                try:
+                    F_real_np = get_F_from_disp(real_solution_disp)
+
+                    if l_th_reshaped_np is not None and F_real_np is not None:
+                        F_lm_pred_np = get_F_from_disp(l_th_reshaped_np)
+                        if F_lm_pred_np is not None and F_lm_pred_np.shape == F_real_np.shape:
+                            diff_F_lm = F_real_np - F_lm_pred_np
+                            norm_diff_F_lm = np.mean(np.linalg.norm(diff_F_lm, ord='fro', axis=(-2,-1)))
+                        elif F_lm_pred_np is not None: print(f"Shape mismatch F_real vs F_lm_pred: {F_real_np.shape} vs {F_lm_pred_np.shape}")
+                    
+                    if u_pred_reshaped_np is not None and F_real_np is not None:
+                        F_nn_pred_np = get_F_from_disp(u_pred_reshaped_np)
+                        if F_nn_pred_np is not None and F_nn_pred_np.shape == F_real_np.shape:
+                            diff_F_nn = F_real_np - F_nn_pred_np
+                            norm_diff_F_nn = np.mean(np.linalg.norm(diff_F_nn, ord='fro', axis=(-2,-1)))
+                        elif F_nn_pred_np is not None: print(f"Shape mismatch F_real vs F_nn_pred: {F_real_np.shape} vs {F_nn_pred_np.shape}")
+                    
+                    if linear_solution_sofa_disp is not None and F_real_np is not None:
+                        F_sofa_linear_np = get_F_from_disp(linear_solution_sofa_disp)
+                        if F_sofa_linear_np is not None and F_sofa_linear_np.shape == F_real_np.shape:
+                            diff_F_sl = F_real_np - F_sofa_linear_np
+                            norm_diff_F_sl = np.mean(np.linalg.norm(diff_F_sl, ord='fro', axis=(-2,-1)))
+                        elif F_sofa_linear_np is not None: print(f"Shape mismatch F_real vs F_sofa_linear: {F_real_np.shape} vs {F_sofa_linear_np.shape}")
+                except Exception as e_fgrad:
+                    print(f"  ERROR calculating deformation gradients or their differences: {e_fgrad}")
+                    traceback.print_exc()
+            else:
+                print("  Skipping deformation gradient calculation: energy_calculator or method not available.")
+
+            self.grad_diff_lin_modes_list.append(norm_diff_F_lm)
+            self.grad_diff_nn_pred_list.append(norm_diff_F_nn)
+            self.grad_diff_sofa_linear_list.append(norm_diff_F_sl)
+            
             if self.original_positions is not None:
-                rest_pos = self.original_positions # Use stored original positions as rest
+                rest_pos = self.original_positions
                 if self.MO_LinearModes is not None and l_th_reshaped_np is not None:
                     self.MO_LinearModes.position.value = rest_pos + l_th_reshaped_np
-                    # self.visual_LM.position.value = rest_pos + l_th_reshaped_np # Not needed if mapping works
                 if self.MO_NeuralPred is not None and u_pred_reshaped_np is not None:
                     self.MO_NeuralPred.position.value = rest_pos + u_pred_reshaped_np
-                    # self.visual_NP.position.value = rest_pos + u_pred_reshaped_np # Not needed if mapping works
-            # --- End Update Viz MOs ---
-
-            # Store results for this substep (ensure order matches __init__)
+            
             self.substep_results.append((
                 current_force_magnitude, real_energy, predicted_energy, linear_energy_modes, sofa_linear_energy,
                 l2_err_pred_real, rmse_pred_real, mse_pred_real,
                 l2_err_lin_real, rmse_lin_real, mse_lin_real,
                 l2_err_lin_sofa, rmse_lin_sofa, mse_lin_sofa
             ))
-
-
         except Exception as e:
-             print(f"ERROR during analysis in onAnimateEndEvent: {e}")
-             traceback.print_exc()
-             # Store NaNs if analysis failed
-             self.substep_results.append((self.last_applied_force_magnitude, float('nan'), float('nan'), float('nan'), float('nan'), float('nan')))
+            print(f"ERROR during analysis in onAnimateEndEvent: {e}")
+            traceback.print_exc()
+            # Ensure lists are appended to even on error to maintain consistent lengths
+            self.substep_results.append((
+                self.last_applied_force_magnitude, 
+                float('nan'), float('nan'), float('nan'), float('nan'), 
+                float('nan'), float('nan'), float('nan'), 
+                float('nan'), float('nan'), float('nan'),  
+                float('nan'), float('nan'), float('nan')  
+            ))
+            self.grad_diff_lin_modes_list.append(float('nan'))
+            self.grad_diff_nn_pred_list.append(float('nan'))
+            self.grad_diff_sofa_linear_list.append(float('nan'))
 
-
-        # --- Increment counters ---
         self.current_substep += 1
-        # Check if a main step is completed (optional, mainly for tracking/stopping)
         if (self.current_substep % self.num_substeps) == 0:
             self.current_main_step += 1
             print(f"--- Main Step {self.current_main_step} Completed (Total Substeps: {self.current_substep}) ---")
-
-            # --- Optional: Stop simulation after N main steps ---
-            if not args.gui and self.current_main_step >= self.max_main_steps:
+            # Access args globally if __main__ defines it
+            if 'args' in globals() and not args.gui and self.current_main_step >= self.max_main_steps:
                  print(f"Reached maximum main steps ({self.max_main_steps}). Stopping simulation.")
                  if self.root: self.root.animate = False
-
         self.end_time = process_time()
-
 
     def computeModalCoordinates(self, displacement):
         """
@@ -537,220 +554,136 @@ class AnimationStepController(Sofa.Core.Controller):
     
 
     def close(self):
-        """
-        Called when the simulation is closing. Calculates final statistics and generates plots,
-        including average energy vs. force magnitude.
-        """
         print("\n--- Simulation Finished ---")
-
         if not self.substep_results:
             print("No results collected. Skipping analysis and plotting.")
             return
 
-        # --- Process Substep Results ---
         result_columns = [
             'ForceMag', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
             'L2Err_Pred_Real', 'RMSE_Pred_Real', 'MSE_Pred_Real',
             'L2Err_Lin_Real', 'RMSE_Lin_Real', 'MSE_Lin_Real',
             'L2Err_Lin_SOFALin', 'RMSE_Lin_SOFALin', 'MSE_Lin_SOFALin'
         ]
-
-        # Use pandas for convenient grouping and averaging
         try:
             import pandas as pd
             df = pd.DataFrame(self.substep_results, columns=result_columns)
 
-            # Group by unique force magnitude and calculate mean (ignoring NaNs)
+            # Add new columns for gradient differences
+            # Ensure lengths match, especially if simulation ended early or with errors
+            num_entries_df = len(df)
+            df['GradDiff_LM'] = pd.Series(self.grad_diff_lin_modes_list[:num_entries_df])
+            df['GradDiff_NN'] = pd.Series(self.grad_diff_nn_pred_list[:num_entries_df])
+            df['GradDiff_SL'] = pd.Series(self.grad_diff_sofa_linear_list[:num_entries_df])
+            
             avg_results = df.groupby('ForceMag').mean().reset_index()
             avg_results = avg_results.sort_values(by='ForceMag')
 
             print("\n--- Average Results per Force Magnitude ---")
-            # Select columns to print (can customize)
             cols_to_print = ['ForceMag', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
                              'RMSE_Pred_Real', 'MSE_Pred_Real',
                              'RMSE_Lin_Real', 'MSE_Lin_Real',
-                             'RMSE_Lin_SOFALin', 'MSE_Lin_SOFALin']
-            print(avg_results[cols_to_print].to_string(index=False, float_format="%.4e")) # Use scientific notation for errors
+                             'RMSE_Lin_SOFALin', 'MSE_Lin_SOFALin',
+                             'GradDiff_LM', 'GradDiff_NN', 'GradDiff_SL'] # Added new cols
+            
+            # Filter out columns that might not exist if all values were NaN (though groupby().mean() should handle NaNs)
+            cols_to_print_existing = [col for col in cols_to_print if col in avg_results.columns]
+            print(avg_results[cols_to_print_existing].to_string(index=False, float_format="%.4e"))
             print("-------------------------------------------\n")
 
-            # Extract data for plotting
-            force_mags = avg_results['ForceMag'].values
+            force_mags_plot = avg_results['ForceMag'].values
             avg_real_e = avg_results['RealE'].values
             avg_pred_e = avg_results['PredE'].values
             avg_linear_modes_e = avg_results['LinearModesE'].values
             avg_sofa_linear_e = avg_results['SOFALinearE'].values
-            # Errors
             avg_rmse_pred_real = avg_results['RMSE_Pred_Real'].values
             avg_mse_pred_real = avg_results['MSE_Pred_Real'].values
             avg_rmse_lin_real = avg_results['RMSE_Lin_Real'].values
             avg_mse_lin_real = avg_results['MSE_Lin_Real'].values
             avg_rmse_lin_sofa = avg_results['RMSE_Lin_SOFALin'].values
             avg_mse_lin_sofa = avg_results['MSE_Lin_SOFALin'].values
+            # Extract new averaged gradient differences
+            avg_grad_diff_lm = avg_results['GradDiff_LM'].values if 'GradDiff_LM' in avg_results else np.full_like(force_mags_plot, float('nan'))
+            avg_grad_diff_nn = avg_results['GradDiff_NN'].values if 'GradDiff_NN' in avg_results else np.full_like(force_mags_plot, float('nan'))
+            avg_grad_diff_sl = avg_results['GradDiff_SL'].values if 'GradDiff_SL' in avg_results else np.full_like(force_mags_plot, float('nan'))
 
+            plot_dir = self.output_subdir if self.save else "."
+            if self.save and not os.path.exists(plot_dir):
+                os.makedirs(plot_dir)
 
+            # ... (Existing Energy, RMSE, MSE plots remain the same) ...
+            # 1. Average Energy vs. Force Magnitude Plot (Linear Scale)
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
+            plt.plot(force_mags_plot, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
+            plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
+            plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy')
+            plt.title('Average Energy vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force.png")); plt.close()
 
-            if not self.all_z_coords:
-                print("No valid modal coordinates (z) collected.")
-            else:
-                all_z_np = np.array(self.all_z_coords) # Shape: (num_steps, latent_dim)
-                num_z_samples, latent_dim = all_z_np.shape
-                print(f"\n--- Modal Coordinate (z) Statistics ({num_z_samples} samples) ---")
+            # 1b. Average Energy vs. Force Magnitude Plot (Log Scale)
+            plt.figure(figsize=(10, 6))
+            valid_indices_real = avg_real_e > 0; valid_indices_pred = avg_pred_e > 0
+            valid_indices_linear_modes = avg_linear_modes_e > 0; valid_indices_sofa_linear = avg_sofa_linear_e > 0
+            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
+            if np.any(valid_indices_pred): plt.plot(force_mags_plot[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy', marker='x', linestyle='--')
+            if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
+            if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy (log scale)')
+            plt.title('Average Energy vs. Applied Force Magnitude (Log Scale)'); plt.yscale('log')
+            plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_log.png")); plt.close()
 
-                # --- Per-Component Statistics ---
-                print("--- Per-Component Statistics ---")
-                # Calculate stats per component
-                z_min_comp = np.min(all_z_np, axis=0)
-                z_max_comp = np.max(all_z_np, axis=0)
-                z_mean_comp = np.mean(all_z_np, axis=0)
+            # 2. RMSE Errors vs Force Magnitude
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^')
+            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
+            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average RMSE')
+            plt.title('Average RMSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png")); plt.close()
 
-                # Calculate stats for absolute values per component
-                abs_z_np = np.abs(all_z_np)
-                abs_z_min_comp = np.min(abs_z_np, axis=0)
-                abs_z_max_comp = np.max(abs_z_np, axis=0)
-                abs_z_mean_comp = np.mean(abs_z_np, axis=0)
+            # 3. MSE Errors vs Force Magnitude
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE: Pred (l+y) vs Real (MO1)', marker='^')
+            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
+            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average MSE')
+            plt.title('Average MSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force.png")); plt.close()
 
-                header = f"{'Component':<10} | {'Min':<12} | {'Max':<12} | {'Mean':<12} | {'Abs Min':<12} | {'Abs Max':<12} | {'Abs Mean':<12}"
-                print(header)
-                print("-" * len(header))
-                for i in range(latent_dim):
-                    print(f"{f'z_{i}':<10} | {z_min_comp[i]:<12.4f} | {z_max_comp[i]:<12.4f} | {z_mean_comp[i]:<12.4f} | {abs_z_min_comp[i]:<12.4f} | {abs_z_max_comp[i]:<12.4f} | {abs_z_mean_comp[i]:<12.4f}")
-                print("-" * len(header))
+            # --- New Plot for Deformation Gradient Differences ---
+            plt.figure(figsize=(12, 7))
+            if not np.all(np.isnan(avg_grad_diff_lm)): # Check if there's any valid data to plot
+                 plt.plot(force_mags_plot, avg_grad_diff_lm, label='Avg ||F_real - F_LMpred||', marker='o', linestyle='-')
+            if not np.all(np.isnan(avg_grad_diff_nn)):
+                 plt.plot(force_mags_plot, avg_grad_diff_nn, label='Avg ||F_real - F_NNpred||', marker='x', linestyle='--')
+            if not np.all(np.isnan(avg_grad_diff_sl)):
+                 plt.plot(force_mags_plot, avg_grad_diff_sl, label='Avg ||F_real - F_SOFALinear||', marker='s', linestyle=':')
+            
+            plt.xlabel('Applied Force Magnitude (N)')
+            plt.ylabel('Avg. Frobenius Norm Diff. of Def. Gradients')
+            plt.title('Average Deformation Gradient Difference vs. Applied Force')
+            plt.legend()
+            plt.grid(True, which="both", ls="--")
+            plt.yscale('log') # Log scale often useful for error metrics
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "avg_grad_diff_vs_force_magnitude.png"))
+            plt.close()
+            print(f"Deformation gradient difference plot saved to {os.path.join(plot_dir, 'avg_grad_diff_vs_force_magnitude.png')}")
+            # --- End New Plot ---
 
-                # --- Overall Statistics (Across all components and steps) ---
-                print("\n--- Overall Statistics (All Components & Steps) ---")
-                z_min_overall = np.min(all_z_np)
-                z_max_overall = np.max(all_z_np)
-                z_mean_overall = np.mean(all_z_np)
-
-                abs_z_min_overall = np.min(abs_z_np)
-                abs_z_max_overall = np.max(abs_z_np)
-                abs_z_mean_overall = np.mean(abs_z_np)
-
-                print(f"{'Overall Min:':<15} {z_min_overall:<12.4f}")
-                print(f"{'Overall Max:':<15} {z_max_overall:<12.4f}")
-                print(f"{'Overall Mean:':<15} {z_mean_overall:<12.4f}")
-                print(f"{'Overall Abs Min:':<15} {abs_z_min_overall:<12.4f}")
-                print(f"{'Overall Abs Max:':<15} {abs_z_max_overall:<12.4f}")
-                print(f"{'Overall Abs Mean:':<15} {abs_z_mean_overall:<12.4f}")
-                print("--------------------------------------------------\n")
-
-        # --- End Z Statistics ---
-
+            print(f"All plots saved to {plot_dir}")
 
         except ImportError:
-            print("Warning: pandas not found. Cannot compute average results per force magnitude.")
-            print("Plotting raw substep data instead (if possible).")
-            # Fallback: plot raw data (might be messy)
-            # Ensure indices match the expanded tuple
-            force_mags = np.array([r[0] for r in self.substep_results])
-            avg_real_e = np.array([r[1] for r in self.substep_results])
-            avg_pred_e = np.array([r[2] for r in self.substep_results])
-            avg_linear_modes_e = np.array([r[3] for r in self.substep_results])
-            avg_sofa_linear_e = np.array([r[4] for r in self.substep_results])
-            # Errors
-            avg_rmse_pred_real = np.array([r[6] for r in self.substep_results])
-            avg_mse_pred_real = np.array([r[7] for r in self.substep_results])
-            avg_rmse_lin_real = np.array([r[9] for r in self.substep_results])
-            avg_mse_lin_real = np.array([r[10] for r in self.substep_results])
-            avg_rmse_lin_sofa = np.array([r[12] for r in self.substep_results])
-            avg_mse_lin_sofa = np.array([r[13] for r in self.substep_results])
+            print("Warning: pandas not found. Cannot compute average results or plot.")
+        except Exception as e_close:
+            print(f"Error during close method processing: {e_close}")
+            traceback.print_exc()
+        finally:
+            print("Closing simulation")
 
-            # Need to sort for line plot
-            sort_idx = np.argsort(force_mags)
-            force_mags = force_mags[sort_idx]
-            avg_real_e = avg_real_e[sort_idx]
-            avg_pred_e = avg_pred_e[sort_idx]
-            avg_linear_modes_e = avg_linear_modes_e[sort_idx]
-            avg_sofa_linear_e = avg_sofa_linear_e[sort_idx]
-            # Errors
-            avg_rmse_pred_real = avg_rmse_pred_real[sort_idx]
-            avg_mse_pred_real = avg_mse_pred_real[sort_idx]
-            avg_rmse_lin_real = avg_rmse_lin_real[sort_idx]
-            avg_mse_lin_real = avg_mse_lin_real[sort_idx]
-            avg_rmse_lin_sofa = avg_rmse_lin_sofa[sort_idx]
-            avg_mse_lin_sofa = avg_mse_lin_sofa[sort_idx]
-
-
-       
-        # 1. Average Energy vs. Force Magnitude Plot
-        plot_dir = self.output_subdir if self.save else "."
-        if self.save and not os.path.exists(plot_dir):
-             os.makedirs(plot_dir)
-
-        # 1. Average Energy vs. Force Magnitude Plot (Linear Scale)
-        plt.figure(figsize=(10, 6))
-        plt.plot(force_mags, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
-        plt.plot(force_mags, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
-        plt.plot(force_mags, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':') # Renamed label
-        plt.plot(force_mags, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.') # Added SOFA Linear
-        plt.xlabel('Applied Force Magnitude')
-        plt.ylabel('Average Internal Energy')
-        plt.title('Average Energy vs. Applied Force Magnitude')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force.png"))
-
-        # 1b. Average Energy vs. Force Magnitude Plot (Log Scale)
-        plt.figure(figsize=(10, 6))
-        # Filter out non-positive values before plotting on log scale
-        valid_indices_real = avg_real_e > 0
-        valid_indices_pred = avg_pred_e > 0
-        valid_indices_linear_modes = avg_linear_modes_e > 0 # Use correct variable
-        valid_indices_sofa_linear = avg_sofa_linear_e > 0 # Added filter for SOFA Linear
-
-        if np.any(valid_indices_real):
-            plt.plot(force_mags[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
-        if np.any(valid_indices_pred):
-            plt.plot(force_mags[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
-        if np.any(valid_indices_linear_modes): # Use correct variable
-            plt.plot(force_mags[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy (l)', marker='s', linestyle=':') # Renamed label
-        if np.any(valid_indices_sofa_linear): # Added SOFA Linear plot
-            plt.plot(force_mags[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
-
-        plt.xlabel('Applied Force Magnitude')
-        plt.ylabel('Average Internal Energy (log scale)')
-        plt.title('Average Energy vs. Applied Force Magnitude (Log Scale)')
-        plt.yscale('log') # Set y-axis to log scale
-        plt.legend()
-        plt.grid(True, which="both", ls="--") # Grid for both major and minor ticks on log scale
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_log.png"))
-
-
-
-        # 2. RMSE Errors vs Force Magnitude
-        plt.figure(figsize=(10, 6))
-        plt.plot(force_mags, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^', linestyle='-')
-        plt.plot(force_mags, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-        plt.plot(force_mags, avg_rmse_lin_sofa, label='RMSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
-        plt.xlabel('Applied Force Magnitude')
-        plt.ylabel('Average RMSE')
-        plt.title('Average RMSE vs. Applied Force Magnitude')
-        plt.legend()
-        plt.grid(True)
-        plt.yscale('log') # Log scale is usually best for errors
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png"))
-
-        # 3. MSE Errors vs Force Magnitude
-        plt.figure(figsize=(10, 6))
-        plt.plot(force_mags, avg_mse_pred_real, label='MSE: Pred (l+y) vs Real (MO1)', marker='^', linestyle='-')
-        plt.plot(force_mags, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-        plt.plot(force_mags, avg_mse_lin_sofa, label='MSE: LinModes (l) vs SOFALin (MO2)', marker='<', linestyle=':')
-        plt.xlabel('Applied Force Magnitude')
-        plt.ylabel('Average MSE')
-        plt.title('Average MSE vs. Applied Force Magnitude')
-        plt.legend()
-        plt.grid(True)
-        plt.yscale('log') # Log scale is usually best for errors
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force.png"))
-
-     
-
-        print(f"Plots saved to {plot_dir}")
-        print("Closing simulation")
 
 
 def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), *args, **kwargs):
