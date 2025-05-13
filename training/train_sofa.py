@@ -388,8 +388,18 @@ class Routine:
 
         # Tensorboard setup
         checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
-        tensorboard_dir = cfg.get('training', {}).get('tensorboard_dir', 'tensorboard')
-        self.writer = SummaryWriter(os.path.join(checkpoint_dir, tensorboard_dir))
+        base_tensorboard_dir = cfg.get('training', {}).get('tensorboard_dir', 'tensorboard') # e.g., "tensorboard"
+        
+        # Create a unique directory for this run
+        import datetime
+        current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        run_specific_log_dir = os.path.join(checkpoint_dir, base_tensorboard_dir, current_time)
+        # Alternatively, you could use a run name from cfg if you add one
+        # run_name = cfg.get('experiment_name', current_time) 
+        # run_specific_log_dir = os.path.join(checkpoint_dir, base_tensorboard_dir, run_name)
+
+        self.writer = SummaryWriter(log_dir=run_specific_log_dir)
+        print(f"TensorBoard logs will be saved to: {run_specific_log_dir}")
 
         # Setup optimizers
         lr = cfg.get('training', {}).get('learning_rate', 0.005)
@@ -721,7 +731,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 25
+                deformation_scale_final = 150
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -732,10 +742,36 @@ class Routine:
                 
                 # mode_scales = mode_scales * current_scale
 
-                # Generate samples with current scale
-                z = torch.rand(batch_size, L, device=self.device) * current_scale * 2 - current_scale
+                # --- New Logistic Decay for Z sampling range ---
+                # current_scale is the max amplitude for the first mode
+                # Hyperparameters for logistic decay:
+                min_amplitude_factor = 0.05  # Min amplitude as a factor of current_scale (e.g., 5%)
+                inflection_point_mode_ratio = 0.1 # Decay is sharpest around this fraction of modes (e.g., first 10%)
+                decay_steepness = 1.0 # Controls how sharp the decay is. Higher is sharper.
 
-                #scale each sample to randomly between 0.001 and 1 to cover smaller and larger scalesù
+                max_amplitude_mode0 = current_scale
+                min_amplitude_higher_modes = max_amplitude_mode0 * min_amplitude_factor
+                
+                mode_indices = torch.arange(L, device=self.device, dtype=torch.float64)
+                inflection_point_abs = L * inflection_point_mode_ratio
+                
+                # Logistic decay formula: Min + (Max - Min) / (1 + exp(steepness * (x - x0)))
+                # This creates a decay from Max down to Min
+                exponent_term = decay_steepness * (mode_indices - inflection_point_abs)
+                logistic_decay_value = 1.0 / (1.0 + torch.exp(exponent_term))
+                
+                individual_mode_scales = min_amplitude_higher_modes + \
+                                         (max_amplitude_mode0 - min_amplitude_higher_modes) * logistic_decay_value
+                # --- End of New Logistic Decay ---
+                
+                # Generate random samples in [-1, 1]
+                z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
+                
+                # Apply the decaying scales
+                # Unsqueeze individual_mode_scales to (1, L) for broadcasting with (batch_size, L)
+                z = z_unit_range * individual_mode_scales.unsqueeze(0)
+                
+                # Ensure the rest shape (if used) has zero latent activation
                 #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
 
 
@@ -899,7 +935,10 @@ class Routine:
                         print(f"│ {'Linear Volume Change:':<20} {(avg_linear_ratio-1)*100:<12.4f}% │ {'Neural Volume Change:':<20} {(avg_neural_ratio-1)*100:<12.4f}%")
                         print(f"│ {'Volume Penalty:':<20} {vol_penalty.item():<12.6f}")
         
-                        
+                        # Print z vector (first 10 modes of the first batch sample)
+                        z_to_print = z[0, :min(10, z.shape[1])].detach().cpu().numpy()
+                        z_str = ", ".join([f"{val:.3f}" for val in z_to_print])
+                        print(f"│ {'z (first sample, up to 10 modes):':<30} [{z_str}]")
                         # Final loss value
                         print(f"{sep_line}")
                         print(f"TOTAL LOSS: {loss.item():.6e} - {lbfgs_progress}")
@@ -968,11 +1007,14 @@ class Routine:
             #     break
         
         # Restore original forward method
-        self.model.forward = original_forward
-        
+        self.model.forward = original_forward # This was outside the loop, ensure it's handled correctly
         print(f"Training complete. Best loss: {best_loss:.8e}")
-        return best_loss
-    
+        if hasattr(self, 'writer') and self.writer:
+            self.writer.close()
+            print("TensorBoard writer closed.")
+
+
+        return best_loss    
     # def train(self, num_epochs=1000):
     #     """
     #     Train the model using batched processing with strong orthogonality constraints.

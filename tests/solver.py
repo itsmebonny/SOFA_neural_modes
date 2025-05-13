@@ -1344,7 +1344,6 @@ class SOFANeoHookeanModel(torch.nn.Module):
         energy = self.compute_energy(displacement_batch)
 
         # Compute gradient: dE/du
-        # Need to sum energy if it's batched, as grad expects scalar output
         grad = torch.autograd.grad(
             outputs=energy.sum(),
             inputs=displacement_batch,
@@ -1389,7 +1388,6 @@ class SOFANeoHookeanModel(torch.nn.Module):
         internal_forces_flat = self.compute_gradient(u_for_grad) # Shape: [batch_size, num_nodes*dim]
 
         # The internal forces are -dE/du. The divergence of PK1 is also -dE/du (in weak form).
-        # So, we just need to reshape the negative gradient.
         div_p = internal_forces_flat.view(batch_size, self.num_nodes, self.dim)
 
         # Return without batch dimension if input wasn't batched
@@ -1434,20 +1432,6 @@ class SOFANeoHookeanModel(torch.nn.Module):
         pk1 = torch.zeros((batch_size, self.num_elements, self.num_quad_points, self.dim, self.dim),
                          dtype=self.dtype, device=self.device)
 
-        # Gather displacements for all elements: [batch_size, num_elements, nodes_per_element, dim]
-        # element_indices = self.elements # Shape: [num_elements, nodes_per_element]
-        # Use broadcasting and indexing for efficiency
-        # Expand elements indices for batch dim: [batch_size, num_elements, nodes_per_element]
-        # This step can be memory intensive if num_elements * nodes_per_element is huge.
-        # Consider chunking elements if needed.
-        element_indices_expanded = self.elements.unsqueeze(0).expand(batch_size, -1, -1) # B x E x N
-        # Gather displacements using batch_gather or equivalent logic
-        # Need to index u_reshaped [B, num_nodes, D] using indices [B, E, N] -> result [B, E, N, D]
-        # This requires gather along node dimension (dim=1)
-        # element_disps = torch.gather(u_reshaped.unsqueeze(2).expand(-1, -1, self.nodes_per_element, -1),
-        #                              1, element_indices_expanded.unsqueeze(-1).expand(-1, -1, -1, self.dim)) # This seems overly complex
-        # Alternative: Replicate u_reshaped and use advanced indexing?
-        # Easier approach: Iterate through batch dim, as done in compute_energy
 
         # Loop over batch samples
         for b in range(batch_size):
@@ -1496,27 +1480,19 @@ class SOFANeoHookeanModel(torch.nn.Module):
 
                  P_q = self.mu * (F - inv_F_T) + self.lmbda * log_J_reshaped * inv_F_T
 
-                 # Handle potentially singular elements where we used pseudo-inverse
-                 # If mask exists, apply it (optional, depends on desired behavior)
-                 # if 'zero_pk1_mask' in locals() and torch.any(zero_pk1_mask):
-                 #     P_q[zero_pk1_mask] = 0.0
+           
 
                  # Store result for this batch sample and quad point
                  pk1[b, :, q_idx, :, :] = P_q
 
 
-        # Return result, removing batch dim if input was flat
         if original_shape_was_flat:
             pk1 = pk1.squeeze(0)
 
         return pk1
 
 
-    # --- Volume Comparison (assuming it uses only coordinates and detJ_all) ---
-    # Keep the volume comparison methods as they were, assuming they rely on
-    # precomputed detJ or calculate volume geometrically.
-    # Note: _compute_deformed_volume might need adjustment if it relies on F
-    # or if the geometric calculation needs refinement for hex elements.
+    # --- Volume Comparison ---
 
     def compute_volume_comparison(self, u_linear, u_total):
         """
@@ -1536,12 +1512,9 @@ class SOFANeoHookeanModel(torch.nn.Module):
             u_total = u_total.squeeze(0)
 
         # Ensure displacements are flat [N*D] for _compute_deformed_volume if needed
-        # (Current implementation reshapes inside)
 
         # Calculate volumes
         original_volume = self._compute_mesh_volume()
-        # Note: _compute_deformed_volume currently only works well for Tets.
-        # Needs update for Hex using quadrature and J from deformed state.
         linear_volume = self._compute_deformed_volume(u_linear)
         neural_volume = self._compute_deformed_volume(u_total)
 
@@ -1590,7 +1563,7 @@ class SOFANeoHookeanModel(torch.nn.Module):
                  total_volume += volume
              return total_volume
 
-        # Preferred method: Integrate 1 over the domain using quadrature
+        # Integrate 1 over the domain using quadrature
         # Volume = ∑_elements ∑_qp (1 * detJ * quad_weight)
         # Reshape quad_weights for broadcasting: [1, num_qp]
         quad_weights_r = self.quadrature_weights.unsqueeze(0)
@@ -1796,8 +1769,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
 
     def _generate_quadrature(self):
         """Generate quadrature rules based ONLY on nodes_per_element."""
-        # --- This function is identical to the one in SOFANeoHookeanModel ---
-        # --- Copy the implementation from SOFANeoHookeanModel._generate_quadrature ---
         if self.nodes_per_element == 4:  # Linear Tetrahedron
             # 4-point rule
             self.quadrature_points = torch.tensor([
@@ -1836,8 +1807,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
     def _precompute_derivatives(self):
         """Precompute shape function derivatives w.r.t. physical coords (dN/dx)
            and Jacobian determinants (detJ) for all elements and quadrature points."""
-        # --- This function is identical to the one in SOFANeoHookeanModel ---
-        # --- Copy the implementation from SOFANeoHookeanModel._precompute_derivatives ---
         num_qp = self.num_quad_points
         self.dN_dx_all = torch.zeros((self.num_elements, num_qp, self.nodes_per_element, self.dim),
                                     dtype=self.dtype, device=self.device)
@@ -1858,7 +1827,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
                      invJ = torch.zeros_like(J) # Assign zero inverse to avoid NaN
                 if detJ <= 0:
                      print(f"Warning: Non-positive Jacobian determinant ({detJ.item():.4e}) for element {e_idx} at QP {q_idx}. Check mesh quality.")
-                     # Optionally clamp detJ to self.eps if needed downstream, but keep original for volume
                 dN_dx = torch.einsum('nj,jk->nk', dN_dxi, invJ)
                 self.dN_dx_all[e_idx, q_idx] = dN_dx
                 self.detJ_all[e_idx, q_idx] = detJ
@@ -1868,7 +1836,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
         """Compute shape function derivatives w.r.t. reference coordinates (ξ, η, ζ)
            at a given reference quadrature point qp_ref."""
         # --- This function is identical to the one in SOFANeoHookeanModel ---
-        # --- Copy the implementation from SOFANeoHookeanModel._shape_function_derivatives_ref ---
         if self.nodes_per_element == 4: # Linear Tetrahedron
              dN_dxi = torch.tensor([
                  [-1.0, -1.0, -1.0], [ 1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0], [ 0.0,  0.0,  1.0]
@@ -1973,8 +1940,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
         Compute internal forces (negative gradient of energy w.r.t. displacements).
         Uses torch.autograd for automatic differentiation.
         """
-        # --- This function is identical to the one in SOFANeoHookeanModel ---
-        # --- Copy the implementation from SOFANeoHookeanModel.compute_gradient ---
         if not displacement_batch.requires_grad:
             displacement_batch = displacement_batch.detach().clone().requires_grad_(True)
         elif not torch.is_grad_enabled():
@@ -1999,8 +1964,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
         Compute the divergence of the first Piola-Kirchhoff (PK1) stress tensor,
         which corresponds to the internal forces (-dE/du).
         """
-        # --- This function is identical to the one in SOFANeoHookeanModel ---
-        # --- Copy the implementation from SOFANeoHookeanModel.compute_div_p ---
         is_batch = displacement_batch.dim() > 1
         if not is_batch:
             original_shape_was_flat = True
@@ -2064,12 +2027,9 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
         return pk1
 
     # --- Volume Comparison Methods ---
-    # These can be copied directly from SOFANeoHookeanModel as they depend on
-    # geometry and the deformation gradient F, not the specific energy model.
 
     def compute_volume_comparison(self, u_linear, u_total):
         """Compare volumes between original, linear, and total displacements."""
-        # --- Copy implementation from SOFANeoHookeanModel.compute_volume_comparison ---
         if u_linear.dim() > 1 and u_linear.shape[0] == 1: u_linear = u_linear.squeeze(0)
         if u_total.dim() > 1 and u_total.shape[0] == 1: u_total = u_total.squeeze(0)
         original_volume = self._compute_mesh_volume()
@@ -2095,7 +2055,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
 
     def _compute_mesh_volume(self):
         """Calculate the total volume of the original undeformed mesh."""
-        # --- Copy implementation from SOFANeoHookeanModel._compute_mesh_volume ---
         if not self.precomputed or self.detJ_all is None:
              print("Warning: Precomputed detJ not available for volume calculation.")
              return torch.tensor(float('nan'), device=self.device)
@@ -2106,7 +2065,6 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
 
     def _compute_deformed_volume(self, displacement):
         """Calculate the total volume of the mesh after applying displacement."""
-        # --- Copy implementation from SOFANeoHookeanModel._compute_deformed_volume ---
         if not self.precomputed: raise RuntimeError("Deformed volume requires precomputed matrices.")
         if displacement.dim() == 1: u_sample = displacement.view(self.num_nodes, self.dim)
         elif displacement.dim() == 2 and displacement.shape[0] == self.num_nodes: u_sample = displacement
