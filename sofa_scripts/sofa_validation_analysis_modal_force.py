@@ -846,7 +846,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            name="LinearFEM",
                            youngModulus=young_modulus,
                            poissonRatio=poisson_ratio,
-                           method="large") # Or "small" if appropriate
+                           method="small") # Or "small" if appropriate
 
 
     # Add constraints (same as exactSolution)

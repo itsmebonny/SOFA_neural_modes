@@ -4,6 +4,7 @@
 /matrices
 /validation_results
 /force_inference
+/z_debug
 
 cantilever_modal.py
 neohookean.cpp

@@ -157,14 +157,49 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateEndEvent(self, event):
         """
         Called by SOFA's animation loop after each physics step.
-        Performs analysis and stores results for the completed substep.
+        Performs analysis, stores results, and saves step-specific data to disk.
         """
         displacement = self.MO1.position.value - self.original_positions
         energy = self.computeInternalEnergy(displacement)
-        self.energy_values.append(energy) # Store energy for this substep
+        self.energy_values.append(energy) # Store energy for this step
 
         volume = self.computeVolume(displacement)
         self.volume_values.append(volume)
+
+        if self.save:
+            # Define the specific output directory for z_amplitude data
+            # self.output_subdir is like 'z_debug/5_modes'
+            # self.z_scale_factor is the amplitude scale
+            z_amplitude_data_dir = os.path.join(self.output_subdir, f"z_amplitude_{self.z_scale_factor}")
+            os.makedirs(z_amplitude_data_dir, exist_ok=True)
+
+            step_number = self.current_main_step # Use current step number for filenames
+
+            # Save displacement as .npy
+            disp_filename = os.path.join(z_amplitude_data_dir, f"step_{step_number}_displacement.npy")
+            np.save(disp_filename, displacement)
+
+            # Prepare data for JSON
+            # self.current_z_for_step was set in onAnimateBeginEvent
+            step_data = {
+                "step": step_number,
+                "z_coords": self.current_z_for_step.tolist() if self.current_z_for_step is not None else None,
+                "energy": energy,
+                "volume": volume,
+                "z_scale_factor": self.z_scale_factor,
+                "displacement_file": os.path.basename(disp_filename) # Relative path to displacement
+            }
+
+            # Save other data as .json
+            json_filename = os.path.join(z_amplitude_data_dir, f"step_{step_number}_data.json")
+            try:
+                with open(json_filename, 'w') as f:
+                    json.dump(step_data, f, indent=4)
+            except Exception as e:
+                print(f"Error saving JSON data for step {step_number}: {e}")
+
+        self.current_main_step += 1
+
 
         self.end_time = process_time()
 
