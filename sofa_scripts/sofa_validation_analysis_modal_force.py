@@ -193,7 +193,7 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateBeginEvent(self, event):
 
 
-        num_modes_modal_force = 3
+        num_modes_modal_force = min(3, self.routine.latent_dim)
 
         if self.current_substep == 0: # Start of a new main step
             rest_pos = self.MO1.rest_position.value
@@ -264,7 +264,7 @@ class AnimationStepController(Sofa.Core.Controller):
                                name="CFF_Exact_Modal",
                                indices=self.force_roi_indices_exact.tolist(), # Use stored indices
                                forces=forces_for_roi_exact_nodes.tolist(), # Apply per-node forces
-                               showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
+                               showArrowSize=1, showColor="0.2 0.2 0.8 1")
             if self.cff_exact: self.cff_exact.init()
 
             # Linear Solution
@@ -297,6 +297,15 @@ class AnimationStepController(Sofa.Core.Controller):
                 self.all_z_coords.append(z_actual_sofa.copy()) # Store z_actual
             print(f"  Random z pattern norm: {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}, Actual z norm: {np.linalg.norm(z_actual_sofa):.4f}")
             print(f"  Random z components (first few): {self.current_applied_z[:min(len(self.current_applied_z),5)]}")
+            self.routine.eigenvalues
+            # Divide current_applied_z by eigenvalues
+            if self.routine.eigenvalues is not None:
+                num_eigenvalues_to_use = min(len(self.routine.eigenvalues), len(self.current_applied_z))
+                eigenvalues_truncated = self.routine.eigenvalues[:num_eigenvalues_to_use]
+                z_scaled = self.current_applied_z[:num_eigenvalues_to_use] / eigenvalues_truncated
+                print(f"  Scaled z components (first few): {z_scaled[:min(len(z_scaled),5)]}")
+            else:
+                print("  Eigenvalues not available, cannot scale z.")
             print(f"  Actual z components (first few): {z_actual_sofa[:min(len(z_actual_sofa),5)]}")
 
             sofa_linear_energy = float('nan')

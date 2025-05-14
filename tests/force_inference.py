@@ -24,6 +24,7 @@ from training.train import setup_logger, Net, load_config, Routine
 
 import traceback
 
+#notes: select one mode (first one), -
 
 class ForceInferenceModel(torch.nn.Module):
     """Neural network that infers forces from latent vector"""

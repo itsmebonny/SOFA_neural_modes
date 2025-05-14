@@ -2128,3 +2128,241 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
             deformation_gradients[:, q_idx, :, :] = F
 
         return deformation_gradients
+
+
+# --- Boundary Condition Managers (from your example, can be kept separate) ---
+class BoundaryConditionManager:
+    """Manages boundary conditions for FEM problems"""
+    def __init__(self, device=None):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fixed_dofs = torch.tensor([], dtype=torch.long, device=self.device)
+        self.fixed_values = torch.tensor([], dtype=torch.float, device=self.device)
+
+    def set_fixed_dofs(self, indices, values):
+        self.fixed_dofs = indices.to(self.device) if isinstance(indices, torch.Tensor) else torch.tensor(indices, dtype=torch.long, device=self.device)
+        self.fixed_values = values.to(self.device) if isinstance(values, torch.Tensor) else torch.tensor(values, dtype=torch.float, device=self.device)
+
+    def apply(self, displacement_batch):
+        if self.fixed_dofs.numel() == 0:
+            return displacement_batch
+        u_batch_fixed = displacement_batch.clone()
+        batch_size = displacement_batch.shape[0]
+        batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, self.fixed_dofs.numel())
+        flat_batch_indices = batch_indices.reshape(-1)
+        repeated_dofs = self.fixed_dofs.repeat(batch_size)
+        u_batch_fixed[flat_batch_indices, repeated_dofs] = self.fixed_values.repeat(batch_size)
+        return u_batch_fixed
+
+class SmoothBoundaryConditionManager:
+    """Manages boundary conditions for FEM problems with smooth enforcement via penalty"""
+    def __init__(self, device=None, penalty_strength=1e3):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fixed_dofs = torch.tensor([], dtype=torch.long, device=self.device)
+        self.fixed_values = torch.tensor([], dtype=torch.float, device=self.device)
+        self.penalty_strength = penalty_strength
+
+    def set_fixed_dofs(self, indices, values):
+        self.fixed_dofs = indices.to(self.device) if isinstance(indices, torch.Tensor) else torch.tensor(indices, dtype=torch.long, device=self.device)
+        self.fixed_values = values.to(self.device) if isinstance(values, torch.Tensor) else torch.tensor(values, dtype=torch.float, device=self.device)
+
+    def apply(self, displacement_batch):
+        return displacement_batch
+
+    def compute_penalty_energy(self, displacement_batch):
+        if self.fixed_dofs.numel() == 0:
+            return torch.zeros(displacement_batch.shape[0], device=self.device, dtype=displacement_batch.dtype)
+        batch_size = displacement_batch.shape[0]
+        batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, self.fixed_dofs.numel())
+        flat_batch_indices = batch_indices.reshape(-1)
+        repeated_dofs = self.fixed_dofs.repeat(batch_size)
+        repeated_values = self.fixed_values.repeat(batch_size)
+        actual_values = displacement_batch[flat_batch_indices, repeated_dofs]
+        squared_diff = torch.pow(actual_values - repeated_values, 2)
+        squared_diff = squared_diff.reshape(batch_size, -1)
+        penalty_energy = self.penalty_strength * squared_diff.sum(dim=1)
+        return penalty_energy
+
+# ==============================================================================
+# Custom Autograd Function for Implicit Differentiation (No Visualization)
+# ==============================================================================
+class FEMSolverFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, f_ext, solver_instance): # Removed disp_gt_subset
+        if not f_ext.requires_grad:
+            with torch.no_grad():
+                 f_ext_detached = f_ext.clone()
+                 u_star = solver_instance._solve_with_lbfgs_internal(f_ext_detached, u0=None)
+            return u_star
+        else:
+            f_ext_detached = f_ext.detach().clone()
+            u_star = solver_instance._solve_with_lbfgs_internal(f_ext_detached, u0=None)
+            ctx.solver_instance = solver_instance
+            ctx.save_for_backward(u_star, f_ext_detached)
+            return u_star
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        solver_instance = ctx.solver_instance
+        u_star_saved, f_ext_detached = ctx.saved_tensors
+
+        if grad_output is None:
+            return None, None # Adjusted for removed disp_gt_subset
+
+        batch_size = grad_output.shape[0]
+        adjoint_solutions = []
+
+        def hvp_at_ustar(v, u_star_current_batch):
+            v_detached = v.detach()
+            with torch.enable_grad():
+                u_star_input = u_star_current_batch.detach().clone().requires_grad_(True)
+                f_int_total_for_hvp = solver_instance.energy_model.compute_gradient(u_star_input)
+            hvp_result, = torch.autograd.grad(
+                outputs=f_int_total_for_hvp,
+                inputs=u_star_input,
+                grad_outputs=v_detached,
+                retain_graph=False,
+                create_graph=False
+            )
+            return hvp_result
+
+        for i in range(batch_size):
+            grad_output_i = grad_output[i:i+1]
+            u_star_i = u_star_saved[i:i+1]
+            hvp_func_for_cg = lambda vec: hvp_at_ustar(vec, u_star_i)
+            v = solver_instance._solve_linear_system_cg(
+                hvp_function=hvp_func_for_cg,
+                rhs=grad_output_i,
+                max_iter=solver_instance.cg_max_iter_backward,
+                tol=solver_instance.cg_tol_backward
+            )
+            adjoint_solutions.append(v)
+        grad_f_ext = torch.cat(adjoint_solutions, dim=0)
+        return grad_f_ext, None # Adjusted for removed disp_gt_subset
+
+# ==============================================================================
+# Differentiable Solver Class (L-BFGS Forward, No Visualization)
+# ==============================================================================
+class DifferentiableFEMSolverIFT(torch.nn.Module):
+    def __init__(self, energy_model: EnergyModel,
+                 lbfgs_max_iter=50, lbfgs_tolerance_grad=1e-5, lbfgs_tolerance_change=1e-7, lbfgs_lr=1.0, lbfgs_history_size=100,
+                 cg_max_iter_backward=300, cg_tol_backward=1e-6,
+                 verbose=False):
+        super().__init__()
+        self.energy_model = energy_model
+        self.verbose = verbose
+        self.device = energy_model.device
+        self.dtype = energy_model.dtype
+
+        if not all(hasattr(energy_model, attr) for attr in ['num_nodes', 'dim', 'device', 'dtype', 'compute_gradient', 'compute_energy']):
+             raise AttributeError("energy_model must have 'num_nodes', 'dim', 'device', 'dtype', 'compute_gradient', 'compute_energy' attributes/methods.")
+        self.num_nodes = energy_model.num_nodes
+        self.dim = energy_model.dim
+        self.dof_count = self.num_nodes * self.dim
+
+        self.lbfgs_max_iter = lbfgs_max_iter
+        self.lbfgs_tolerance_grad = lbfgs_tolerance_grad
+        self.lbfgs_tolerance_change = lbfgs_tolerance_change
+        self.lbfgs_lr = lbfgs_lr
+        self.lbfgs_history_size = lbfgs_history_size
+
+        self.cg_max_iter_backward = cg_max_iter_backward
+        self.cg_tol_backward = cg_tol_backward
+
+    def forward(self, external_forces): # Removed disp_gt_subset
+        return FEMSolverFunction.apply(external_forces, self) # Pass self as solver_instance
+
+    def _solve_with_lbfgs_internal(self, external_forces_detached, u0=None): # Removed disp_gt_subset_for_viz
+        batch_size = external_forces_detached.shape[0]
+        solutions = []
+
+        for i in range(batch_size):
+            if self.verbose and batch_size > 1: print(f"\n--- LBFGS Solve: Sample {i+1}/{batch_size} ---")
+            f_i_detached = external_forces_detached[i:i+1]
+
+            if u0 is None:
+                current_u_i = torch.randn_like(f_i_detached) * 1e-5
+            else:
+                current_u_i = u0[i:i+1].detach().clone()
+            current_u_i.requires_grad_(True)
+
+            optimizer = torch.optim.LBFGS([current_u_i],
+                                    lr=self.lbfgs_lr,
+                                    max_iter=self.lbfgs_max_iter,
+                                    history_size=self.lbfgs_history_size,
+                                    tolerance_grad=self.lbfgs_tolerance_grad,
+                                    tolerance_change=self.lbfgs_tolerance_change,
+                                    line_search_fn="strong_wolfe")
+            def closure():
+                optimizer.zero_grad()
+                internal_energy_val = self.energy_model.compute_energy(current_u_i)
+                external_work_val = torch.sum(f_i_detached * current_u_i)
+                total_potential_energy_val = internal_energy_val - external_work_val
+                total_potential_energy_val.backward()
+                return total_potential_energy_val
+            try:
+                optimizer.step(closure)
+            except Exception as e:
+                print(f"LBFGS optimization failed for sample {i}: {e}")
+                solutions.append(current_u_i.detach().clone())
+                continue
+
+            final_loss = closure() # Re-evaluate to get final state
+            if self.verbose:
+                grad_norm = current_u_i.grad.norm().item() if current_u_i.grad is not None else float('nan')
+                print(f"Sample {i}: LBFGS finished. Final Potential Energy = {final_loss.item():.3e}, Grad Norm = {grad_norm:.3e}")
+            solutions.append(current_u_i.detach().clone())
+
+        if not solutions:
+            return torch.empty((0, self.dof_count), device=self.device, dtype=self.dtype)
+        final_solutions = torch.cat(solutions, dim=0)
+        return final_solutions
+
+    def _solve_linear_system_cg(self, hvp_function, rhs, max_iter, tol):
+        with torch.no_grad():
+            x = torch.zeros_like(rhs)
+            r = rhs.clone()
+            p = r.clone()
+            rsold_sq = torch.dot(r.flatten(), r.flatten())
+            rsinit_norm = torch.sqrt(rsold_sq).item()
+            if self.verbose and self.verbose > 1 : print(f"CG Start: Initial ||Residual|| = {rsinit_norm:.3e}, Max Iter = {max_iter}, Tol = {tol:.1e}")
+
+            if rsinit_norm < 1e-15:
+                if self.verbose and self.verbose > 1: print("CG: Initial residual near zero. Returning zero solution.")
+                return x
+            best_x = x.clone()
+            min_residual_norm_sq = rsold_sq.item()
+
+            for i_cg in range(max_iter):
+                try:
+                    Ap = hvp_function(p)
+                except Exception as e:
+                    print(f"CG Error: HVP computation failed at iteration {i_cg}: {e}")
+                    return best_x
+                if torch.isnan(Ap).any() or torch.isinf(Ap).any():
+                    print(f"CG Error: NaN/Inf in HVP result at iter {i_cg}.")
+                    return best_x
+                pAp_dot = torch.dot(p.flatten(), Ap.flatten())
+                if pAp_dot <= 1e-12 * torch.dot(p.flatten(), p.flatten()):
+                    if self.verbose and self.verbose > 1: print(f"CG Warning: Breakdown at iter {i_cg} (p^T*A*p = {pAp_dot.item():.3e}). Returning best solution.")
+                    return best_x
+                alpha = rsold_sq / pAp_dot
+                x.add_(p, alpha=alpha)
+                r.add_(Ap, alpha=-alpha)
+                rsnew_sq = torch.dot(r.flatten(), r.flatten())
+                current_residual_norm = torch.sqrt(rsnew_sq).item()
+                if rsnew_sq.item() < min_residual_norm_sq:
+                    min_residual_norm_sq = rsnew_sq.item()
+                    best_x = x.clone()
+                if current_residual_norm < tol * rsinit_norm:
+                    if self.verbose and self.verbose > 1: print(f"CG Converged at iteration {i_cg+1}. Final Rel Residual = {current_residual_norm / rsinit_norm:.3e}")
+                    break
+                beta = rsnew_sq / rsold_sq
+                p = r + beta * p
+                rsold_sq = rsnew_sq
+                if self.verbose and self.verbose > 1 and (i_cg + 1) % 50 == 0:
+                     print(f"CG Iter {i_cg+1}: Rel Residual = {current_residual_norm / rsinit_norm:.3e}")
+            else:
+                if self.verbose and self.verbose > 1: print(f"CG Warning: Max iterations ({max_iter}) reached. Final Rel Residual = {current_residual_norm / rsinit_norm:.3e}")
+                x = best_x
+            if self.verbose and self.verbose > 1: print(f"CG End: ||Solution|| = {torch.linalg.norm(x).item():.3e}")
+            return x

@@ -63,7 +63,7 @@ def load_simulation_data(data_directory):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize Z plausibility simulation data.")
-    parser.add_argument("--data_dir", type=str, default="z_debug/10_modes/z_amplitude_50.0",
+    parser.add_argument("--data_dir", type=str, default="z_debug/10_modes/z_amplitude_30.0",
                         help="Path to the specific z_amplitude_{scale} directory containing step data.")
     parser.add_argument("--mesh_path", type=str, default="mesh/beam_732.msh",
                         help="Path to the original .msh mesh file.")

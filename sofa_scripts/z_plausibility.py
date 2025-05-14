@@ -61,7 +61,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.linear_modes_np = None 
         self.latent_dim = 0       
         self.current_z_for_step = None 
-        self.z_scale_factor = kwargs.get('z_scale_factor', 50.0) # New configurable scale factor for z
+        self.z_scale_factor = kwargs.get('z_scale_factor', 30.0) # New configurable scale factor for z
         print(f"Using Z scale factor: {self.z_scale_factor}")
 
         self.output_subdir = "z_plausibility_analysis"

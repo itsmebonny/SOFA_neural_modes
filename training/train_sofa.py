@@ -731,7 +731,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 15
+                deformation_scale_final = 300
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -742,34 +742,34 @@ class Routine:
                 
                 # mode_scales = mode_scales * current_scale
 
-                # --- New Logistic Decay for Z sampling range ---
-                # current_scale is the max amplitude for the first mode
-                # Hyperparameters for logistic decay:
-                min_amplitude_factor = 0.05  # Min amplitude as a factor of current_scale (e.g., 5%)
-                inflection_point_mode_ratio = 0.1 # Decay is sharpest around this fraction of modes (e.g., first 10%)
-                decay_steepness = 1.0 # Controls how sharp the decay is. Higher is sharper.
+                # # --- New Logistic Decay for Z sampling range ---
+                # # current_scale is the max amplitude for the first mode
+                # # Hyperparameters for logistic decay:
+                # min_amplitude_factor = 0.05  # Min amplitude as a factor of current_scale (e.g., 5%)
+                # inflection_point_mode_ratio = 0.1 # Decay is sharpest around this fraction of modes (e.g., first 10%)
+                # decay_steepness = 1.0 # Controls how sharp the decay is. Higher is sharper.
 
-                max_amplitude_mode0 = current_scale
-                min_amplitude_higher_modes = max_amplitude_mode0 * min_amplitude_factor
+                # max_amplitude_mode0 = current_scale
+                # min_amplitude_higher_modes = max_amplitude_mode0 * min_amplitude_factor
                 
-                mode_indices = torch.arange(L, device=self.device, dtype=torch.float64)
-                inflection_point_abs = L * inflection_point_mode_ratio
+                # mode_indices = torch.arange(L, device=self.device, dtype=torch.float64)
+                # inflection_point_abs = L * inflection_point_mode_ratio
                 
-                # Logistic decay formula: Min + (Max - Min) / (1 + exp(steepness * (x - x0)))
-                # This creates a decay from Max down to Min
-                exponent_term = decay_steepness * (mode_indices - inflection_point_abs)
-                logistic_decay_value = 1.0 / (1.0 + torch.exp(exponent_term))
+                # # Logistic decay formula: Min + (Max - Min) / (1 + exp(steepness * (x - x0)))
+                # # This creates a decay from Max down to Min
+                # exponent_term = decay_steepness * (mode_indices - inflection_point_abs)
+                # logistic_decay_value = 1.0 / (1.0 + torch.exp(exponent_term))
                 
-                individual_mode_scales = min_amplitude_higher_modes + \
-                                         (max_amplitude_mode0 - min_amplitude_higher_modes) * logistic_decay_value
-                # --- End of New Logistic Decay ---
+                # individual_mode_scales = min_amplitude_higher_modes + \
+                #                          (max_amplitude_mode0 - min_amplitude_higher_modes) * logistic_decay_value
+                # # --- End of New Logistic Decay ---
                 
                 # Generate random samples in [-1, 1]
                 z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
                 
                 # Apply the decaying scales
                 # Unsqueeze individual_mode_scales to (1, L) for broadcasting with (batch_size, L)
-                z = z_unit_range * individual_mode_scales.unsqueeze(0)
+                z = z_unit_range * current_scale
                 
                 # Ensure the rest shape (if used) has zero latent activation
                 #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
@@ -889,7 +889,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 0.0 * ortho + 1e3 * bc_penalty 
+                    loss = energy + 1e3 * ortho + 1e3 * bc_penalty 
 
                     loss.backward()
 
