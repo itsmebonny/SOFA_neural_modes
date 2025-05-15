@@ -731,7 +731,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 1200
+                deformation_scale_final = 300
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 

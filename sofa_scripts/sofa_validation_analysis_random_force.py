@@ -206,7 +206,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
             # --- Generate a new random direction for this main step ---
-            random_vec = np.random.randn(3) # Generate random vector from normal distribution
+            random_vec = [0, np.sqrt(2)/2, np.sqrt(2)/2] #np.random.randn(3) # Generate random vector from normal distribution
             norm = np.linalg.norm(random_vec)
             if norm < 1e-9: # Avoid division by zero if vector is near zero
                 self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction

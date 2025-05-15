@@ -6,6 +6,7 @@ import glob
 import argparse
 
 import torch # NEW
+import pyvista 
 
 # --- Imports for loading the model and config ---
 import sys
@@ -14,6 +15,8 @@ try:
     # or that SOFA_neural_modes directory is in PYTHONPATH.
     from training.train_sofa import Routine, ResidualNet, load_config 
     # SOFANeoHookeanModel will be imported by Routine from tests.solver
+    # Import the AnimationStepController to access computeInternalEnergy
+    from sofa_scripts.sofa_validation_analysis_modal_force import AnimationStepController
 except ImportError as e:
     print(f"ImportError: {e}. Attempting to add project root to sys.path.")
     # Try to add the parent directory of 'tests' to sys.path if script is in 'tests'
@@ -23,6 +26,7 @@ except ImportError as e:
     sys.path.insert(0, project_root_candidate)
     try:
         from training.train_sofa import Routine, ResidualNet, load_config
+        from sofa_scripts.sofa_validation_analysis_modal_force import AnimationStepController
     except ImportError as e2:
         print(f"Failed to import Routine, ResidualNet, load_config even after path adjustment: {e2}")
         print("Please ensure that the SOFA_neural_modes project directory is in your PYTHONPATH,")
@@ -58,6 +62,17 @@ def load_simulation_data(data_directory):
             
             step_number = step_meta.get("step")
             displacement_filename = step_meta.get("displacement_file")
+            rest_position_filename = step_meta.get("rest_position_file")
+            if rest_position_filename is None:
+                print(f"Warning: Skipping {json_file_path}, missing 'rest_position_file' key.")
+                continue
+
+            rest_position_path = os.path.join(data_directory, rest_position_filename)
+            if not os.path.exists(rest_position_path):
+                print(f"Warning: Rest position file not found for step {step_number}: {rest_position_path}")
+                continue
+            
+            rest_position_array = np.load(rest_position_path)
 
             if step_number is None or displacement_filename is None:
                 print(f"Warning: Skipping {json_file_path}, missing 'step' or 'displacement_file' key.")
@@ -76,7 +91,8 @@ def load_simulation_data(data_directory):
                 "energy": step_meta.get("energy"),
                 "volume": step_meta.get("volume"),
                 "z_scale_factor": step_meta.get("z_scale_factor"),
-                "displacement": displacement_array
+                "displacement": displacement_array,
+                "rest_position": rest_position_array
             })
         except Exception as e:
             print(f"Error loading data for {json_file_path}: {e}")
@@ -86,6 +102,25 @@ def load_simulation_data(data_directory):
     print(f"Loaded data for {len(all_step_data)} steps from {data_directory}")
     return all_step_data
 
+def create_pyvista_grid(coordinates_np, elements_np):
+    """Creates a PyVista UnstructuredGrid from NumPy arrays."""
+    num_elements = elements_np.shape[0]
+    nodes_per_elem = elements_np.shape[1]
+
+    if nodes_per_elem == 4:  # Linear Tetrahedron
+        cell_type = pyvista.CellType.TETRA
+        cells = np.hstack((np.full((num_elements, 1), 4), elements_np)).flatten()
+    elif nodes_per_elem == 8:  # Linear Hexahedron
+        cell_type = pyvista.CellType.HEXAHEDRON
+        cells = np.hstack((np.full((num_elements, 1), 8), elements_np)).flatten()
+    elif nodes_per_elem == 10:  # Quadratic Tetrahedron
+        cell_type = pyvista.CellType.QUADRATIC_TETRA
+        cells = np.hstack((np.full((num_elements, 1), 10), elements_np)).flatten()
+    else:
+        raise ValueError(f"Unsupported element type for visualization: {nodes_per_elem} nodes")
+
+    grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, coordinates_np)
+    return grid
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize Z plausibility simulation data using a trained Neural Network.")
@@ -97,7 +132,7 @@ def main():
                         help="Path to the training configuration YAML file.")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/best_sofa.pt", # NEW
                         help="Path to the trained model checkpoint (.pt file).")
-    parser.add_argument("--gif_path", type=str, default="z_debug/1_modes/output.gif", # Default to None
+    parser.add_argument("--gif_path", type=str, default=None,#"z_debug/1_modes/output.gif", # Default to None
                         help="Optional path to save the animation as a GIF.")
     parser.add_argument("--fps", type=int, default=1,
                         help="Frames per second for the GIF.")
@@ -112,8 +147,6 @@ def main():
 
     if not os.path.isdir(args.data_dir):
         print(f"Error: Data directory not found: {args.data_dir}"); return
-    if not os.path.isfile(args.mesh_path):
-        print(f"Error: Mesh file not found: {args.mesh_path}"); return
     if not os.path.isfile(args.config_path):
         print(f"Error: Config file not found: {args.config_path}"); return
     # Checkpoint path is optional if user wants to see untrained model (though less useful)
@@ -138,24 +171,33 @@ def main():
         print("Proceeding with the (potentially untrained) model initialized by Routine.")
         print("The visualization will show the model's current state.")
 
-    # Load the original mesh
+    # --- Load Mesh Data from Routine ---
     try:
-        original_mesh = pv.read(args.mesh_path)
-        if not isinstance(original_mesh, pv.UnstructuredGrid):
-            original_mesh = original_mesh.cast_to_unstructured_grid()
-        print(f"Successfully loaded mesh: {args.mesh_path} with {original_mesh.n_points} points and {original_mesh.n_cells} cells.")
-        original_points = original_mesh.points.copy()
-        if original_points.shape[0] * original_points.shape[1] != engine.output_dim:
-            print(f"Error: Mesh DOFs ({original_points.shape[0] * original_points.shape[1]}) "
-                  f"do not match model output dimension ({engine.output_dim}).")
-            return
+        coordinates_np = engine.coordinates_np
+        elements_np = engine.elements_np
+        original_mesh = create_pyvista_grid(coordinates_np, elements_np)
+        original_points = coordinates_np.copy()  # Use the loaded coordinates
+        print(f"Successfully loaded mesh data from Routine.")
     except Exception as e:
-        print(f"Error loading mesh {args.mesh_path}: {e}"); return
+        print(f"Error loading mesh data from Routine: {e}")
+        return
+
+    if original_points.shape[0] * original_points.shape[1] != engine.output_dim:
+        print(f"Error: Mesh DOFs ({original_points.shape[0] * original_points.shape[1]}) "
+              f"do not match model output dimension ({engine.output_dim}).")
+        return
 
     # Load simulation step metadata (z_coords, etc.)
     simulation_steps_metadata = load_simulation_data(args.data_dir)
     if not simulation_steps_metadata:
         print("No simulation metadata loaded. Exiting."); return
+
+    # --- Create an instance of AnimationStepController ---
+    # We only need the computeInternalEnergy method, so we don't need a full SOFA scene
+    dummy_root = None  # No SOFA scene needed
+    controller = AnimationStepController(dummy_root)
+    controller.routine = engine # Pass the engine to the controller
+    print("AnimationStepController initialized for energy calculation.")
 
     # --- Pre-computation pass for displacements using the NN and for color limits ---
     all_predicted_displacements_for_clim_calc = []
@@ -186,6 +228,7 @@ def main():
             u_linear = torch.einsum('l,dl->d', z_tensor, active_linear_modes) # More explicit: z_l * A_dl -> u_d
             u_correction = engine.model(z_tensor) # model output is [num_dofs]
             u_total_tensor = u_linear + u_correction
+            print(f"  Percent of correction: {torch.norm(u_correction) / torch.norm(u_linear) * 100:.2f}%")
         
         predicted_displacement_np = u_total_tensor.cpu().numpy()
         computed_displacements_for_animation.append(predicted_displacement_np)
@@ -268,6 +311,11 @@ def main():
             
         deformed_mesh = original_mesh.copy()
         deformed_mesh.points = original_points + displacement_reshaped
+
+        linear_displacement = step_meta["displacement"]
+        if linear_displacement is not None:
+            print(f"  Mse between linear and NN displacement: {np.mean((linear_displacement.flatten() - displacement_reshaped.flatten())**2):.4e}")
+
         
         disp_magnitude = np.linalg.norm(displacement_reshaped, axis=1)
         deformed_mesh["Displacement Magnitude"] = disp_magnitude
@@ -276,24 +324,37 @@ def main():
         plotter.add_mesh(deformed_mesh, scalars="Displacement Magnitude", cmap="viridis", clim=clim,
                          show_edges=False, scalar_bar_args={'title': 'Disp. Mag.'})
 
+        # Compute energy and volume using the routine's energy calculator
+        # Note: Ensure the deformed_mesh.points are correctly set before calling these
+        original_mesh_np = step_meta.get("rest_position")
+        deformed_mesh_np = original_mesh_np + displacement_reshaped 
+        # deformed_mesh_points_tensor = torch.tensor(deformed_mesh_np, device=engine.device)
+        # energy_val = engine.energy_calculator(deformed_mesh_points_tensor.unsqueeze(0)).item()  # Add batch dimension
+        # volume_val = engine.energy_calculator._compute_deformed_volume(deformed_mesh_points_tensor).item()
+
+        # Use the computeInternalEnergy function from AnimationStepController
+        energy_val = controller.computeInternalEnergy(deformed_mesh_np)
+        # volume_val = engine.energy_calculator._compute_deformed_volume(deformed_mesh_points_tensor).item() # No volume in AnimationStepController
+
         # Add text annotations from metadata
-        energy_val = step_meta.get('energy', float('nan'))
-        volume_val = step_meta.get('volume', float('nan'))
+        z_scale_val = step_meta.get('z_scale_factor', float('nan'))
+        z_coords_val = step_meta.get('z_coords', [])
         z_scale_val = step_meta.get('z_scale_factor', float('nan'))
         z_coords_val = step_meta.get('z_coords', [])
 
         energy_color = "red" if not np.isnan(energy_val) and energy_val > 500 else "green" # Example condition
-        volume_color = "green" if not np.isnan(volume_val) and 0.95 <= (volume_val / (engine.energy_calculator._compute_mesh_volume().item() + 1e-9)) <= 1.05 else "red" # Example condition
+        # volume_color = "green" if not np.isnan(volume_val) and 0.95 <= (volume_val / (engine.energy_calculator._compute_mesh_volume().item() + 1e-9)) <= 1.05 else "red" # Example condition
+        volume_color = "white" # No volume calculation
 
         plotter.add_text(f"Step: {current_step_number}", position="upper_left", font_size=10, color="black", shadow=True)
-        plotter.add_text(f"Energy (NN): {energy_val:.2e}", position=[0.02, 0.92], font_size=10, color=energy_color, shadow=True, viewport=True)
-        plotter.add_text(f"Volume (NN): {volume_val:.3f}", position=[0.02, 0.88], font_size=10, color=volume_color, shadow=True, viewport=True)
+        plotter.add_text(f"Energy (NN): {energy_val:.2f}", position=[0.02, 0.92], font_size=10, color=energy_color, shadow=True, viewport=True)
+        # plotter.add_text(f"Volume (NN): {volume_val:.2f}", position=[0.02, 0.88], font_size=10, color=volume_color, shadow=True, viewport=True)
         plotter.add_text(f"Z-Scale (NN): {z_scale_val:.2f}", position=[0.02, 0.84], font_size=10, color="black", shadow=True, viewport=True)
         
         z_coords_str = "N/A"
         if z_coords_val:
             z_coords_str = np.array2string(np.array(z_coords_val), precision=2, floatmode='fixed', max_line_width=30, threshold=engine.latent_dim +1)
-        plotter.add_text(f"Z (meta): {z_coords_str}", position=[0.02, 0.76], font_size=8, color="black", shadow=True, viewport=True)
+        plotter.add_text(f"Z (Coords): {z_coords_str}", position=[0.02, 0.76], font_size=8, color="black", shadow=True, viewport=True)
 
 
         if args.interactive and not off_screen_plotting:
@@ -355,7 +416,6 @@ if __name__ == "__main__":
     # Example usage:
     # python tests/z_visualization_NN.py \
     #   --data_dir z_debug/10_modes/z_amplitude_10.0 \
-    #   --mesh_path mesh/beam_732.msh \
     #   --config_path configs/default.yaml \
     #   --checkpoint_path checkpoints/best_sofa.pt \
     #   --gif_path z_debug/10_modes/output_nn_animation.gif \

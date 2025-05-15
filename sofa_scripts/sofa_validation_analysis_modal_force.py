@@ -70,7 +70,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- New parameter for scaling modal coordinates 'z' ---
-        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 10) # Tune this value
+        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 1) # Tune this value
         print(f"Max Z Amplitude Scale (for random z generation): {self.max_z_amplitude_scale}")
         # --- End New Parameter ---
         
@@ -314,7 +314,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 num_eigenvalues_to_use = min(len(self.routine.eigenvalues), len(self.current_applied_z))
                 eigenvalues_truncated = self.routine.eigenvalues[:num_eigenvalues_to_use]
                 safe_eigenvalues = np.where(np.abs(eigenvalues_truncated) < 1e-9, 1e-9, eigenvalues_truncated)
-                z_scaled = self.current_applied_z[:num_eigenvalues_to_use] / safe_eigenvalues
+                z_scaled = self.current_applied_z[:num_eigenvalues_to_use] / np.sqrt(safe_eigenvalues)
                 self.scaled_z0_vals.append(float(z_scaled[0]) if len(z_scaled) > 0 else np.nan)
                 print(f"  Scaled z components (first few): {z_scaled[:min(len(z_scaled),5)]}")
             else:

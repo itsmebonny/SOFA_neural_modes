@@ -179,6 +179,11 @@ class AnimationStepController(Sofa.Core.Controller):
             disp_filename = os.path.join(z_amplitude_data_dir, f"step_{step_number}_displacement.npy")
             np.save(disp_filename, displacement)
 
+            rest_position = self.MO1.rest_position.value
+            # Save rest position as .npy
+            rest_filename = os.path.join(z_amplitude_data_dir, f"step_{step_number}_rest_position.npy")
+            np.save(rest_filename, rest_position)
+
             # Prepare data for JSON
             # self.current_z_for_step was set in onAnimateBeginEvent
             step_data = {
@@ -187,7 +192,8 @@ class AnimationStepController(Sofa.Core.Controller):
                 "energy": energy,
                 "volume": volume,
                 "z_scale_factor": self.z_scale_factor,
-                "displacement_file": os.path.basename(disp_filename) # Relative path to displacement
+                "displacement_file": os.path.basename(disp_filename), # Relative path to displacement
+                "rest_position_file": os.path.basename(rest_filename) # Relative path to rest position
             }
 
             # Save other data as .json
