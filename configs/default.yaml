@@ -16,10 +16,10 @@ physics:
   dt: 0.01
   rayleigh_stiffness: 0.1
   rayleigh_mass: 0.1
-  solver_iterations: 50000
-  solver_tolerance: 1e-5
-  solver_threshold: 1e-5
-  num_substeps: 100 # Added for substep logic
+  solver_iterations: 1000
+  solver_tolerance: 1e-4
+  solver_threshold: 1e-4
+  num_substeps: 200 # Added for substep logic
 
 simulation:
   steps: 1 # Default number of main steps

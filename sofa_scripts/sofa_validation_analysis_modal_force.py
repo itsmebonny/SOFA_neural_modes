@@ -61,14 +61,16 @@ class AnimationStepController(Sofa.Core.Controller):
 
         self.substep_results = []
         self.all_z_coords = []    # Stores numpy arrays of actual modal coordinates (z_actual) from SOFA solution
-
+        self.z0_vals = []
+        self.scaled_z0_vals = []
+        self.actual_z0_vals = []        
         self.num_substeps = kwargs.get('num_substeps', 1)
         self.current_substep = 0
         self.current_main_step = 0
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- New parameter for scaling modal coordinates 'z' ---
-        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 10.0) # Tune this value
+        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 10) # Tune this value
         print(f"Max Z Amplitude Scale (for random z generation): {self.max_z_amplitude_scale}")
         # --- End New Parameter ---
         
@@ -286,6 +288,11 @@ class AnimationStepController(Sofa.Core.Controller):
 
     def onAnimateEndEvent(self, event):
         try:
+            if self.current_applied_z is not None and len(self.current_applied_z) > 0:
+                self.z0_vals.append(float(self.current_applied_z[0]))
+            else:
+                self.z0_vals.append(np.nan)
+
             # current_force_magnitude is now self.last_applied_force_magnitude (norm of Phi*z)
             real_solution = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
             linear_solution = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
@@ -293,18 +300,25 @@ class AnimationStepController(Sofa.Core.Controller):
 
             # Compute actual modal coordinates from SOFA's real solution
             z_actual_sofa = self.computeModalCoordinates(linear_solution) # This is z_actual
+            if z_actual_sofa is not None and len(z_actual_sofa) > 0:
+                self.actual_z0_vals.append(float(z_actual_sofa[0]))
+            else:
+                self.actual_z0_vals.append(np.nan)
             if z_actual_sofa is not None and not np.isnan(z_actual_sofa).any():
                 self.all_z_coords.append(z_actual_sofa.copy()) # Store z_actual
             print(f"  Random z pattern norm: {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}, Actual z norm: {np.linalg.norm(z_actual_sofa):.4f}")
             print(f"  Random z components (first few): {self.current_applied_z[:min(len(self.current_applied_z),5)]}")
             self.routine.eigenvalues
             # Divide current_applied_z by eigenvalues
-            if self.routine.eigenvalues is not None:
+            if self.routine.eigenvalues is not None and self.current_applied_z is not None:
                 num_eigenvalues_to_use = min(len(self.routine.eigenvalues), len(self.current_applied_z))
                 eigenvalues_truncated = self.routine.eigenvalues[:num_eigenvalues_to_use]
-                z_scaled = self.current_applied_z[:num_eigenvalues_to_use] / eigenvalues_truncated
+                safe_eigenvalues = np.where(np.abs(eigenvalues_truncated) < 1e-9, 1e-9, eigenvalues_truncated)
+                z_scaled = self.current_applied_z[:num_eigenvalues_to_use] / safe_eigenvalues
+                self.scaled_z0_vals.append(float(z_scaled[0]) if len(z_scaled) > 0 else np.nan)
                 print(f"  Scaled z components (first few): {z_scaled[:min(len(z_scaled),5)]}")
             else:
+                self.scaled_z0_vals.append(np.nan)
                 print("  Eigenvalues not available, cannot scale z.")
             print(f"  Actual z components (first few): {z_actual_sofa[:min(len(z_actual_sofa),5)]}")
 
@@ -336,6 +350,7 @@ class AnimationStepController(Sofa.Core.Controller):
                     z_actual_sofa_flat = z_actual_sofa.flatten() # Or handle error if shape is unexpected
                 else:
                     z_actual_sofa_flat = z_actual_sofa
+
 
                 z_for_nn_th = torch.tensor(z_actual_sofa_flat, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
                 # Ensure modes_to_use matches the latent_dim of z_actual_sofa
@@ -415,10 +430,10 @@ class AnimationStepController(Sofa.Core.Controller):
                     print(f"  Error during prediction processing/reshaping/error calc: {e}")
             
             if self.original_positions is not None:
-                print("  Debug: original_positions is not None. Updating visualization MOs.")
+                # print("  Debug: original_positions is not None. Updating visualization MOs.")
                 rest_pos = self.original_positions
                 if self.MO_LinearModes is not None and l_th_reshaped_np is not None:
-                    print(f"  Debug: Updating MO_LinearModes.position. l_th_reshaped_np shape: {l_th_reshaped_np.shape}")
+                    # print(f"  Debug: Updating MO_LinearModes.position. l_th_reshaped_np shape: {l_th_reshaped_np.shape}")
                     self.MO_LinearModes.position.value = rest_pos + l_th_reshaped_np
                 elif self.MO_LinearModes is None:
                     print("  Debug: MO_LinearModes is None.")
@@ -428,14 +443,14 @@ class AnimationStepController(Sofa.Core.Controller):
                 if self.visual_LM is not None and l_th_reshaped_np is not None:
                     # This might be redundant if MO_LinearModes directly drives the visual,
                     # but included for completeness if visual_LM has its own position.
-                    print(f"  Debug: Updating visual_LM.position. l_th_reshaped_np shape: {l_th_reshaped_np.shape}")
+                    # print(f"  Debug: Updating visual_LM.position. l_th_reshaped_np shape: {l_th_reshaped_np.shape}")
                     self.visual_LM.position.value = rest_pos + l_th_reshaped_np
                 elif self.visual_LM is None:
                     print("  Debug: visual_LM is None.")
                 # No need for another l_th_reshaped_np is None check if covered by MO_LinearModes
 
                 if self.MO_NeuralPred is not None and u_pred_reshaped_np is not None:
-                    print(f"  Debug: Updating MO_NeuralPred.position. u_pred_reshaped_np shape: {u_pred_reshaped_np.shape}")
+                    # print(f"  Debug: Updating MO_NeuralPred.position. u_pred_reshaped_np shape: {u_pred_reshaped_np.shape}")
                     self.MO_NeuralPred.position.value = rest_pos + u_pred_reshaped_np
                 elif self.MO_NeuralPred is None:
                     print("  Debug: MO_NeuralPred is None.")
@@ -444,7 +459,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
                 if self.visual_NP is not None and u_pred_reshaped_np is not None:
                     # Similar to visual_LM, might be redundant.
-                    print(f"  Debug: Updating visual_NP.position. u_pred_reshaped_np shape: {u_pred_reshaped_np.shape}")
+                    # print(f"  Debug: Updating visual_NP.position. u_pred_reshaped_np shape: {u_pred_reshaped_np.shape}")
                     self.visual_NP.position.value = rest_pos + u_pred_reshaped_np
                 elif self.visual_NP is None:
                     print("  Debug: visual_NP is None.")
@@ -697,6 +712,21 @@ class AnimationStepController(Sofa.Core.Controller):
             plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force_norm.png"))
             plt.close()
 
+            plt.figure(figsize=(10, 6))
+            plt.plot(force_mags_plot, np.abs(self.z0_vals[:len(force_mags_plot)]), label='|z| (First Value)', marker='o')
+            plt.plot(force_mags_plot, np.abs(self.scaled_z0_vals[:len(force_mags_plot)]), label='|z_scaled| (First Value)', marker='x', linestyle='--')
+            plt.plot(force_mags_plot, np.abs(self.actual_z0_vals[:len(force_mags_plot)]), label='|z_actual| (First Value)', marker='s', linestyle=':')
+            plt.xlabel('Applied Force Magnitude (N)')
+            plt.ylabel('|z| (First Value) (log scale)')
+            plt.title('|z|, |z_scaled|, and |z_actual| vs. Applied Force Magnitude')
+            plt.yscale('symlog')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "z_vs_force_magnitude_semilogy.png"))
+            plt.close()
+
+
             print(f"Plots saved to {plot_dir}")
             print("Closing simulation")
 
@@ -841,6 +871,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     # Add system components (similar to exactSolution)
     linearSolution.addObject('StaticSolver', name="ODEsolver",
                            newton_iterations=20,
+                           absolute_residual_tolerance_threshold=1e-5,
+                            relative_residual_tolerance_threshold=1e-5,
                            printLog=True) # Maybe less logging for this one
 
     linearSolution.addObject('CGLinearSolver',

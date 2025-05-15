@@ -513,10 +513,17 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                           threshold=config['physics'].get('solver_threshold', 1e-10), 
                                           warmStart=True)
     
-    fem = exactSolution.addObject('TetrahedronHyperelasticityFEMForceField',
-                                name="FEM", 
-                                materialName="NeoHookean", 
-                                ParameterSet=mu_lam_str)
+    # fem = exactSolution.addObject('TetrahedronHyperelasticityFEMForceField',
+    #                             name="FEM", 
+    #                             materialName="NeoHookean", 
+    #                             ParameterSet=mu_lam_str)
+
+    fem = exactSolution.addObject('TetrahedronFEMForceField', # Store reference
+                           name="LinearFEM",
+                           youngModulus=young_modulus,
+                           poissonRatio=poisson_ratio,
+                           method="small") 
+
                             
     
     # Get constraint box from config
