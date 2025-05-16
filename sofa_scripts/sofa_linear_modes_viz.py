@@ -133,6 +133,8 @@ class AnimationStepController(Sofa.Core.Controller):
         print("Computing mass and stiffness matrices...")
         self.mass_matrix = self.mass.assembleMMatrix()
         self.stiffness_matrix = self.fem.assembleKMatrix()
+
+        global HAS_PETSC_SLEPC
         
         print(f"Mass matrix shape: {self.mass_matrix.shape}")
         print(f"Stiffness matrix shape: {self.stiffness_matrix.shape}")
