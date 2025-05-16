@@ -5,8 +5,8 @@ mesh:
 
 # Material properties
 material:
-  youngs_modulus: 100
-  poissons_ratio: 0.45
+  youngs_modulus: 400000000
+  poissons_ratio: 0.2
   density: 1000
   volume: 10.0
 
@@ -19,7 +19,7 @@ physics:
   solver_iterations: 1000
   solver_tolerance: 1e-4
   solver_threshold: 1e-4
-  num_substeps: 200 # Added for substep logic
+  num_substeps: 50 # Added for substep logic
 
 simulation:
   steps: 1 # Default number of main steps
@@ -30,7 +30,7 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 1
+  latent_dim: 3
   hid_layers: 16
   hid_dim: 64
   use_modal_derivatives: true
