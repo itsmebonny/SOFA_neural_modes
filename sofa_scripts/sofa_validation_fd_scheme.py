@@ -25,6 +25,8 @@ from scipy import sparse
 from scipy.sparse.linalg import eigsh
 
 import matplotlib.pyplot as plt
+import torch.optim as optim # For L-BFGS optimizer
+
 
 
 
@@ -44,6 +46,16 @@ class AnimationStepController(Sofa.Core.Controller):
         self.MO2 = kwargs.get('MO2') # MechObj for linear
         self.linearFEM = kwargs.get('linearFEM') # Linear FEM ForceField
         self.cff_linear = None # Placeholder for linear solution CFF
+
+        self.u_nn_prev_flat_th = None       # Previous NN displacement (DOF vector, PyTorch tensor)
+        self.u_nn_prev_prev_flat_th = None  # Second previous NN displacement (DOF vector, PyTorch tensor)
+        self.z_nn_current_th = None         # Current optimized latent coordinates (PyTorch tensor)
+        self.F_ext_dof_th = None            # External force vector on DOFs (PyTorch tensor)
+        self.dt = 0.01                      # Simulation time step, will be updated
+        self.M_torch = None                 # Mass matrix as a PyTorch tensor
+        self.force_roi_indices_flat = None  # Flattened DOF indices for force application
+        self.num_force_roi_nodes = 0        # Number of nodes in ForceROI
+
         self.MO_LinearModes = kwargs.get('MO_LinearModes') # MechObj for Linear Modes
         self.MO_NeuralPred = kwargs.get('MO_NeuralPred')   # MechObj for Neural Pred Viz
         self.visual_LM = kwargs.get('visual_LM') # Visual for Linear Modes
@@ -106,6 +118,8 @@ class AnimationStepController(Sofa.Core.Controller):
         self.original_positions = None
         self.transition_steps = 20  # Steps to transition between modes
         self.pause_steps = 30  # Steps to pause at maximum amplitude
+        self.current_period_timestep_counter = 0 # Counter for timesteps within the current force period
+
 
         # --- Add lists for Deformation Gradient Differences ---
         self.grad_diff_lin_modes_list = []
@@ -183,6 +197,52 @@ class AnimationStepController(Sofa.Core.Controller):
         surface = self.surface_topo
         self.idx_surface = surface.triangles.value.reshape(-1)
         self.timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        self.dt = self.root.dt.value # Get actual dt
+        num_dofs = self.MO1.rest_position.value.size # Total number of DOFs
+
+        # Initialize previous displacements to zero or from a static solve if available
+        self.u_nn_prev_flat_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
+        self.u_nn_prev_prev_flat_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
+        # Initialize z_nn_current_th (e.g., zeros or from initial modal projection)
+        self.z_nn_current_th = torch.zeros(self.routine.latent_dim, dtype=torch.float64, device=self.routine.device)
+
+
+        # Prepare mass matrix as PyTorch tensor (assuming self.routine.M is scipy sparse)
+        if self.routine.M is not None:
+            M_coo = self.routine.M.tocoo()
+            M_indices = torch.tensor(np.vstack((M_coo.row, M_coo.col)), dtype=torch.long, device=self.routine.device)
+            M_values = torch.tensor(M_coo.data, dtype=torch.float64, device=self.routine.device)
+            self.M_torch = torch.sparse_coo_tensor(M_indices, M_values, M_coo.shape, device=self.routine.device)
+        else:
+            print("ERROR: Mass matrix M not found in routine. Cannot proceed with dynamic NN objective.")
+            if self.root: self.root.animate = False # Stop simulation
+            return
+
+        # Prepare ForceROI information for distributing total force
+        force_roi_exact_obj = self.exactSolution.getObject('ForceROI')
+        if force_roi_exact_obj:
+            roi_node_indices = force_roi_exact_obj.indices.value
+            self.num_force_roi_nodes = len(roi_node_indices)
+            if self.num_force_roi_nodes > 0:
+                # Create a flat list of DOF indices for these nodes
+                self.force_roi_indices_flat = []
+                for node_idx in roi_node_indices:
+                    self.force_roi_indices_flat.extend([node_idx * 3, node_idx * 3 + 1, node_idx * 3 + 2])
+            else:
+                print("Warning: ForceROI is empty.")
+        else:
+            print("Warning: ForceROI not found in exactSolution.")
+        # Initialize previous displacements to zero or from a static solve if available
+        self.u_nn_prev_flat_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
+        self.u_nn_prev_prev_flat_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
+        # Initialize z_nn_current_th (e.g., zeros or from initial modal projection)
+        self.z_nn_current_th = torch.zeros(self.routine.latent_dim, dtype=torch.float64, device=self.routine.device)
+        # Initialize F_ext_dof_th to a zero tensor
+        self.F_ext_dof_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
+        print(f"Initialized F_ext_dof_th with shape {self.F_ext_dof_th.shape}")
+        self.optimization_start_step_in_period = 30
+
         
         # Store the original positions for mode animation
         if self.show_modes and self.MO1:
@@ -216,13 +276,7 @@ class AnimationStepController(Sofa.Core.Controller):
             if self.MO_LinearModes: self.MO_LinearModes.position.value = np.copy(rest_pos)
             if self.MO_NeuralPred: self.MO_NeuralPred.position.value = np.copy(rest_pos)
             
-            # Re-initialize mechanical states after position reset if necessary
-            # This might involve re-calling init on parent nodes or specific components
-            # For now, assuming SOFA handles this sufficiently with the position update.
-            # If issues arise, one might need:
-            # self.MO1.init() or self.exactSolution.init()
-            # self.MO2.init() or self.linearSolution.init()
-
+    
 
             print(f"\n--- Timestep {self.timestep_counter}: Starting Force Period {self.current_main_step}/{self.max_main_steps} ---")
 
@@ -237,6 +291,27 @@ class AnimationStepController(Sofa.Core.Controller):
             # Set the force vector for the current period
             self.current_period_force_vector = self.current_main_step_direction * self.target_force_magnitude
             self.last_applied_force_magnitude = self.target_force_magnitude # Store magnitude for analysis
+
+            # --- Prepare F_ext_dof_th for the objective function for this period ---
+            num_dofs_force = self.MO1.rest_position.value.size # Ensure this matches M_torch dimensions
+            F_ext_dof_np = np.zeros(num_dofs_force, dtype=np.float64)
+            if self.force_roi_indices_flat and self.num_force_roi_nodes > 0:
+                force_per_node_vec = self.current_period_force_vector / self.num_force_roi_nodes
+                # Apply force_per_node_vec to the DOFs in force_roi_indices_flat
+                # This assumes force_roi_indices_flat correctly maps to F_ext_dof_np
+                node_indices_in_roi = self.exactSolution.getObject('ForceROI').indices.value
+                for i, node_idx in enumerate(node_indices_in_roi):
+                    if node_idx * 3 + 2 < num_dofs_force: # Check bounds
+                         F_ext_dof_np[node_idx*3 : node_idx*3+3] = force_per_node_vec
+                    else:
+                        print(f"Warning: Node index {node_idx} out of bounds for F_ext_dof_np.")
+
+            if self.routine and hasattr(self.routine, 'device'):
+                # This line updates self.F_ext_dof_th when the force changes
+                self.F_ext_dof_th = torch.tensor(F_ext_dof_np, device=self.routine.device, dtype=torch.float64)
+            # --- End F_ext_dof_th preparation ---
+
+
 
             print(f"  New Random Force Direction: {self.current_main_step_direction}")
             print(f"  Applying force (mag: {self.last_applied_force_magnitude:.2e}, vec: {self.current_period_force_vector}) for the next {self.force_change_interval} timesteps.")
@@ -305,80 +380,176 @@ class AnimationStepController(Sofa.Core.Controller):
         Performs analysis and stores results for the completed substep.
         """
         try:
-            current_force_magnitude = self.last_applied_force_magnitude # This should be set in onAnimateBeginEvent
-            real_solution_disp = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
-            linear_solution_sofa_disp = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
-            real_energy = self.computeInternalEnergy(real_solution_disp)
+            self.current_period_timestep_counter += 1
+            self.simulation_time += self.root.dt.value # Increment simulation time
+            self.time_list.append(self.simulation_time) # Store current time
+
+            current_force_magnitude = self.last_applied_force_magnitude
+            real_solution_disp_np = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
+            linear_solution_sofa_disp_np = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
             
-            z = self.computeModalCoordinates(linear_solution_sofa_disp)
-            print(f"  Modal coordinates (z) computed with shape {z.shape} for linear solution.")
-            print(f"  Z-coordinates: {z}")
-            if z is not None and not np.isnan(z).any():
-                self.all_z_coords.append(z.copy())
-
+            real_energy = self.computeInternalEnergy(real_solution_disp_np)
             sofa_linear_energy = float('nan')
-            linear_solution_sofa_reshaped = None
             if self.MO2 and self.linearFEM:
-                sofa_linear_energy = self.computeInternalEnergy(linear_solution_sofa_disp)
-                try:
-                    linear_solution_sofa_reshaped = linear_solution_sofa_disp.reshape(self.MO1.position.value.shape[0], 3)
-                except ValueError as e:
-                    print(f"  Warning: Could not reshape SOFA linear solution: {e}")
+                sofa_linear_energy = self.computeInternalEnergy(linear_solution_sofa_disp_np)
 
-            predicted_energy, linear_energy_modes = float('nan'), float('nan')
-            l2_err_pred_real, rmse_pred_real, mse_pred_real = float('nan'), float('nan'), float('nan')
-            l2_err_lin_real, rmse_lin_real, mse_lin_real = float('nan'), float('nan'), float('nan')
-            l2_err_lin_sofa, rmse_lin_sofa, mse_lin_sofa = float('nan'), float('nan'), float('nan')
-            l_th_reshaped_np, u_pred_reshaped_np, real_solution_reshaped = None, None, None
+            # Initialize placeholders for NN and Linear Modes predictions
+            u_pred_nn_flat_th = torch.zeros_like(self.u_nn_prev_flat_th) # Default to zeros
+            l_th_flat_for_report = torch.zeros_like(self.u_nn_prev_flat_th) # Default to zeros
+            
+            # --- NN Dynamic Prediction ---
+            if self.routine and self.M_torch is not None and self.F_ext_dof_th is not None:
+                device = self.routine.device
+                real_solution_disp_th = torch.tensor(real_solution_disp_np.flatten(), dtype=torch.float64, device=device)
 
-            if z is None or np.isnan(z).any():
-                print(f"  Warning: NaN or None detected in modal coordinates (z). Skipping NN prediction.")
+                # self.optimization_start_step_in_period should be defined in __init__, e.g., = 3
+
+                if self.current_period_timestep_counter < self.optimization_start_step_in_period:
+                    # --- Bootstrapping phase: Use SOFA solutions to guide NN state before optimization kicks in ---
+                    # u_pred_nn_flat_th is set to the real solution.
+                    # z_nn_current_th is projected from the SOFA linear solution.
+                    # l_th_flat_for_report is the linear part from this projected z.
+                    # The history (u_nn_prev, u_nn_prev_prev) will be populated by these "real" values later.
+
+                    u_pred_nn_flat_th = real_solution_disp_th.clone() # NN "output" forced to match real solution for history
+
+                    # Project SOFA linear solution to get z_nn_current_th as an estimate
+                    z_from_sofa_linear_np = self.computeModalCoordinates(linear_solution_sofa_disp_np)
+                    if z_from_sofa_linear_np is None or np.isnan(z_from_sofa_linear_np).any():
+                        # print(f"Warning: Projection of SOFA linear solution for z_nn_current_th resulted in None/NaN at timestep {self.current_period_timestep_counter}. Using zeros.")
+                        z_from_sofa_linear_np = np.zeros(self.routine.latent_dim)
+                    
+                    current_z_tensor = torch.tensor(z_from_sofa_linear_np, dtype=torch.float64, device=device)
+
+                    # Ensure z_nn_current_th (which is self.z_nn_current_th) has the correct latent_dim for model consistency
+                    if current_z_tensor.shape[0] != self.routine.latent_dim:
+                        new_z = torch.zeros(self.routine.latent_dim, dtype=current_z_tensor.dtype, device=device)
+                        common_dim = min(current_z_tensor.shape[0], self.routine.latent_dim)
+                        new_z[:common_dim] = current_z_tensor[:common_dim]
+                        self.z_nn_current_th = new_z
+                    else:
+                        self.z_nn_current_th = current_z_tensor
+                    
+                    # Calculate l_th_flat_for_report based on this z_nn_current_th
+                    # Ensure modes used for l_th_flat_for_report match the dimension of z_nn_current_th (self.routine.latent_dim)
+                    # This assumes self.routine.linear_modes has at least self.routine.latent_dim columns.
+                    modes_for_report = self.routine.linear_modes[:, :self.routine.latent_dim].to(device, dtype=torch.float64)
+                    l_th_flat_for_report = torch.matmul(modes_for_report, self.z_nn_current_th)
+
+                else: # Timestep >= self.optimization_start_step_in_period: Perform optimization
+                    # Initial guess for z for the optimizer is self.z_nn_current_th (from previous step's projection or optimization)
+                    z_guess_th = self.z_nn_current_th.clone().detach().requires_grad_(True)
+                    
+                    # Ensure z_guess_th has the correct latent_dim for the model input
+                    if z_guess_th.shape[0] != self.routine.latent_dim:
+                        new_z_guess = torch.zeros(self.routine.latent_dim, dtype=z_guess_th.dtype, device=device)
+                        common_dim = min(z_guess_th.shape[0], self.routine.latent_dim)
+                        new_z_guess[:common_dim] = z_guess_th[:common_dim]
+                        z_guess_th = new_z_guess.requires_grad_(True)
+
+                    optimizer = optim.LBFGS([z_guess_th], lr=1.0, max_iter=15, line_search_fn="strong_wolfe")
+
+                    # History terms for the objective function come from self.u_nn_prev_flat_th and self.u_nn_prev_prev_flat_th
+                    u_prev_for_opt = self.u_nn_prev_flat_th.clone().detach()
+                    u_prev_prev_for_opt = self.u_nn_prev_prev_flat_th.clone().detach()
+                    F_ext_for_opt = self.F_ext_dof_th.clone().detach() # External force for current step
+
+                    def closure():
+                        optimizer.zero_grad()
+                        loss = self.objective_function(z_guess_th, u_prev_for_opt, u_prev_prev_for_opt, F_ext_for_opt)
+                        loss.backward()
+                        return loss
+                    
+                    optimizer.step(closure)
+                    self.z_nn_current_th = z_guess_th.clone().detach() # Update z with optimized value
+                    print(f"  Optimized z_nn_current_th: {self.z_nn_current_th.cpu().numpy().round(3)}")
+
+
+                    # Reconstruct displacement u_pred_nn_flat_th and l_th_flat_for_report from optimized z
+                    with torch.no_grad():
+                        modes_final = self.routine.linear_modes[:, :self.routine.latent_dim].to(device, dtype=torch.float64)
+                        l_th_flat_for_report = torch.matmul(modes_final, self.z_nn_current_th)
+                        
+                        y_th_final_flat = self.routine.model(self.z_nn_current_th.unsqueeze(0)).squeeze(0)
+                        u_pred_nn_flat_th = l_th_flat_for_report + y_th_final_flat
+                    
+                # --- This history update applies to both cases (bootstrapping and optimization) ---
+                # It stores the u_pred_nn_flat_th determined for the *current* step (either real_solution or optimized NN prediction)
+                # into the history to be used as u_nn_prev_flat_th in the *next* step's optimization.
+                self.u_nn_prev_prev_flat_th = self.u_nn_prev_flat_th.clone().detach()
+                self.u_nn_prev_flat_th = u_pred_nn_flat_th.clone().detach()
+
+                # else: # Timestep >= 3: Perform optimization
+                #     z_guess_th = self.z_nn_current_th.clone().detach().requires_grad_(True)
+                #     if z_guess_th.shape[0] != self.routine.latent_dim: # Adjust shape
+                #         new_z_guess = torch.zeros(self.routine.latent_dim, dtype=z_guess_th.dtype, device=device)
+                #         common_dim = min(z_guess_th.shape[0], self.routine.latent_dim); new_z_guess[:common_dim] = z_guess_th[:common_dim]
+                #         z_guess_th = new_z_guess.requires_grad_(True)
+
+                #     optimizer = optim.LBFGS([z_guess_th], lr=1.0, max_iter=15, line_search_fn="strong_wolfe") # Reduced max_iter
+
+                #     u_prev_for_opt = self.u_nn_prev_flat_th.clone().detach()
+                #     u_prev_prev_for_opt = self.u_nn_prev_prev_flat_th.clone().detach()
+                #     F_ext_for_opt = self.F_ext_dof_th.clone().detach()
+
+                #     def closure():
+                #         optimizer.zero_grad()
+                #         loss = self.objective_function(z_guess_th, u_prev_for_opt, u_prev_prev_for_opt, F_ext_for_opt)
+                #         loss.backward()
+                #         return loss
+                #     optimizer.step(closure)
+                #     self.z_nn_current_th = z_guess_th.clone().detach()
+                #     print(f"  Optimized z_nn_current_th: {self.z_nn_current_th}")
+
+                #     with torch.no_grad():
+                #         latent_dim_final = self.z_nn_current_th.shape[0]
+                #         modes_final = self.routine.linear_modes[:, :latent_dim_final].to(device, dtype=torch.float64)
+                #         l_th_flat_for_report = torch.matmul(modes_final, self.z_nn_current_th)
+                #         y_th_final_flat = self.routine.model(self.z_nn_current_th.unsqueeze(0)).squeeze(0)
+                #         u_pred_nn_flat_th = l_th_flat_for_report + y_th_final_flat
+                    
+                #     self.u_nn_prev_prev_flat_th = self.u_nn_prev_flat_th.clone().detach()
+                    # self.u_nn_prev_flat_th = u_pred_nn_flat_th.clone().detach()
             else:
-                z_th = torch.tensor(z, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
-                if z_th.shape[1] != self.routine.latent_dim:
-                     print(f"Warning: z_th shape {z_th.shape} does not match routine.latent_dim {self.routine.latent_dim}. Adjusting z_th.")
-                     if z_th.shape[1] > self.routine.latent_dim:
-                         z_th = z_th[:, :self.routine.latent_dim]
-                     else: 
-                         padding = torch.zeros((1, self.routine.latent_dim - z_th.shape[1]), dtype=z_th.dtype, device=z_th.device)
-                         z_th = torch.cat((z_th, padding), dim=1)
+                missing_components = []
+                if not self.routine:
+                    missing_components.append("routine")
+                if self.M_torch is None:
+                    missing_components.append("M_torch")
+                if self.F_ext_dof_th is None:
+                    missing_components.append("F_ext_dof_th")
+                print(f"  Skipping NN dynamic prediction. Not available: {', '.join(missing_components)}.")
+            # --- End NN Dynamic Prediction ---
 
-                modes_to_use = self.routine.linear_modes[:, :self.routine.latent_dim].to(self.routine.device)
-                l_th = torch.matmul(modes_to_use, z_th.T).squeeze()
-                with torch.no_grad():
-                    y_th = self.routine.model(z_th).squeeze()
-                u_pred_th = l_th + y_th
-                num_nodes_mo1 = self.MO1.position.value.shape[0]  # Get num_nodes from MO1
-                try:
-                    l_th_reshaped = l_th.reshape(num_nodes_mo1, 3)
-                    l_th_reshaped_np = l_th_reshaped.cpu().numpy()
-                    u_pred_reshaped = u_pred_th.reshape(num_nodes_mo1, 3)
-                    u_pred_reshaped_np = u_pred_reshaped.cpu().numpy()
-                    real_solution_reshaped = real_solution_disp.reshape(num_nodes_mo1, 3)
+            # Convert predictions to NumPy for reporting and visualization
+            num_nodes_mo1 = self.MO1.position.value.shape[0]
+            u_pred_reshaped_np = u_pred_nn_flat_th.cpu().numpy().reshape(num_nodes_mo1, 3)
+            l_th_reshaped_np = l_th_flat_for_report.cpu().numpy().reshape(num_nodes_mo1, 3)
+            real_solution_reshaped_np = real_solution_disp_np.reshape(num_nodes_mo1, 3)
+            linear_solution_sofa_reshaped_np = linear_solution_sofa_disp_np.reshape(num_nodes_mo1, 3)
 
-                    # Compute energies
-                    linear_energy_modes = self.computeInternalEnergy(l_th_reshaped_np)
-                    predicted_energy = self.computeInternalEnergy(u_pred_reshaped_np)
 
-                    # Compute errors with respect to the real solution
-                    diff_pred_real = real_solution_reshaped - u_pred_reshaped_np
-                    l2_err_pred_real = np.linalg.norm(diff_pred_real)
-                    mse_pred_real = np.mean(diff_pred_real**2)
-                    rmse_pred_real = np.sqrt(mse_pred_real)
+            # Compute energies
+            predicted_energy = self.computeInternalEnergy(u_pred_reshaped_np)
+            linear_energy_modes = self.computeInternalEnergy(l_th_reshaped_np)
 
-                    diff_lin_real = real_solution_reshaped - l_th_reshaped_np
-                    l2_err_lin_real = np.linalg.norm(diff_lin_real)
-                    mse_lin_real = np.mean(diff_lin_real**2)
-                    rmse_lin_real = np.sqrt(mse_lin_real)
+            # Compute errors
+            diff_pred_real = real_solution_reshaped_np - u_pred_reshaped_np
+            l2_err_pred_real = np.linalg.norm(diff_pred_real)
+            mse_pred_real = np.mean(diff_pred_real**2)
+            rmse_pred_real = np.sqrt(mse_pred_real)
 
-                    if linear_solution_sofa_reshaped is not None:
-                        diff_lin_sofa_real = real_solution_reshaped - linear_solution_sofa_reshaped
-                        l2_err_lin_sofa_real = np.linalg.norm(diff_lin_sofa_real)
-                        mse_lin_sofa_real = np.mean(diff_lin_sofa_real**2)
-                        rmse_lin_sofa_real = np.sqrt(mse_lin_sofa_real)
-                except (RuntimeError, ValueError) as e:
-                    print(f"  Error during prediction processing/reshaping/error calc: {e}")
+            diff_lin_modes_real = real_solution_reshaped_np - l_th_reshaped_np
+            l2_err_lin_real = np.linalg.norm(diff_lin_modes_real) # Error of NN's linear part vs Real
+            mse_lin_real = np.mean(diff_lin_modes_real**2)
+            rmse_lin_real = np.sqrt(mse_lin_real)
 
+            diff_sofa_lin_real = real_solution_reshaped_np - linear_solution_sofa_reshaped_np
+            l2_err_sofa_lin_real = np.linalg.norm(diff_sofa_lin_real) # Error of SOFA Linear vs Real
+            mse_sofa_lin_real = np.mean(diff_sofa_lin_real**2)
+            rmse_sofa_lin_real = np.sqrt(mse_sofa_lin_real)
+            
+            # Deformation Gradients (using the new predictions)
             F_real_np, F_lm_pred_np, F_nn_pred_np, F_sofa_linear_np = None, None, None, None
             norm_diff_F_lm, norm_diff_F_nn, norm_diff_F_sl = float('nan'), float('nan'), float('nan')
 
@@ -387,67 +558,47 @@ class AnimationStepController(Sofa.Core.Controller):
                hasattr(self.routine.energy_calculator, 'compute_deformation_gradients'):
                 
                 calc_F = self.routine.energy_calculator.compute_deformation_gradients
-                device = self.routine.device
-                dtype = torch.float64 if not hasattr(self.routine, 'dtype') else self.routine.dtype
+                device_grad = self.routine.device
+                dtype_grad = torch.float64 # Assuming float64 for consistency
                 
-                # Determine num_nodes and dim for reshaping
-                # Assuming MO1 is representative for num_nodes
-                num_nodes_for_grad = self.MO1.rest_position.value.shape[0]
-                spatial_dim = 3 # Assuming 3D
+                num_nodes_for_grad = num_nodes_mo1
+                spatial_dim = 3
 
-                def get_F_from_disp(disp_np_array):
-                    if disp_np_array is None: return None
-                    disp_flat = disp_np_array.flatten()
-                    disp_tensor = torch.tensor(disp_flat, device=device, dtype=dtype)
-                    
-                    # Reshape to  [num_nodes, dim]
+                def get_F_from_disp(disp_np_array_flat): # Expects flat (num_dofs)
+                    if disp_np_array_flat is None: return None
+                    disp_tensor = torch.tensor(disp_np_array_flat, device=device_grad, dtype=dtype_grad)
                     try:
-                        # disp_tensor is 1D (num_dofs,). Reshape to (num_nodes, dim).
                         disp_tensor_reshaped = disp_tensor.view(num_nodes_for_grad, spatial_dim)
                     except RuntimeError as e_reshape:
-                        print(f"  Error reshaping displacement to ({num_nodes_for_grad}, {spatial_dim}): {e_reshape}")
-                        print(f"  Original disp_tensor shape: {disp_tensor.shape}")
+                        print(f"  Error reshaping for F: {e_reshape}. Shape: {disp_tensor.shape}")
                         return None
-
-                    # Add batch dimension for calc_F, as it likely expects (batch_size, num_nodes, dim)
-                    F_tensor = calc_F(disp_tensor_reshaped)
-                    if F_tensor.dim() == 4 and F_tensor.shape[0] == 1: # If calc_F returned batched output
-                        F_tensor = F_tensor.squeeze(0) # Remove batch dimension from F_tensor for consistency
+                    F_tensor = calc_F(disp_tensor_reshaped) # Expects (num_nodes, dim)
+                    if F_tensor.dim() == 4 and F_tensor.shape[0] == 1: F_tensor = F_tensor.squeeze(0)
                     return F_tensor.cpu().numpy()
 
                 try:
-                    F_real_np = get_F_from_disp(real_solution_disp)
-
-                    if l_th_reshaped_np is not None and F_real_np is not None:
-                        F_lm_pred_np = get_F_from_disp(l_th_reshaped_np)
-                        if F_lm_pred_np is not None and F_lm_pred_np.shape == F_real_np.shape:
-                            diff_F_lm = F_real_np - F_lm_pred_np
-                            norm_diff_F_lm = np.mean(np.linalg.norm(diff_F_lm, ord='fro', axis=(-2,-1)))
-                        elif F_lm_pred_np is not None: print(f"Shape mismatch F_real vs F_lm_pred: {F_real_np.shape} vs {F_lm_pred_np.shape}")
-                    
-                    if u_pred_reshaped_np is not None and F_real_np is not None:
-                        F_nn_pred_np = get_F_from_disp(u_pred_reshaped_np)
-                        if F_nn_pred_np is not None and F_nn_pred_np.shape == F_real_np.shape:
-                            diff_F_nn = F_real_np - F_nn_pred_np
-                            norm_diff_F_nn = np.mean(np.linalg.norm(diff_F_nn, ord='fro', axis=(-2,-1)))
-                        elif F_nn_pred_np is not None: print(f"Shape mismatch F_real vs F_nn_pred: {F_real_np.shape} vs {F_nn_pred_np.shape}")
-                    
-                    if linear_solution_sofa_disp is not None and F_real_np is not None:
-                        F_sofa_linear_np = get_F_from_disp(linear_solution_sofa_disp)
-                        if F_sofa_linear_np is not None and F_sofa_linear_np.shape == F_real_np.shape:
-                            diff_F_sl = F_real_np - F_sofa_linear_np
-                            norm_diff_F_sl = np.mean(np.linalg.norm(diff_F_sl, ord='fro', axis=(-2,-1)))
-                        elif F_sofa_linear_np is not None: print(f"Shape mismatch F_real vs F_sofa_linear: {F_real_np.shape} vs {F_sofa_linear_np.shape}")
+                    F_real_np = get_F_from_disp(real_solution_disp_np.flatten())
+                    if F_real_np is not None:
+                        if l_th_reshaped_np is not None:
+                            F_lm_pred_np = get_F_from_disp(l_th_reshaped_np.flatten())
+                            if F_lm_pred_np is not None and F_lm_pred_np.shape == F_real_np.shape:
+                                norm_diff_F_lm = np.mean(np.linalg.norm(F_real_np - F_lm_pred_np, ord='fro', axis=(-2,-1)))
+                        if u_pred_reshaped_np is not None:
+                            F_nn_pred_np = get_F_from_disp(u_pred_reshaped_np.flatten())
+                            if F_nn_pred_np is not None and F_nn_pred_np.shape == F_real_np.shape:
+                                norm_diff_F_nn = np.mean(np.linalg.norm(F_real_np - F_nn_pred_np, ord='fro', axis=(-2,-1)))
+                        if linear_solution_sofa_disp_np is not None:
+                            F_sofa_linear_np = get_F_from_disp(linear_solution_sofa_disp_np.flatten())
+                            if F_sofa_linear_np is not None and F_sofa_linear_np.shape == F_real_np.shape:
+                                norm_diff_F_sl = np.mean(np.linalg.norm(F_real_np - F_sofa_linear_np, ord='fro', axis=(-2,-1)))
                 except Exception as e_fgrad:
-                    print(f"  ERROR calculating deformation gradients or their differences: {e_fgrad}")
-                    traceback.print_exc()
-            else:
-                print("  Skipping deformation gradient calculation: energy_calculator or method not available.")
-
+                    print(f"  ERROR calculating deformation gradients: {e_fgrad}"); traceback.print_exc()
+            
             self.grad_diff_lin_modes_list.append(norm_diff_F_lm)
             self.grad_diff_nn_pred_list.append(norm_diff_F_nn)
             self.grad_diff_sofa_linear_list.append(norm_diff_F_sl)
             
+            # Update visualizations
             if self.original_positions is not None:
                 rest_pos = self.original_positions
                 if self.MO_LinearModes is not None and l_th_reshaped_np is not None:
@@ -455,37 +606,178 @@ class AnimationStepController(Sofa.Core.Controller):
                 if self.MO_NeuralPred is not None and u_pred_reshaped_np is not None:
                     self.MO_NeuralPred.position.value = rest_pos + u_pred_reshaped_np
             
+            # Store results for plotting
             self.substep_results.append((
+                self.simulation_time, # Add current time
                 current_force_magnitude, real_energy, predicted_energy, linear_energy_modes, sofa_linear_energy,
                 l2_err_pred_real, rmse_pred_real, mse_pred_real,
-                l2_err_lin_real, rmse_lin_real, mse_lin_real,
-                l2_err_lin_sofa_real, rmse_lin_sofa_real, mse_lin_sofa_real ))
-            
+                l2_err_lin_real, rmse_lin_real, mse_lin_real, # Errors for NN's linear part
+                l2_err_sofa_lin_real, rmse_sofa_lin_real, mse_sofa_lin_real # Errors for SOFA Linear FEM
+            ))
+            if self.z_nn_current_th is not None:
+                 self.all_z_coords.append(self.z_nn_current_th.cpu().numpy().copy()) # Store optimized z
 
         except Exception as e:
             print(f"ERROR during analysis in onAnimateEndEvent: {e}")
             traceback.print_exc()
-            # Ensure lists are appended to even on error to maintain consistent lengths
+            current_time_for_error = self.time_list[-1] if self.time_list else 0.0
             self.substep_results.append((
-                self.last_applied_force_magnitude, 
-                float('nan'), float('nan'), float('nan'), float('nan'), 
-                float('nan'), float('nan'), float('nan'), 
-                float('nan'), float('nan'), float('nan'),  
-                float('nan'), float('nan'), float('nan')  
+                current_time_for_error,
+                self.last_applied_force_magnitude if hasattr(self, 'last_applied_force_magnitude') else float('nan'),
+                float('nan'), float('nan'), float('nan'), float('nan'),
+                float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan'),
+                float('nan'), float('nan'), float('nan')
             ))
             self.grad_diff_lin_modes_list.append(float('nan'))
             self.grad_diff_nn_pred_list.append(float('nan'))
             self.grad_diff_sofa_linear_list.append(float('nan'))
+            if self.all_z_coords and self.routine: # Append zeros if z_coords list exists
+                 self.all_z_coords.append(np.zeros(self.routine.latent_dim))
 
-        self.current_substep += 1
-        if (self.current_substep % self.num_substeps) == 0:
-            self.current_main_step += 1
-            print(f"--- Main Step {self.current_main_step} Completed (Total Substeps: {self.current_substep}) ---")
-            # Access args globally if __main__ defines it
-            if 'args' in globals() and not args.gui and self.current_main_step >= self.max_main_steps:
-                 print(f"Reached maximum main steps ({self.max_main_steps}). Stopping simulation.")
-                 if self.root: self.root.animate = False
+
+        # This counter is for the overall simulation, not per force period
+        # self.current_substep += 1 # This was from the old logic, self.timestep_counter is now the global step
+        
+        # Check for stopping condition based on main steps (managed in onAnimateBeginEvent)
+        # if 'args' in globals() and not args.gui and self.current_main_step >= self.max_main_steps:
+        #     if self.root: self.root.animate = False # Controller will stop based on this
+
         self.end_time = process_time()
+
+        
+    # --- Full new method for the Neural Network Objective Function ---
+    def objective_function(self, z_th_opt, u_nn_prev_flat_th, u_nn_prev_prev_flat_th, F_ext_dof_th):
+        """
+        Objective function for optimizing the latent coordinates z_th.
+        J(z) = InertialTerm(u_nn(z)) + ElasticEnergy(u_nn(z)) - Work_ExternalForce(u_nn(z)) (+ DampingTerm(u_nn(z)))
+        """
+        # Ensure z_th_opt requires gradients for the optimizer
+        z_th_opt.requires_grad_(True)
+
+        # 1. Predict current displacement u_curr_nn_flat_th from z_th_opt
+        # Ensure modes_to_use matches the dimension of z_th_opt
+        latent_dim_current = z_th_opt.shape[0]
+        modes_to_use = self.routine.linear_modes[:, :latent_dim_current].to(self.routine.device, dtype=torch.float64)
+
+        # l_th is (num_dofs,)
+        l_th_flat = torch.matmul(modes_to_use, z_th_opt)
+
+        # y_th is (num_dofs,)
+        # Model input z_th_opt needs to be (batch_size, latent_dim) = (1, latent_dim_current)
+        y_th_flat = self.routine.model(z_th_opt.unsqueeze(0)).squeeze(0)
+        
+        u_curr_nn_flat_th = l_th_flat + y_th_flat # Shape: (num_dofs,)
+
+        # 2. Calculate acceleration u_ddot_nn_flat_th (using Newmark-beta like terms for an implicit scheme)
+        # Simplified: (u_curr - 2*u_prev + u_prev_prev) / dt^2
+        # This is a common explicit finite difference for acceleration.
+        # For an implicit objective, one might formulate it differently, e.g., based on Newmark's velocity/position updates.
+        # Let's use the simple explicit form for now for u_ddot.
+        if self.dt == 0: # Avoid division by zero if dt not set
+            u_ddot_nn_flat_th = torch.zeros_like(u_curr_nn_flat_th)
+        else:
+            u_ddot_nn_flat_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th) / (self.dt**2)
+
+        # 3. Calculate Inertial Term: 0.5 * u_ddot^T * M * u_ddot
+        # M_torch is sparse: (num_dofs, num_dofs), u_ddot is dense (num_dofs,)
+        # (M @ u_ddot) is dense (num_dofs,)
+        inertial_force_th = torch.sparse.mm(self.M_torch, u_ddot_nn_flat_th.unsqueeze(1)).squeeze(1)
+        inertial_term = 0.5 * torch.dot(u_ddot_nn_flat_th, inertial_force_th)
+
+        # 4. Calculate Elastic Strain Energy: E_elastic(u_nn(z))
+        # energy_calculator expects displacement in shape (batch_size, num_nodes, 3) or (num_nodes, 3)
+        # u_curr_nn_flat_th is (num_dofs,). Reshape it.
+        num_nodes = self.MO1.rest_position.value.shape[0] # Or from self.routine.num_nodes
+        try:
+            u_curr_nn_reshaped_th = u_curr_nn_flat_th.view(1, num_nodes, 3) # Add batch dim
+            elastic_energy = self.routine.energy_calculator(u_curr_nn_reshaped_th).squeeze()
+        except Exception as e:
+            print(f"Error in energy_calculator with u_curr_nn: {e}")
+            elastic_energy = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
+
+
+        # 5. Calculate External Force Work Term: - F_ext_dof · u_curr_nn
+        # F_ext_dof_th is (num_dofs,), u_curr_nn_flat_th is (num_dofs,)
+        work_external_term = -torch.dot(F_ext_dof_th, u_curr_nn_flat_th)
+
+        # 6. Damping Term (Placeholder - can be mass-proportional, stiffness-proportional, etc.)
+        # Example: Mass-proportional damping: 0.5 * alpha_damping * v_curr^T * M * v_curr
+        # v_curr = (u_curr - u_prev) / dt
+        damping_term = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
+        # if self.dt > 0:
+        #     alpha_damping = 0.01 # Example damping coefficient
+        #     v_curr_nn_flat_th = (u_curr_nn_flat_th - u_nn_prev_flat_th) / self.dt
+        #     damping_force_th = torch.sparse.mm(self.M_torch, v_curr_nn_flat_th.unsqueeze(1)).squeeze(1)
+        #     damping_term = 0.5 * alpha_damping * torch.dot(v_curr_nn_flat_th, damping_force_th)
+
+
+        # 7. Total Objective
+        total_objective = inertial_term + elastic_energy + work_external_term + damping_term
+        
+        # print(f"  Objective: {total_objective.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e}, Damping: {damping_term.item():.3e})")
+        return total_objective
+    # --- End Objective Function ---
+
+    def objective_function_linear_modes(self, z_lm_th_opt, u_lm_prev_flat_th, u_lm_prev_prev_flat_th, F_ext_dof_th):
+        """
+        Objective function for optimizing the latent coordinates z_lm_th for a purely linear modal model.
+        J(z) = InertialTerm(u_lm(z)) + ElasticEnergy(u_lm(z)) - Work_ExternalForce(u_lm(z)) (+ DampingTerm(u_lm(z)))
+        """
+        # Ensure z_lm_th_opt requires gradients for the optimizer
+        z_lm_th_opt.requires_grad_(True)
+
+        # 1. Predict current displacement u_curr_lm_flat_th from z_lm_th_opt (Linear Modes Only)
+        latent_dim_current = z_lm_th_opt.shape[0]
+        # Ensure modes_to_use matches the dimension of z_lm_th_opt
+        modes_to_use = self.routine.linear_modes[:, :latent_dim_current].to(self.routine.device, dtype=torch.float64)
+
+        # u_lm_th is (num_dofs,)
+        u_curr_lm_flat_th = torch.matmul(modes_to_use, z_lm_th_opt) # Linear reconstruction
+
+        # 2. Calculate acceleration u_ddot_lm_flat_th
+        if self.dt == 0:
+            u_ddot_lm_flat_th = torch.zeros_like(u_curr_lm_flat_th)
+        else:
+            u_ddot_lm_flat_th = (u_curr_lm_flat_th - 2 * u_lm_prev_flat_th + u_lm_prev_prev_flat_th) / (self.dt**2)
+
+        # 3. Calculate Inertial Term: 0.5 * u_ddot^T * M * u_ddot
+        inertial_force_th = torch.sparse.mm(self.M_torch, u_ddot_lm_flat_th.unsqueeze(1)).squeeze(1)
+        inertial_term = 0.5 * torch.dot(u_ddot_lm_flat_th, inertial_force_th)
+
+        # 4. Calculate Elastic Strain Energy: E_elastic(u_lm(z))
+        num_nodes = self.MO1.rest_position.value.shape[0]
+        try:
+            # energy_calculator expects displacement in shape (batch_size, num_nodes, 3)
+            u_curr_lm_reshaped_th = u_curr_lm_flat_th.view(1, num_nodes, 3)
+            # Note: This will use the routine's energy calculator. If this is hyperelastic,
+            # it will compute hyperelastic energy for a purely modal displacement.
+            # If a specific linear elastic energy calculator is desired for this objective,
+            # it would need to be provided and used here.
+            elastic_energy = self.routine.energy_calculator(u_curr_lm_reshaped_th).squeeze()
+        except Exception as e:
+            print(f"Error in energy_calculator with u_curr_lm: {e}")
+            elastic_energy = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
+
+        # 5. Calculate External Force Work Term: - F_ext_dof · u_curr_lm
+        work_external_term = -torch.dot(F_ext_dof_th, u_curr_lm_flat_th)
+
+        # 6. Damping Term (Placeholder)
+        damping_term = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
+        # if self.dt > 0:
+        #     alpha_damping = 0.01 # Example damping coefficient
+        #     v_curr_lm_flat_th = (u_curr_lm_flat_th - u_lm_prev_flat_th) / self.dt
+        #     damping_force_th = torch.sparse.mm(self.M_torch, v_curr_lm_flat_th.unsqueeze(1)).squeeze(1)
+        #     damping_term = 0.5 * alpha_damping * torch.dot(v_curr_lm_flat_th, damping_force_th)
+
+        # 7. Total Objective
+        total_objective_lm = inertial_term + elastic_energy + work_external_term + damping_term
+        
+        # print(f"  LM Objective: {total_objective_lm.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e})")
+        return total_objective_lm
+    # --- End Linear Modes Objective Function ---
+
+
+
 
     def computeModalCoordinates(self, displacement):
         """
@@ -597,6 +889,7 @@ class AnimationStepController(Sofa.Core.Controller):
             return
 
         result_columns = [
+            'Time', # Added 'Time' column
             'ForceMag', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
             'L2Err_Pred_Real', 'RMSE_Pred_Real', 'MSE_Pred_Real',
             'L2Err_Lin_Real', 'RMSE_Lin_Real', 'MSE_Lin_Real',

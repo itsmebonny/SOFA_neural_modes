@@ -731,7 +731,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 1
+                deformation_scale_final = 10
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -768,7 +768,7 @@ class Routine:
                 # z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
 
                 # --- Regular Sampling of Latent Space ---
-                num_samples_per_mode = 5  # Number of samples along each mode
+                num_samples_per_mode = 15  # Number of samples along each mode
                 
                 # Create a grid of latent vectors
                 grid_coords = [torch.linspace(-1, 1, num_samples_per_mode, device=self.device) for _ in range(L)]
