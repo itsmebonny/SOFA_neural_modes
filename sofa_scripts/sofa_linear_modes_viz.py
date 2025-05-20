@@ -19,6 +19,18 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
 
+# Attempt to import PETSc and SLEPc
+try:
+    from petsc4py import PETSc
+    from slepc4py import SLEPc
+    HAS_PETSC_SLEPC = True
+    print("PETSc and SLEPc found. Will use for eigenvalue computation.")
+except ImportError:
+    HAS_PETSC_SLEPC = False
+    print("PETSc and/or SLEPc not found. Will use SciPy for eigenvalue computation.")
+    print("For potentially better performance and more solver options, consider installing petsc4py and slepc4py.")
+
+
 
 
 class AnimationStepController(Sofa.Core.Controller):
@@ -121,6 +133,8 @@ class AnimationStepController(Sofa.Core.Controller):
         print("Computing mass and stiffness matrices...")
         self.mass_matrix = self.mass.assembleMMatrix()
         self.stiffness_matrix = self.fem.assembleKMatrix()
+
+        global HAS_PETSC_SLEPC
         
         print(f"Mass matrix shape: {self.mass_matrix.shape}")
         print(f"Stiffness matrix shape: {self.stiffness_matrix.shape}")
@@ -253,80 +267,210 @@ class AnimationStepController(Sofa.Core.Controller):
         print(f"Matrices, mesh data, and metadata saved to {output_subdir}")
 
         
-        # Now compute eigenmodes directly
-        print(f"Computing {self.num_modes_to_show} eigenmodes using SLEPc...")
-        try:
-            # Convert sparse matrices to PETSc format
-            from petsc4py import PETSc
-            from slepc4py import SLEPc
-            
-            # Convert to CSR format first if needed
-            if not isinstance(self.stiffness_matrix, sparse.csr_matrix):
-                K_csr = self.stiffness_matrix.tocsr()
-                M_csr = self.mass_matrix.tocsr() 
-            else:
-                K_csr = self.stiffness_matrix
-                M_csr = self.mass_matrix
-            
-            # Create PETSc matrices
-            n = K_csr.shape[0]
-            K_petsc = PETSc.Mat().createAIJ(size=(n, n), 
-                                        csr=(K_csr.indptr, K_csr.indices, K_csr.data))
-            M_petsc = PETSc.Mat().createAIJ(size=(n, n), 
-                                        csr=(M_csr.indptr, M_csr.indices, M_csr.data))
-            K_petsc.assemble()
-            M_petsc.assemble()
-            
-            # Set up SLEPc eigensolver
-            eigensolver = SLEPc.EPS().create()
-            eigensolver.setOperators(K_petsc, M_petsc)
-            eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-            eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-            eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-            eigensolver.setTarget(0.0)
+        # Now compute eigenmodes
+        if HAS_PETSC_SLEPC:
+            print(f"Computing {self.num_modes_to_show} eigenmodes using SLEPc...")
+            try:
+                # Convert sparse matrices to PETSc format
+                # from petsc4py import PETSc # Already imported at the top
+                # from slepc4py import SLEPc # Already imported at the top
+                
+                # Convert to CSR format first if needed
+                if not isinstance(self.stiffness_matrix, sparse.csr_matrix):
+                    K_csr = self.stiffness_matrix.tocsr()
+                    M_csr = self.mass_matrix.tocsr() 
+                else:
+                    K_csr = self.stiffness_matrix
+                    M_csr = self.mass_matrix
+                
+                # Create PETSc matrices
+                n = K_csr.shape[0]
+                K_petsc = PETSc.Mat().createAIJ(size=(n, n), 
+                                            csr=(K_csr.indptr, K_csr.indices, K_csr.data))
+                M_petsc = PETSc.Mat().createAIJ(size=(n, n), 
+                                            csr=(M_csr.indptr, M_csr.indices, M_csr.data))
+                K_petsc.assemble()
+                M_petsc.assemble()
+                
+                # Set up SLEPc eigensolver
+                eigensolver = SLEPc.EPS().create()
+                eigensolver.setOperators(K_petsc, M_petsc)
+                eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+                eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP) # Generalized Hermitian Eigenvalue Problem Kx = lambda Mx
+                eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE) # Smallest magnitude eigenvalues
+                eigensolver.setTarget(0.0) # Target eigenvalue is 0
 
-            st = eigensolver.getST()
-            st.setType(SLEPc.ST.Type.SINVERT)
-            st.setShift(0.0)
+                st = eigensolver.getST()
+                st.setType(SLEPc.ST.Type.SINVERT) # Spectral Transformation: Shift-and-Invert
+                st.setShift(0.0) # Shift for SINVERT
+                            
+                # Set dimensions and solve
+                eigensolver.setDimensions(nev=self.num_modes_to_show + 6) # Request a few more modes for stability
+                eigensolver.setFromOptions()
+                
+                print("Solving eigenvalue problem with SLEPc...")
+                eigensolver.solve()
+                
+                # Get number of converged eigenvalues
+                nconv = eigensolver.getConverged()
+                print(f"Number of converged eigenvalues (SLEPc): {nconv}")
+                
+                if nconv > 0:
+                    # Extract eigenvalues and eigenvectors
+                    eigenvalues_list = []
+                    eigenvectors_list = []
+                    
+                    for i in range(nconv):
+                        eigenvalue = eigensolver.getEigenvalue(i).real
+                        # SLEPc might return very small negative eigenvalues for GHEP due to numerical precision,
+                        # especially for rigid body modes if not fully constrained.
+                        # We are interested in positive eigenvalues for physical modes.
+                        # if eigenvalue > 1e-9: # Filter out potentially non-physical or zero eigenvalues
+                        eigenvalues_list.append(eigenvalue)
+                        vr = K_petsc.createVecRight()
+                        eigensolver.getEigenvector(i, vr)
+                        eigenvectors_list.append(vr.getArray().copy()) # Ensure it's a copy
                         
-            # Set dimensions and solve
-            eigensolver.setDimensions(nev=self.num_modes_to_show)
-            eigensolver.setFromOptions()
-            
-            print("Solving eigenvalue problem...")
-            eigensolver.solve()
-            
-            # Get number of converged eigenvalues
-            nconv = eigensolver.getConverged()
-            print(f"Number of converged eigenvalues: {nconv}")
-            
-            if nconv > 0:
-                # Extract eigenvalues and eigenvectors
-                eigenvalues = []
-                eigenvectors = np.zeros((n, nconv))
-                
-                for i in range(min(nconv, self.num_modes_to_show)):
-                    eigenvalue = eigensolver.getEigenvalue(i).real
-                    eigenvalues.append(eigenvalue)
-                    
-                    # Extract eigenvector
-                    vr = K_petsc.createVecRight()
-                    eigensolver.getEigenvector(i, vr)
-                    eigenvectors[:, i] = vr.getArray()
-                    
-                # Convert to numpy arrays
-                self.eigenvalues = np.array(eigenvalues)
-                self.eigenvectors = eigenvectors
-                
-                # Sort eigenvalues (smallest first)
-                idx = self.eigenvalues.argsort()
-                self.eigenvalues = self.eigenvalues[idx]
-                self.eigenvectors = self.eigenvectors[:, idx]
-                
-                # Calculate natural frequencies
-                self.frequencies = np.sqrt(np.abs(self.eigenvalues)) / (2 * np.pi)
+                    if not eigenvalues_list:
+                        print("Warning: No positive eigenvalues found with SLEPc. Check constraints and problem setup.")
+                        self.modes_computed = False
+                        return
 
-                print("Checking eigenvector norms before saving:")
+                    # Convert to numpy arrays
+                    self.eigenvalues = np.array(eigenvalues_list)
+                    self.eigenvectors = np.array(eigenvectors_list).T # Transpose to have modes as columns
+                    
+                    # Sort eigenvalues (smallest magnitude first) and corresponding eigenvectors
+                    idx = np.abs(self.eigenvalues).argsort()
+                    self.eigenvalues = self.eigenvalues[idx]
+                    self.eigenvectors = self.eigenvectors[:, idx]
+
+                    # Select the requested number of modes (typically smallest non-zero)
+                    # Often, the first few modes might be rigid body modes (eigenvalue close to 0)
+                    # We usually want the smallest *positive* eigenvalues for elastic modes.
+                    # For now, let's take the smallest `num_modes_to_show` by magnitude.
+                    if len(self.eigenvalues) > self.num_modes_to_show:
+                        self.eigenvalues = self.eigenvalues[:self.num_modes_to_show]
+                        self.eigenvectors = self.eigenvectors[:, :self.num_modes_to_show]
+                    
+                    # Calculate natural frequencies
+                    self.frequencies = np.sqrt(np.abs(self.eigenvalues)) / (2 * np.pi)
+
+                    print("Checking eigenvector norms before saving (SLEPc):")
+                    for i in range(min(5, self.eigenvectors.shape[1])):
+                        mode_norm = np.linalg.norm(self.eigenvectors[:, i])
+                        print(f"  Norm of Mode {i}: {mode_norm:.4e}")
+
+
+                    #save the eigenvalues and eigenvector as the matrices 
+                    np.save(f'{matrices_dir}/{self.timestamp}/eigenvalues_{self.timestamp}.npy', self.eigenvalues)
+                    np.save(f'{matrices_dir}/{self.timestamp}/eigenvectors_{self.timestamp}.npy', self.eigenvectors)
+                    np.save(f'{matrices_dir}/{self.timestamp}/frequencies_{self.timestamp}.npy', self.frequencies)
+                    
+                    print("Eigenmode computation successful with SLEPc!")
+                    for i in range(min(nconv, len(self.eigenvalues))):
+                        print(f"Mode {i+1}: λ = {self.eigenvalues[i]:.6e}, f = {self.frequencies[i]:.4f} Hz")
+                        
+                    # [Rest of your code for saving eigenmodes]
+                    self.modes_computed = True
+                    
+                else:
+                    print("No eigenvalues converged!")
+                    self.modes_computed = False
+                
+            except Exception as e:
+                print(f"Error computing eigenmodes with SLEPc: {e}")
+                import traceback
+                traceback.print_exc()
+                self.modes_computed = False
+                print("Falling back to SciPy due to SLEPc error.")
+                HAS_PETSC_SLEPC = False # Force SciPy fallback
+
+        if not HAS_PETSC_SLEPC: # If PETSc/SLEPc not available or failed
+            print(f"Computing {self.num_modes_to_show} eigenmodes using SciPy eigsh...")
+            try:
+                # Ensure matrices are in CSR format for SciPy
+                if not isinstance(self.stiffness_matrix, sparse.csr_matrix):
+                    K_csr = self.stiffness_matrix.tocsr()
+                else:
+                    K_csr = self.stiffness_matrix
+                if not isinstance(self.mass_matrix, sparse.csr_matrix):
+                    M_csr = self.mass_matrix.tocsr()
+                else:
+                    M_csr = self.mass_matrix
+
+                # SciPy's eigsh solves Kx = lambda Mx.
+                # It expects K to be symmetric and M to be symmetric positive-definite.
+                # We are looking for smallest magnitude eigenvalues, so we use sigma=0.
+                # Note: K_csr is -K from SOFA, so we use -K_csr to get positive eigenvalues for Kx = lambda Mx
+                
+                # We need to solve K*v = lambda*M*v. Our K_csr is already -K_sofa.
+                # So we solve (-K_sofa)*v = lambda*M*v.
+                # eigsh finds eigenvalues of A relative to M. Here A = -K_sofa.
+                # We want smallest eigenvalues, so sigma=0 is appropriate.
+                # 'LM' means largest magnitude. For sigma=0, this means eigenvalues closest to 0.
+                
+                # Number of eigenvalues to compute. Add a few extra for stability and to discard zero modes.
+                num_to_compute_scipy = self.num_modes_to_show + 6 
+                
+                # Ensure K_csr is symmetric. It should be from FEM.
+                # Ensure M_csr is symmetric and positive definite.
+                
+                # We use K_csr directly (which is -Stiffness_SOFA)
+                # eigsh solves A * x = lambda * M * x
+                # Here, A = K_csr (our -Stiffness_SOFA)
+                # We want smallest eigenvalues of K_SOFA, which are largest eigenvalues of -K_SOFA (if all are negative)
+                # or eigenvalues of -K_SOFA closest to zero.
+                
+                # Let's use the original SOFA stiffness (positive definite) and find smallest eigenvalues
+                # K_orig_sofa = -self.stiffness_matrix # self.stiffness_matrix is already -K_sofa
+                
+                # We want to solve K_sofa u = omega^2 M u
+                # Our self.stiffness_matrix is -K_sofa.
+                # So we solve -self.stiffness_matrix u = omega^2 M u
+                # Or, self.stiffness_matrix u = -omega^2 M u
+                # eigsh solves A u = lambda M u.
+                # If A = self.stiffness_matrix, then lambda = -omega^2. We want lambda closest to 0 from negative side.
+                
+                # Let's use K_actual = -self.stiffness_matrix (which is the actual positive definite K)
+                K_actual_csr = -K_csr 
+                
+                eigenvalues_scipy, eigenvectors_scipy = eigsh(
+                    A=K_actual_csr, 
+                    k=num_to_compute_scipy, 
+                    M=M_csr, 
+                    sigma=1e-6, # Look for eigenvalues near 0 (but not exactly 0 to avoid issues with singular K if unconstrained)
+                    which='LM', # Largest Magnitude when sigma is used means closest to sigma.
+                    v0=None, # Initial guess vector
+                    ncv=None, # Number of Lanczos vectors
+                    maxiter=None, # Max iterations
+                    tol=1e-9, # Tolerance
+                    return_eigenvectors=True
+                )
+
+                # Sort eigenvalues (smallest first) and corresponding eigenvectors
+                idx = eigenvalues_scipy.argsort()
+                self.eigenvalues = eigenvalues_scipy[idx]
+                self.eigenvectors = eigenvectors_scipy[:, idx]
+
+                # Filter out very small or negative eigenvalues if they are due to rigid body modes or numerical noise
+                # Keep only the smallest positive eigenvalues
+                positive_eigenvalues_mask = self.eigenvalues > 1e-9 # Threshold for "positive"
+                self.eigenvalues = self.eigenvalues[positive_eigenvalues_mask]
+                self.eigenvectors = self.eigenvectors[:, positive_eigenvalues_mask]
+                
+                if len(self.eigenvalues) > self.num_modes_to_show:
+                    self.eigenvalues = self.eigenvalues[:self.num_modes_to_show]
+                    self.eigenvectors = self.eigenvectors[:, :self.num_modes_to_show]
+                elif len(self.eigenvalues) == 0:
+                    print("SciPy eigsh did not find any positive eigenvalues. Check constraints and problem setup.")
+                    self.modes_computed = False
+                    return
+
+
+                self.frequencies = np.sqrt(self.eigenvalues) / (2 * np.pi) # Eigenvalues from eigsh are omega^2
+
+                print("Checking eigenvector norms before saving (SciPy):")
                 for i in range(min(5, self.eigenvectors.shape[1])):
                     mode_norm = np.linalg.norm(self.eigenvectors[:, i])
                     print(f"  Norm of Mode {i}: {mode_norm:.4e}")
@@ -344,15 +488,15 @@ class AnimationStepController(Sofa.Core.Controller):
                 # [Rest of your code for saving eigenmodes]
                 self.modes_computed = True
                 
-            else:
-                print("No eigenvalues converged!")
+   
+                    
+            except Exception as e:
+                print(f"Error computing eigenmodes with SLEPc: {e}")
+                import traceback
+                traceback.print_exc()
                 self.modes_computed = False
-                
-        except Exception as e:
-            print(f"Error computing eigenmodes with SLEPc: {e}")
-            import traceback
-            traceback.print_exc()
-            self.modes_computed = False
+
+
 
     def displayMode(self, mode_index):
         """Directly display an eigenmode with proper scaling"""

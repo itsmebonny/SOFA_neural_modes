@@ -16,7 +16,7 @@ import traceback
 from scipy import sparse
 
 # --- Import the renamed solver class ---
-from tests.solver import SOFANeoHookeanModel, SOFAStVenantKirchhoffModel
+from tests.solver import SOFANeoHookeanModel, SOFAStVenantKirchhoffModel, SOFAStVenantKirchhoffModelModified
 
 # In train.py - add these imports
 import glob
@@ -731,7 +731,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 300
+                deformation_scale_final = 1
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -765,8 +765,21 @@ class Routine:
                 # # --- End of New Logistic Decay ---
                 
                 # Generate random samples in [-1, 1]
-                z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
+                # z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
+
+                # --- Regular Sampling of Latent Space ---
+                num_samples_per_mode = 5  # Number of samples along each mode
                 
+                # Create a grid of latent vectors
+                grid_coords = [torch.linspace(-1, 1, num_samples_per_mode, device=self.device) for _ in range(L)]
+                
+                # Use torch.meshgrid to create all combinations of latent values
+                mesh = torch.meshgrid(*grid_coords, indexing='ij')
+                
+                # Stack the meshgrid tensors and reshape to (num_samples_total, latent_dim)
+                z_unit_range = torch.stack(mesh).reshape(-1, L)
+                print(f"Number of samples: {z_unit_range.shape[0]}")
+                                
                 # Apply the decaying scales
                 # Unsqueeze individual_mode_scales to (1, L) for broadcasting with (batch_size, L)
                 z = z_unit_range * current_scale
@@ -820,21 +833,21 @@ class Routine:
                     energy = torch.mean(energies)  # Average energy across batch
              
 
-                    volume_sample_indices = [0, min(10, batch_size-1), rest_idx]  # Rest shape + a couple samples
-                    volume_results = []
-                    for idx in volume_sample_indices:
-                        vol_result = self.energy_calculator.compute_volume_comparison(
-                            l[idx:idx+1], u_total_batch[idx:idx+1])
-                        volume_results.append(vol_result)
+                    # volume_sample_indices = [0, min(10, batch_size-1), rest_idx]  # Rest shape + a couple samples
+                    # volume_results = []
+                    # for idx in volume_sample_indices:
+                    #     vol_result = self.energy_calculator.compute_volume_comparison(
+                    #         l[idx:idx+1], u_total_batch[idx:idx+1])
+                    #     volume_results.append(vol_result)
                     
-                    # Calculate average volume metrics across the samples
-                    avg_linear_ratio = sum(r['linear_volume_ratio'] for r in volume_results) / len(volume_results)
-                    avg_neural_ratio = sum(r['neural_volume_ratio'] for r in volume_results) / len(volume_results)
+                    # # Calculate average volume metrics across the samples
+                    # avg_linear_ratio = sum(r['linear_volume_ratio'] for r in volume_results) / len(volume_results)
+                    # avg_neural_ratio = sum(r['neural_volume_ratio'] for r in volume_results) / len(volume_results)
                     
-                    # Compute volume preservation penalty (squared deviation from 1.0)
-                    vol_penalty = 1000.0 * torch.mean((torch.tensor(
-                        [r['neural_volume_ratio'] for r in volume_results], 
-                        device=self.device, dtype=torch.float64) - 1.0)**2)
+                    # # Compute volume preservation penalty (squared deviation from 1.0)
+                    # vol_penalty = 1000.0 * torch.mean((torch.tensor(
+                    #     [r['neural_volume_ratio'] for r in volume_results], 
+                    #     device=self.device, dtype=torch.float64) - 1.0)**2)
 
 
                     # Calculate maximum displacements
@@ -889,7 +902,7 @@ class Routine:
 
 
                     # Modified loss
-                    loss = energy + 1e3 * ortho + 1e3 * bc_penalty 
+                    loss = energy + 1e10 * ortho + 1e10 * bc_penalty 
 
                     loss.backward()
 
@@ -929,11 +942,11 @@ class Routine:
                         # print(f"│ {'Div(P):':<12} {div_p_means[0].item():15.6e} {div_p_means[1].item():15.6e} {div_p_means[2].item():15.6e}")
                         # print(f"│ {'Div(P) Loss:':<20} {log_scaled_div_p.item():<12.6f} │ {'Raw Div(P) L2:':<20} {raw_div_p_L2_mean.item():<12.6e}")
 
-                        # Add volume metrics section
-                        print(f"│ VOLUME PRESERVATION:")
-                        print(f"│ {'Linear Volume Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Volume Ratio:':<20} {avg_neural_ratio:<12.6f}")
-                        print(f"│ {'Linear Volume Change:':<20} {(avg_linear_ratio-1)*100:<12.4f}% │ {'Neural Volume Change:':<20} {(avg_neural_ratio-1)*100:<12.4f}%")
-                        print(f"│ {'Volume Penalty:':<20} {vol_penalty.item():<12.6f}")
+                        # # Add volume metrics section
+                        # print(f"│ VOLUME PRESERVATION:")
+                        # print(f"│ {'Linear Volume Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Volume Ratio:':<20} {avg_neural_ratio:<12.6f}")
+                        # print(f"│ {'Linear Volume Change:':<20} {(avg_linear_ratio-1)*100:<12.4f}% │ {'Neural Volume Change:':<20} {(avg_neural_ratio-1)*100:<12.4f}%")
+                        # print(f"│ {'Volume Penalty:':<20} {vol_penalty.item():<12.6f}")
         
                         # Print z vector (first 10 modes of the first batch sample)
                         z_to_print = z[0, :min(10, z.shape[1])].detach().cpu().numpy()
@@ -1727,7 +1740,7 @@ class Routine:
         print("Visualization complete.")
         return plotter # Return plotter in case further customization is needed
 
-    def analyze_latent_correlations(self, delta=0.01, save_path=None):
+    def analyze_latent_correlations(self, delta=1e-5, save_path=None):
         """
         Analyze correlations between latent dimensions based on the gradient of the
         TOTAL displacement (linear + neural) at the origin.
@@ -1827,7 +1840,7 @@ class Routine:
         print("Latent correlation analysis (total displacement) complete.")
         return corr_matrix, fig
 
-    def analyze_linear_mode_correlations(self, delta=1.0, save_path=None):
+    def analyze_linear_mode_correlations(self, delta=1e-5, save_path=None):
         """
         Analyze correlations between latent dimensions based ONLY on the linear modes.
         This should ideally result in an identity matrix if linear modes are orthogonal.
@@ -2098,11 +2111,11 @@ def main():
 
         print("\nAnalyzing latent space correlations (TOTAL displacement)...")
         correlation_matrix_path_total = os.path.join(analysis_save_dir, 'latent_correlations_total.png')
-        corr_matrix_total, _ = engine.analyze_latent_correlations(delta=0.001, save_path=correlation_matrix_path_total) # Smaller delta might be needed
+        corr_matrix_total, _ = engine.analyze_latent_correlations(delta=1e-10, save_path=correlation_matrix_path_total) # Smaller delta might be needed
 
         print("\nAnalyzing latent space correlations (LINEAR modes only)...")
         correlation_matrix_path_linear = os.path.join(analysis_save_dir, 'latent_correlations_linear.png')
-        corr_matrix_linear, _ = engine.analyze_linear_mode_correlations(delta=1.0, save_path=correlation_matrix_path_linear)
+        corr_matrix_linear, _ = engine.analyze_linear_mode_correlations(delta=1e-10, save_path=correlation_matrix_path_linear)
 
         # Plotting training metrics might require loading tensorboard data, skipping for now
         # print("\nPlotting training metrics...")

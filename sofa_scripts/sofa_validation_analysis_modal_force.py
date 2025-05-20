@@ -70,7 +70,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- New parameter for scaling modal coordinates 'z' ---
-        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 1) # Tune this value
+        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 1000) # Tune this value
         print(f"Max Z Amplitude Scale (for random z generation): {self.max_z_amplitude_scale}")
         # --- End New Parameter ---
         
@@ -195,7 +195,7 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateBeginEvent(self, event):
 
 
-        num_modes_modal_force = min(3, self.routine.latent_dim)
+        num_modes_modal_force = min(5, self.routine.latent_dim)
 
         if self.current_substep == 0: # Start of a new main step
             rest_pos = self.MO1.rest_position.value
@@ -205,10 +205,10 @@ class AnimationStepController(Sofa.Core.Controller):
             if self.MO_NeuralPred: self.MO_NeuralPred.position.value = rest_pos
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
-            base_z_coeffs = np.random.rand(num_modes_modal_force) #* 2 - 1 # Random coefficients in [-1, 1]
+            base_z_coeffs = np.random.rand(num_modes_modal_force) * 2 - 1 # Random coefficients in [-1, 1]
          
 
-            self.base_z_pattern_for_main_step = base_z_coeffs 
+            self.base_z_pattern_for_main_step = base_z_coeffs * self.max_z_amplitude_scale
             print(f"  Base Z pattern for main step (norm): {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}")
             # print(f"  Base Z pattern components (first few): {self.base_z_pattern_for_main_step[:min(L,5)]}")
 

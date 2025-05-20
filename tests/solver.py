@@ -2129,6 +2129,314 @@ class SOFAStVenantKirchhoffModel(torch.nn.Module):
 
         return deformation_gradients
 
+import torch
+
+class SOFAStVenantKirchhoffModelModified(torch.nn.Module):
+    """
+    PyTorch-based St. Venant-Kirchhoff (StVK) energy model.
+    MODIFIED to optionally use a (J-1)^2 volumetric term for linear tetrahedra,
+    similar to the first provided code snippet.
+
+    Standard StVK: W = 0.5 * λ * (tr(E))² + μ * tr(E²)
+    Modified form (if enabled): W_density = custom_lame * (J-1)² + μ * tr(E²)
+    where E = 0.5 * (FᵀF - I), J = det(F).
+    """
+
+    def __init__(self, coordinates_np, elements_np, degree,
+                 # Option 1: Standard E, nu
+                 E=None, nu=None,
+                 # Option 2: Direct Lame-like params for modified model
+                 custom_lame_for_J_minus_1_sq=None, mu_direct=None,
+                 use_J_minus_1_sq_volumetric=False, # Flag to switch model
+                 precompute_matrices=True, device=None, dtype=torch.float64):
+        super(SOFAStVenantKirchhoffModelModified, self).__init__()
+
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.dtype = dtype
+        print(f"SOFAStVenantKirchhoffModelModified: Using device: {self.device}, dtype: {self.dtype}")
+
+        self.use_J_minus_1_sq_volumetric = use_J_minus_1_sq_volumetric
+
+        if self.use_J_minus_1_sq_volumetric:
+            if custom_lame_for_J_minus_1_sq is None or mu_direct is None:
+                raise ValueError("For J-1 squared volumetric term, 'custom_lame_for_J_minus_1_sq' and 'mu_direct' must be provided.")
+            self.custom_lame = torch.tensor(custom_lame_for_J_minus_1_sq, dtype=self.dtype, device=self.device)
+            self.mu = torch.tensor(mu_direct, dtype=self.dtype, device=self.device)
+            # lmbda is not used in this custom formulation
+            self.lmbda = torch.tensor(0.0, dtype=self.dtype, device=self.device) # Placeholder
+            print(f"Using MODIFIED StVK: custom_lame (for (J-1)^2)={self.custom_lame.item():.2f}, mu={self.mu.item():.2f}")
+        else:
+            if E is None or nu is None:
+                raise ValueError("For standard StVK, 'E' and 'nu' must be provided.")
+            self.E = torch.tensor(E, dtype=self.dtype, device=self.device)
+            self.nu = torch.tensor(nu, dtype=self.dtype, device=self.device)
+            if torch.abs(1.0 - 2.0 * self.nu) < 1e-9 or torch.abs(1.0 + self.nu) < 1e-9:
+                 print("Warning: nu is close to 0.5 or -1. Adjusting Lamé parameters calculation.")
+                 safe_nu = torch.clamp(self.nu, min=-0.99999, max=0.49999)
+                 self.lmbda = self.E * safe_nu / ((1 + safe_nu) * (1 - 2 * safe_nu))
+                 self.mu = self.E / (2 * (1 + safe_nu))
+            else:
+                 self.lmbda = self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu))
+                 self.mu = self.E / (2 * (1 + self.nu))
+            print(f"Using STANDARD StVK: E={self.E.item():.2f}, nu={self.nu.item():.2f}, mu={self.mu.item():.2f}, lambda={self.lmbda.item():.2f}")
+
+
+        self.degree = degree
+        self.coordinates = torch.tensor(coordinates_np, device=self.device, dtype=self.dtype)
+        self.elements = torch.tensor(elements_np, device=self.device, dtype=torch.long)
+
+        self.num_nodes = self.coordinates.shape[0]
+        self.dim = self.coordinates.shape[1]
+        self.num_elements = self.elements.shape[0]
+        self.nodes_per_element = self.elements.shape[1]
+
+        if self.dim != 3:
+            print(f"Warning: Expected 3D coordinates, but got {self.dim}D.")
+        if self.use_J_minus_1_sq_volumetric and self.nodes_per_element != 4:
+            print(f"Warning: (J-1)^2 volumetric term is primarily intended/verified for linear tetrahedra (4 nodes). Current: {self.nodes_per_element} nodes.")
+
+
+        print(f"Mesh info loaded: {self.num_nodes} nodes, {self.num_elements} elements")
+        print(f"Nodes per element: {self.nodes_per_element} (degree={self.degree})")
+
+        self._setup_elements(precompute_matrices)
+        self.precompute_matrices = precompute_matrices
+        self.eps = torch.tensor(1e-10, dtype=self.dtype, device=self.device)
+
+    # --- _setup_elements, _generate_quadrature, _precompute_derivatives, _shape_function_derivatives_ref ---
+    # These methods remain largely the same as in your original Code 2.
+    # For linear tetrahedra, the existing 4-point quadrature is acceptable.
+    # Since F is constant in a linear tet, the energy density will be constant
+    # across these 4 QPs, and the sum of (Density * Vol_QP_i * Weight_QP_i)
+    # will correctly give Density * Total_Vol_element.
+    # If one strictly wanted to mimic a single-point evaluation like Code 1 might imply:
+    # you could modify _generate_quadrature for nodes_per_element == 4 to use
+    # 1 quadrature point (e.g., centroid [0.25,0.25,0.25]) and weight 1.0 (if detJ_all
+    # is scaled to be the element volume directly, or 1/6 if detJ_all is det(dX/dxi_iso)).
+    # However, the current 4-point rule is generally fine and more standard.
+
+    def _setup_elements(self, precompute=True):
+        """Setup element data and potentially precompute matrices"""
+        self._generate_quadrature() # Depends on self.nodes_per_element
+
+        if precompute:
+            print("Precomputing element shape function derivatives...")
+            self._precompute_derivatives()
+            self.precomputed = True
+            print("Precomputation finished.")
+        else:
+            print("Derivatives will be computed on-the-fly (less efficient).")
+            self.precomputed = False
+            self.dN_dx_all = None
+            self.detJ_all = None # This stores det(dX/dxi_iso) for each element and QP
+
+    def _generate_quadrature(self):
+        """Generate quadrature rules based ONLY on nodes_per_element."""
+        if self.nodes_per_element == 4:  # Linear Tetrahedron
+            self.quadrature_points = torch.tensor([
+                [0.58541020, 0.13819660, 0.13819660],
+                [0.13819660, 0.58541020, 0.13819660],
+                [0.13819660, 0.13819660, 0.58541020],
+                [0.13819660, 0.13819660, 0.13819660]
+            ], dtype=self.dtype, device=self.device)
+            self.quadrature_weights = torch.tensor([0.25, 0.25, 0.25, 0.25],
+                                                  dtype=self.dtype,
+                                                  device=self.device) / 6.0 # 1/6 for tet volume
+            print(f"Using 4-point quadrature for {self.nodes_per_element}-node elements.")
+        elif self.nodes_per_element == 8: # Linear Hexahedron
+            gp = 1.0 / torch.sqrt(torch.tensor(3.0, device=self.device, dtype=self.dtype))
+            self.quadrature_points = torch.tensor([
+                [-gp, -gp, -gp], [ gp, -gp, -gp], [ gp,  gp, -gp], [-gp,  gp, -gp],
+                [-gp, -gp,  gp], [ gp, -gp,  gp], [ gp,  gp,  gp], [-gp,  gp,  gp]
+            ], dtype=self.dtype, device=self.device)
+            self.quadrature_weights = torch.ones(8, dtype=self.dtype, device=self.device)
+            print(f"Using 8-point (2x2x2 Gauss) quadrature for {self.nodes_per_element}-node elements.")
+        elif self.nodes_per_element == 10: # Quadratic Tetrahedron
+             print(f"Warning: Using placeholder 5-point quadrature for {self.nodes_per_element}-node Tet. Verify accuracy.")
+             a = 0.108103018168070; b = 0.445948490915965
+             self.quadrature_points = torch.tensor([
+                 [0.25, 0.25, 0.25], [a, a, a], [b, a, a], [a, b, a], [a, a, b]
+             ], dtype=self.dtype, device=self.device)
+             w0 = -0.8 / 6.0; w1 = 0.325 / 6.0 # 1/6 for tet volume
+             self.quadrature_weights = torch.tensor([w0, w1, w1, w1, w1], dtype=self.dtype, device=self.device) * 4.0 # Not sure about this *4.0
+        else:
+            raise NotImplementedError(f"Quadrature rule not implemented for {self.nodes_per_element}-node elements.")
+        self.num_quad_points = len(self.quadrature_points)
+
+
+    def _precompute_derivatives(self):
+        num_qp = self.num_quad_points
+        self.dN_dx_all = torch.zeros((self.num_elements, num_qp, self.nodes_per_element, self.dim),
+                                    dtype=self.dtype, device=self.device)
+        self.detJ_all = torch.zeros((self.num_elements, num_qp), # This stores det(dX/dxi_iso)
+                                   dtype=self.dtype, device=self.device)
+        for e_idx in range(self.num_elements):
+            element_node_indices = self.elements[e_idx]
+            element_coords = self.coordinates[element_node_indices] # Rest coordinates X
+            for q_idx, qp_ref in enumerate(self.quadrature_points):
+                dN_dxi = self._shape_function_derivatives_ref(qp_ref) # Derivatives in ref element coords
+                J_mat = torch.einsum('ni,nj->ij', element_coords, dN_dxi) # Jacobian of X(xi) map
+                try:
+                    detJ = torch.linalg.det(J_mat)
+                    invJ = torch.linalg.inv(J_mat)
+                except torch.linalg.LinAlgError as err:
+                     print(f"Error computing inv/det(J_mat) for element {e_idx} at QP {q_idx}: {err}")
+                     detJ = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+                     invJ = torch.zeros_like(J_mat)
+                if detJ <= 0: # detJ is det(dX/dxi)
+                     print(f"Warning: Non-positive Jacobian determinant ({detJ.item():.4e}) for element {e_idx} at QP {q_idx}. Check mesh quality.")
+                dN_dX = torch.einsum('nj,jk->nk', dN_dxi, invJ) # dN/dX (derivatives w.r.t. material/rest coords)
+                self.dN_dx_all[e_idx, q_idx] = dN_dX
+                self.detJ_all[e_idx, q_idx] = detJ # Store det(dX/dxi_iso)
+
+    def _shape_function_derivatives_ref(self, qp_ref):
+        if self.nodes_per_element == 4: # Linear Tetrahedron
+             dN_dxi = torch.tensor([
+                 [-1.0, -1.0, -1.0], [ 1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0], [ 0.0,  0.0,  1.0]
+             ], dtype=self.dtype, device=self.device)
+        elif self.nodes_per_element == 8: # Linear Hexahedron
+            xi, eta, zeta = qp_ref[0], qp_ref[1], qp_ref[2]
+            one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
+            xim, xip, etam, etap, zetam, zetap = one-xi, one+xi, one-eta, one+eta, one-zeta, one+zeta
+            dN_dxi = torch.zeros((8, 3), dtype=self.dtype, device=self.device)
+            eighth = 0.125
+            dN_dxi[0, 0] = -eighth * etam * zetam; dN_dxi[1, 0] =  eighth * etam * zetam; dN_dxi[2, 0] =  eighth * etap * zetam; dN_dxi[3, 0] = -eighth * etap * zetam
+            dN_dxi[4, 0] = -eighth * etam * zetap; dN_dxi[5, 0] =  eighth * etam * zetap; dN_dxi[6, 0] =  eighth * etap * zetap; dN_dxi[7, 0] = -eighth * etap * zetap
+            dN_dxi[0, 1] = -eighth * xim * zetam; dN_dxi[1, 1] = -eighth * xip * zetam; dN_dxi[2, 1] =  eighth * xip * zetam; dN_dxi[3, 1] =  eighth * xim * zetam
+            dN_dxi[4, 1] = -eighth * xim * zetap; dN_dxi[5, 1] = -eighth * xip * zetap; dN_dxi[6, 1] =  eighth * xip * zetap; dN_dxi[7, 1] =  eighth * xim * zetap
+            dN_dxi[0, 2] = -eighth * xim * etam; dN_dxi[1, 2] = -eighth * xip * etam; dN_dxi[2, 2] = -eighth * xip * etap; dN_dxi[3, 2] = -eighth * xim * etap
+            dN_dxi[4, 2] =  eighth * xim * etam; dN_dxi[5, 2] =  eighth * xip * etam; dN_dxi[6, 2] =  eighth * xip * etap; dN_dxi[7, 2] =  eighth * xim * etap
+        else:
+            raise NotImplementedError(f"Shape function derivatives not implemented for {self.nodes_per_element}-node elements.")
+        return dN_dxi
+
+    def forward(self, u_tensor):
+        return self.compute_energy(u_tensor)
+
+    def compute_energy(self, displacement_batch):
+        if not self.precomputed:
+             raise RuntimeError("Energy computation requires precomputed matrices.")
+
+        is_batch = displacement_batch.dim() > 1
+        if not is_batch:
+            displacement_batch = displacement_batch.unsqueeze(0)
+        batch_size = displacement_batch.shape[0]
+        # u_reshaped should be [batch_size, num_total_nodes, dim]
+        # Ensure displacement_batch is flattened per sample then reshaped
+        u_reshaped = displacement_batch.view(batch_size, self.num_nodes, self.dim)
+
+
+        total_energy = torch.zeros(batch_size, dtype=self.dtype, device=self.device)
+        for b in range(batch_size):
+            u_sample = u_reshaped[b] # [num_nodes, dim]
+            # element_disps: [num_elements, nodes_per_element, dim]
+            element_disps = u_sample[self.elements]
+            energy_sample = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+
+            for q_idx in range(self.num_quad_points):
+                # dN_dX_q: [num_elements, nodes_per_element, dim] (derivatives w.r.t. material coords X)
+                dN_dX_q = self.dN_dx_all[:, q_idx, :, :]
+                # detJ_iso_q: [num_elements] (Jacobian determinant dX/dxi_iso)
+                detJ_iso_q = self.detJ_all[:, q_idx]
+                # qw_q: scalar (quadrature weight for this point)
+                qw_q = self.quadrature_weights[q_idx]
+
+                # grad_u = sum_nodes (u_node * dN_node/dX)
+                # element_disps: [E, N_per_E, D]
+                # dN_dX_q:       [E, N_per_E, D]
+                # grad_u:        [E, D, D]
+                grad_u = torch.einsum('end,enk->edk', element_disps, dN_dX_q) # Corrected einsum for grad_u
+                I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(self.num_elements, -1, -1)
+                F = I + grad_u # Deformation Gradient F_ij = dx_i/dX_j
+
+                energy_density_q = self._compute_energy_density_at_qp(F) # [num_elements]
+
+                # dV0 = det(dX/dxi_iso) * quad_weight_iso
+                # For tets, quad_weight_iso includes the 1/6 factor.
+                # So, detJ_iso_q * qw_q is the rest volume differential dV0 for this QP.
+                element_volume_differential = detJ_iso_q * qw_q
+                energy_sample += torch.sum(energy_density_q * element_volume_differential)
+
+            total_energy[b] = energy_sample
+
+        if not is_batch:
+            total_energy = total_energy.squeeze(0)
+        return total_energy
+
+
+    def _compute_energy_density_at_qp(self, F):
+        """
+        Compute St. Venant-Kirchhoff (StVK) strain energy density.
+        Can use standard or modified ((J-1)^2) volumetric term.
+        """
+        if F.shape[-2:] != (self.dim, self.dim):
+             raise ValueError(f"Input F must have shape [..., {self.dim}, {self.dim}], but got {F.shape}")
+
+        batch_dims = F.shape[:-2] # E.g., [num_elements]
+        I = torch.eye(self.dim, dtype=self.dtype, device=self.device).expand(*batch_dims, -1, -1)
+
+        C = torch.einsum('...ji,...jk->...ik', F, F) # Right Cauchy-Green C = FᵀF
+        E = 0.5 * (C - I) # Green-Lagrange strain E
+
+        # Deviatoric part (common to both formulations)
+        # tr(E²) = ∑_i,j (E_ij * E_ij) [*]
+        trE2 = torch.einsum('...ij,...ij->...', E, E)
+        deviatoric_energy_density = self.mu * trE2
+
+        # Volumetric part
+        if self.use_J_minus_1_sq_volumetric:
+            J = torch.linalg.det(F) # Determinant of F [*]
+            volumetric_energy_density = self.custom_lame * (J - 1.0) ** 2
+        else: # Standard StVK
+            trE = torch.sum(torch.diagonal(E, dim1=-2, dim2=-1), dim=-1) # tr(E) [*]
+            volumetric_energy_density = 0.5 * self.lmbda * (trE ** 2)
+
+        W_density = volumetric_energy_density + deviatoric_energy_density
+        return W_density
+
+    # --- Other methods (compute_gradient, compute_PK1, etc.) would also need to be
+    #     consistent with the chosen energy formulation if used.
+    #     For simplicity, they are omitted here but would need careful review. ---
+
+    def compute_gradient(self, displacement_batch):
+        """
+        Compute internal forces (negative gradient of energy w.r.t. displacements).
+        Uses torch.autograd for automatic differentiation.
+        """
+        # Ensure grad is enabled for this computation if called from a context where it might be disabled
+        is_grad_enabled_globally = torch.is_grad_enabled()
+        if not is_grad_enabled_globally:
+            torch.set_grad_enabled(True)
+
+        if not displacement_batch.requires_grad:
+            # If called multiple times, ensure it's a fresh tensor for grad computation
+            # or handle appropriately based on expected use.
+            # For a simple call, detaching and cloning is safest.
+            displacement_batch_for_grad = displacement_batch.detach().clone().requires_grad_(True)
+        else:
+            displacement_batch_for_grad = displacement_batch
+
+        energy = self.compute_energy(displacement_batch_for_grad)
+        grad_outputs = torch.ones_like(energy) # For batched energy
+
+        # Summing energy for scalar output if batching, or if energy is already scalar
+        energy_sum = energy.sum()
+
+        grad = torch.autograd.grad(
+            outputs=energy_sum,
+            inputs=displacement_batch_for_grad,
+            grad_outputs=None, # Since energy_sum is scalar
+            create_graph=torch.is_grad_enabled(), # Propagate graph if nested diff
+            retain_graph=True # Often needed if grad is used for further ops or multiple grad calls
+        )[0]
+
+        if not is_grad_enabled_globally:
+            torch.set_grad_enabled(False) # Restore global state
+
+        return grad
+
+
+
 
 # --- Boundary Condition Managers (from your example, can be kept separate) ---
 class BoundaryConditionManager:

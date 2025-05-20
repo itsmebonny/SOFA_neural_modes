@@ -75,7 +75,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- Define Fixed Force Target Magnitude ---
         # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 1
+        self.target_force_magnitude = 1e6
         # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
@@ -206,7 +206,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
             # --- Generate a new random direction for this main step ---
-            random_vec = [0, np.sqrt(2)/2, np.sqrt(2)/2] #np.random.randn(3) # Generate random vector from normal distribution
+            random_vec = np.random.randn(3) # Generate random vector from normal distribution
             norm = np.linalg.norm(random_vec)
             if norm < 1e-9: # Avoid division by zero if vector is near zero
                 self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction
@@ -295,7 +295,9 @@ class AnimationStepController(Sofa.Core.Controller):
             linear_solution_sofa_disp = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
             real_energy = self.computeInternalEnergy(real_solution_disp)
             
-            z = self.computeModalCoordinates(linear_solution_sofa_disp) 
+            z = self.computeModalCoordinates(linear_solution_sofa_disp)
+            print(f"  Modal coordinates (z) computed with shape {z.shape} for linear solution.")
+            print(f"  Z-coordinates: {z}")
             if z is not None and not np.isnan(z).any():
                 self.all_z_coords.append(z.copy())
 
@@ -442,7 +444,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 current_force_magnitude, real_energy, predicted_energy, linear_energy_modes, sofa_linear_energy,
                 l2_err_pred_real, rmse_pred_real, mse_pred_real,
                 l2_err_lin_real, rmse_lin_real, mse_lin_real,
-                l2_err_lin_sofa_real, mse_lin_sofa_real, rmse_lin_sofa_real))
+                l2_err_lin_sofa_real, rmse_lin_sofa_real, mse_lin_sofa_real ))
             
 
         except Exception as e:
@@ -660,7 +662,7 @@ class AnimationStepController(Sofa.Core.Controller):
             plt.figure(figsize=(10, 6))
             plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^')
             plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='MSE: SOFALin (MO2) vs Real (MO1)', marker='<', linestyle=':')
+            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: SOFALin (MO2) vs Real (MO1)', marker='<', linestyle=':')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average RMSE')
             plt.title('Average RMSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png")); plt.close()
