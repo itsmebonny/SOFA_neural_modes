@@ -452,6 +452,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
         'Sofa.Component.LinearSolver.Iterative',
         'Sofa.Component.LinearSolver.Direct',
         'Sofa.Component.Mass',
+        'Sofa.Component.IO.Mesh',
         'Sofa.Component.Mapping.Linear', 
         'Sofa.Component.MechanicalLoad',
         'Sofa.Component.ODESolver.Backward',
@@ -460,6 +461,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
         'Sofa.Component.Topology.Container.Dynamic',
         'Sofa.Component.Topology.Container.Grid',
         'Sofa.Component.Visual',
+        'Sofa.GL.Component.Rendering3D',
         'SofaMatrix'
     ]
     
@@ -591,23 +593,27 @@ if __name__ == "__main__":
     
     # Required plugins
     required_plugins = [
-        "Sofa.GL.Component.Rendering3D",
-        "Sofa.GL.Component.Shader",
-        "Sofa.Component.StateContainer",
-        "Sofa.Component.ODESolver.Backward",
-        "Sofa.Component.LinearSolver.Direct",
-        "Sofa.Component.IO.Mesh",
-        "Sofa.Component.MechanicalLoad",
-        "Sofa.Component.Engine.Select",
-        "Sofa.Component.SolidMechanics.FEM.Elastic",
-        "MultiThreading",
-        "SofaMatrix",
-        "Sofa.Component.SolidMechanics.FEM.HyperElastic"
+        'MultiThreading',
+        'Sofa.Component.Constraint.Projective',
+        'Sofa.Component.Engine.Select',
+        'Sofa.Component.LinearSolver.Iterative',
+        'Sofa.Component.LinearSolver.Direct',
+        'Sofa.Component.Mass',
+        'Sofa.Component.IO.Mesh',
+        'Sofa.Component.Mapping.Linear', 
+        'Sofa.Component.MechanicalLoad',
+        'Sofa.Component.ODESolver.Backward',
+        'Sofa.Component.SolidMechanics.FEM.Elastic',
+        'Sofa.Component.StateContainer',
+        'Sofa.Component.Topology.Container.Dynamic',
+        'Sofa.Component.Topology.Container.Grid',
+        'Sofa.Component.Visual',
+        'SofaMatrix'
     ]
 
     # Import all required plugins
-    for plugin in required_plugins:
-        SofaRuntime.importPlugin(plugin)
+    # for plugin in required_plugins:
+    #     SofaRuntime.importPlugin(plugin)
 
     # Create simulation directory
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
@@ -625,7 +631,7 @@ if __name__ == "__main__":
     )
 
     # Initialize simulation
-    Sofa.Simulation.init(root)
+    Sofa.Simulation.initRoot(root)
     controller.save = True
 
     if args.gui:

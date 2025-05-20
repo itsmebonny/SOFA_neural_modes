@@ -46,3 +46,4 @@ ENV/
 .vscode/
 *.code-workspace
 .history/
+runSofa.ini
