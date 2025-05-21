@@ -30,6 +30,8 @@ except ImportError:
     print("PETSc and/or SLEPc not found. Will use SciPy for eigenvalue computation.")
     print("For potentially better performance and more solver options, consider installing petsc4py and slepc4py.")
 
+# HAS_PETSC_SLEPC = False #for debugging purposes
+
 
 
 
@@ -387,92 +389,72 @@ class AnimationStepController(Sofa.Core.Controller):
                 HAS_PETSC_SLEPC = False # Force SciPy fallback
 
         if not HAS_PETSC_SLEPC: # If PETSc/SLEPc not available or failed
-            print(f"Computing {self.num_modes_to_show} eigenmodes using SciPy eigsh...")
+            print(f"Computing {self.num_modes_to_show} eigenmodes using SciPy eigh (dense solver)...")
             try:
-                # Ensure matrices are in CSR format for SciPy
-                if not isinstance(self.stiffness_matrix, sparse.csr_matrix):
-                    K_csr = self.stiffness_matrix.tocsr()
-                else:
-                    K_csr = self.stiffness_matrix
-                if not isinstance(self.mass_matrix, sparse.csr_matrix):
-                    M_csr = self.mass_matrix.tocsr()
-                else:
-                    M_csr = self.mass_matrix
+                from scipy.linalg import eigh # Import for dense solver
 
-                # SciPy's eigsh solves Kx = lambda Mx.
-                # It expects K to be symmetric and M to be symmetric positive-definite.
-                # We are looking for smallest magnitude eigenvalues, so we use sigma=0.
-                # Note: K_csr is -K from SOFA, so we use -K_csr to get positive eigenvalues for Kx = lambda Mx
+                # Get original K and M *before* BCs that zero out rows/cols for fixed DOFs
+                # self.fem.assembleKMatrix() gives -K_sofa
+                # self.mass.assembleMMatrix() gives M_sofa
                 
-                # We need to solve K*v = lambda*M*v. Our K_csr is already -K_sofa.
-                # So we solve (-K_sofa)*v = lambda*M*v.
-                # eigsh finds eigenvalues of A relative to M. Here A = -K_sofa.
-                # We want smallest eigenvalues, so sigma=0 is appropriate.
-                # 'LM' means largest magnitude. For sigma=0, this means eigenvalues closest to 0.
+                # Option 1: Re-assemble or get fresh copies if self.stiffness_matrix/mass_matrix are already modified
+                # For this example, let's assume you can get the original matrices
+                # If not, you'd need to adjust how K_orig and M_orig are obtained
                 
-                # Number of eigenvalues to compute. Add a few extra for stability and to discard zero modes.
-                num_to_compute_scipy = self.num_modes_to_show + 6 
-                
-                # Ensure K_csr is symmetric. It should be from FEM.
-                # Ensure M_csr is symmetric and positive definite.
-                
-                # We use K_csr directly (which is -Stiffness_SOFA)
-                # eigsh solves A * x = lambda * M * x
-                # Here, A = K_csr (our -Stiffness_SOFA)
-                # We want smallest eigenvalues of K_SOFA, which are largest eigenvalues of -K_SOFA (if all are negative)
-                # or eigenvalues of -K_SOFA closest to zero.
-                
-                # Let's use the original SOFA stiffness (positive definite) and find smallest eigenvalues
-                # K_orig_sofa = -self.stiffness_matrix # self.stiffness_matrix is already -K_sofa
-                
-                # We want to solve K_sofa u = omega^2 M u
-                # Our self.stiffness_matrix is -K_sofa.
-                # So we solve -self.stiffness_matrix u = omega^2 M u
-                # Or, self.stiffness_matrix u = -omega^2 M u
-                # eigsh solves A u = lambda M u.
-                # If A = self.stiffness_matrix, then lambda = -omega^2. We want lambda closest to 0 from negative side.
-                
-                # Let's use K_actual = -self.stiffness_matrix (which is the actual positive definite K)
-                K_actual_csr = -K_csr 
-                
-                eigenvalues_scipy, eigenvectors_scipy = eigsh(
-                    A=K_actual_csr, 
-                    k=num_to_compute_scipy, 
-                    M=M_csr, 
-                    sigma=1e-6, # Look for eigenvalues near 0 (but not exactly 0 to avoid issues with singular K if unconstrained)
-                    which='LM', # Largest Magnitude when sigma is used means closest to sigma.
-                    v0=None, # Initial guess vector
-                    ncv=None, # Number of Lanczos vectors
-                    maxiter=None, # Max iterations
-                    tol=1e-9, # Tolerance
-                    return_eigenvectors=True
-                )
+                # K_orig should be the actual positive semi-definite stiffness matrix
+                K_orig_sofa = self.fem.assembleKMatrix() # This is -K_sofa
+                K_orig = -sparse.csr_matrix(K_orig_sofa) # Now K_orig is K_sofa (positive semi-definite)
+                M_orig = sparse.csr_matrix(self.mass.assembleMMatrix()) # This is M_sofa (positive definite)
 
-                # Sort eigenvalues (smallest first) and corresponding eigenvectors
-                idx = eigenvalues_scipy.argsort()
-                self.eigenvalues = eigenvalues_scipy[idx]
-                self.eigenvectors = eigenvectors_scipy[:, idx]
-
-                # Filter out very small or negative eigenvalues if they are due to rigid body modes or numerical noise
-                # Keep only the smallest positive eigenvalues
-                positive_eigenvalues_mask = self.eigenvalues > 1e-9 # Threshold for "positive"
-                self.eigenvalues = self.eigenvalues[positive_eigenvalues_mask]
-                self.eigenvectors = self.eigenvectors[:, positive_eigenvalues_mask]
+                n_total_dofs = K_orig.shape[0]
+                all_dofs_indices = np.arange(n_total_dofs)
                 
-                if len(self.eigenvalues) > self.num_modes_to_show:
-                    self.eigenvalues = self.eigenvalues[:self.num_modes_to_show]
-                    self.eigenvectors = self.eigenvectors[:, :self.num_modes_to_show]
-                elif len(self.eigenvalues) == 0:
-                    print("SciPy eigsh did not find any positive eigenvalues. Check constraints and problem setup.")
+                # fixed_dofs should be defined earlier in your function
+                free_dofs_indices = np.setdiff1d(all_dofs_indices, fixed_dofs, assume_unique=True)
+
+                if len(free_dofs_indices) == 0:
+                    print("Error: No free DOFs found. Cannot solve with eigh on reduced system.")
                     self.modes_computed = False
                     return
 
+                print(f"  Solving on reduced system of {len(free_dofs_indices)} free DOFs.")
 
-                self.frequencies = np.sqrt(self.eigenvalues) / (2 * np.pi) # Eigenvalues from eigsh are omega^2
+                K_free = K_orig[free_dofs_indices, :][:, free_dofs_indices]
+                M_free = M_orig[free_dofs_indices, :][:, free_dofs_indices]
 
-                print("Checking eigenvector norms before saving (SciPy):")
+                K_free_dense = K_free.toarray()
+                M_free_dense = M_free.toarray()
+                
+                # eigh returns eigenvalues in ascending order
+                eigenvalues_reduced, eigenvectors_reduced_dense = eigh(K_free_dense, M_free_dense)
+
+                # Filter for smallest positive eigenvalues (elastic modes)
+                # The smallest eigenvalues from eigh will be the first ones.
+                positive_mask = eigenvalues_reduced > 1e-9 # Adjust threshold if needed
+                
+                filtered_eigenvalues = eigenvalues_reduced[positive_mask]
+                filtered_eigenvectors_dense = eigenvectors_reduced_dense[:, positive_mask]
+
+                if len(filtered_eigenvalues) == 0:
+                    print("SciPy eigh did not find any positive eigenvalues on the reduced system.")
+                    self.modes_computed = False
+                    return
+
+                num_found_modes = len(filtered_eigenvalues)
+                num_to_keep = min(num_found_modes, self.num_modes_to_show)
+
+                self.eigenvalues = filtered_eigenvalues[:num_to_keep]
+                selected_eigenvectors_reduced = filtered_eigenvectors_dense[:, :num_to_keep]
+
+                # Reconstruct full eigenvectors
+                self.eigenvectors = np.zeros((n_total_dofs, num_to_keep))
+                self.eigenvectors[free_dofs_indices, :] = selected_eigenvectors_reduced
+                
+                self.frequencies = np.sqrt(self.eigenvalues) / (2 * np.pi)
+
+                print("Checking eigenvector norms before saving (SciPy eigh):")
                 for i in range(min(5, self.eigenvectors.shape[1])):
-                    mode_norm = np.linalg.norm(self.eigenvectors[:, i])
+                    mode_norm = np.linalg.norm(self.eigenvectors[:, i]) # Euclidean norm of full vector
                     print(f"  Norm of Mode {i}: {mode_norm:.4e}")
 
 
@@ -482,7 +464,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 np.save(f'{matrices_dir}/{self.timestamp}/frequencies_{self.timestamp}.npy', self.frequencies)
                 
                 print("Eigenmode computation successful with SLEPc!")
-                for i in range(min(nconv, len(self.eigenvalues))):
+                for i in range(len(self.eigenvalues)):
                     print(f"Mode {i+1}: λ = {self.eigenvalues[i]:.6e}, f = {self.frequencies[i]:.4f} Hz")
                     
                 # [Rest of your code for saving eigenmodes]
