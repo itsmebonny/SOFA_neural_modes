@@ -16,6 +16,11 @@ import traceback
 from scipy import sparse
 
 # --- Import the renamed solver class ---
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from tests.solver import SOFANeoHookeanModel, SOFAStVenantKirchhoffModel, SOFAStVenantKirchhoffModelModified
 
 # In train.py - add these imports
@@ -27,9 +32,6 @@ import pyvista # Keep pyvista for visualization
 import seaborn as sns          # Add seaborn
 
 
-# Add after imports
-from slepc4py import SLEPc
-from petsc4py import PETSc
 
 logger = logging.getLogger('train')
 
@@ -434,13 +436,20 @@ class Routine:
         """
         print("Attempting to load SOFA matrices, modes, and mesh data...")
         if matrices_path is None:
-            matrices_path = 'matrices'
+            matrices_path = 'matrices' # Default relative path
+
+        # --- Convert to absolute path if not already ---
+        if not os.path.isabs(matrices_path):
+            # project_root is defined at the module level
+            matrices_path = os.path.join(project_root, matrices_path)
+            print(f"Converted matrices_path to absolute: {matrices_path}")
+        # --- End absolute path conversion ---
 
         if not os.path.exists(matrices_path):
             print(f"Matrices path does not exist: {matrices_path}")
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None # Added one None for fixed_dofs_np
 
-        # Find the latest subdirectory if timestamp not specified
+            # Find the latest subdirectory if timestamp not specified
         if timestamp is None:
             subdirs = [d for d in os.listdir(matrices_path) if os.path.isdir(os.path.join(matrices_path, d))]
             if not subdirs:
@@ -731,7 +740,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 10
+                deformation_scale_final = 20
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -765,20 +774,21 @@ class Routine:
                 # # --- End of New Logistic Decay ---
                 
                 # Generate random samples in [-1, 1]
-                # z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
+                print(f"Generating random samples in [{-current_scale}, {current_scale}] for batch size {batch_size} and latent dim {L}")
+                z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
 
-                # --- Regular Sampling of Latent Space ---
-                num_samples_per_mode = 15  # Number of samples along each mode
+                # # --- Regular Sampling of Latent Space ---
+                # num_samples_per_mode = 15  # Number of samples along each mode
                 
-                # Create a grid of latent vectors
-                grid_coords = [torch.linspace(-1, 1, num_samples_per_mode, device=self.device) for _ in range(L)]
+                # # Create a grid of latent vectors
+                # grid_coords = [torch.linspace(-1, 1, num_samples_per_mode, device=self.device) for _ in range(L)]
                 
-                # Use torch.meshgrid to create all combinations of latent values
-                mesh = torch.meshgrid(*grid_coords, indexing='ij')
+                # # Use torch.meshgrid to create all combinations of latent values
+                # mesh = torch.meshgrid(*grid_coords, indexing='ij')
                 
-                # Stack the meshgrid tensors and reshape to (num_samples_total, latent_dim)
-                z_unit_range = torch.stack(mesh).reshape(-1, L)
-                print(f"Number of samples: {z_unit_range.shape[0]}")
+                # # Stack the meshgrid tensors and reshape to (num_samples_total, latent_dim)
+                # z_unit_range = torch.stack(mesh).reshape(-1, L)
+                # print(f"Number of samples: {z_unit_range.shape[0]}")
                                 
                 # Apply the decaying scales
                 # Unsqueeze individual_mode_scales to (1, L) for broadcasting with (batch_size, L)
@@ -1418,31 +1428,6 @@ class Routine:
     
 
     
-    # First add this function to your Routine class (copied from linear_modes.py):
-    def compute_modal_coordinates(self, u_array, modal_matrix, M):
-        """
-        Compute modal coordinates using mass orthonormalization
-        Args:
-            u_array: displacement field as numpy array
-            modal_matrix: matrix containing eigenvectors as columns
-            M: mass matrix from eigenvalue problem
-        Returns:
-            q: modal coordinates
-        """
-        # Convert to PETSc vector
-        u_vec = PETSc.Vec().createWithArray(u_array)
-        
-        # Initialize vector for modal coordinates
-        q = np.zeros(modal_matrix.shape[1])
-        
-        # Compute modal coordinates using mass orthonormalization
-        for i in range(modal_matrix.shape[1]):
-            phi_i = PETSc.Vec().createWithArray(modal_matrix[:, i])
-            Mphi = M.createVecLeft()
-            M.mult(phi_i, Mphi)
-            q[i] = u_vec.dot(Mphi) / phi_i.dot(Mphi)
-        
-        return q
     
     def compute_safe_scaling_factor(self):
         """
@@ -1994,8 +1979,13 @@ def main():
     parser.add_argument('--analyze', action='store_true', help='perform analysis (visualization, correlations) after training/loading')
     parser.add_argument('--init-checkpoint', type=str, default=None, help='path to checkpoint to initialize model weights before training (does not load optimizer)')
     args = parser.parse_args()
+    config_file_path = args.config
+    if not os.path.isabs(config_file_path):
+        # project_root is defined at the module level
+        config_file_path = os.path.join(project_root, config_file_path)
 
-    cfg = load_config(args.config)
+
+    cfg = load_config(config_file_path)
     # Use checkpoint_dir from config for logs
     log_dir_base = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
     log_dir_specific = cfg.get('training', {}).get('log_dir', 'logs')
