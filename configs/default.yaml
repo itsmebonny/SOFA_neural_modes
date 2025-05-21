@@ -17,8 +17,8 @@ physics:
   rayleigh_stiffness: 0.1
   rayleigh_mass: 0.1
   solver_iterations: 1000
-  solver_tolerance: 1e-4
-  solver_threshold: 1e-4
+  solver_tolerance: 1e-6
+  solver_threshold: 1e-6
   num_substeps: 50 # Added for substep logic
 
 simulation:
@@ -30,7 +30,7 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 2
+  latent_dim: 5
   hid_layers: 16
   hid_dim: 64
   use_modal_derivatives: true
