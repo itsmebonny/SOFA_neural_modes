@@ -16,6 +16,11 @@ import traceback
 from scipy import sparse
 
 # --- Import the renamed solver class ---
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from tests.solver import SOFANeoHookeanModel, SOFAStVenantKirchhoffModel, SOFAStVenantKirchhoffModelModified
 
 # In train.py - add these imports
@@ -431,13 +436,20 @@ class Routine:
         """
         print("Attempting to load SOFA matrices, modes, and mesh data...")
         if matrices_path is None:
-            matrices_path = 'matrices'
+            matrices_path = 'matrices' # Default relative path
+
+        # --- Convert to absolute path if not already ---
+        if not os.path.isabs(matrices_path):
+            # project_root is defined at the module level
+            matrices_path = os.path.join(project_root, matrices_path)
+            print(f"Converted matrices_path to absolute: {matrices_path}")
+        # --- End absolute path conversion ---
 
         if not os.path.exists(matrices_path):
             print(f"Matrices path does not exist: {matrices_path}")
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None # Added one None for fixed_dofs_np
 
-        # Find the latest subdirectory if timestamp not specified
+            # Find the latest subdirectory if timestamp not specified
         if timestamp is None:
             subdirs = [d for d in os.listdir(matrices_path) if os.path.isdir(os.path.join(matrices_path, d))]
             if not subdirs:
@@ -728,7 +740,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 10
+                deformation_scale_final = 20
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -1967,8 +1979,13 @@ def main():
     parser.add_argument('--analyze', action='store_true', help='perform analysis (visualization, correlations) after training/loading')
     parser.add_argument('--init-checkpoint', type=str, default=None, help='path to checkpoint to initialize model weights before training (does not load optimizer)')
     args = parser.parse_args()
+    config_file_path = args.config
+    if not os.path.isabs(config_file_path):
+        # project_root is defined at the module level
+        config_file_path = os.path.join(project_root, config_file_path)
 
-    cfg = load_config(args.config)
+
+    cfg = load_config(config_file_path)
     # Use checkpoint_dir from config for logs
     log_dir_base = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
     log_dir_specific = cfg.get('training', {}).get('log_dir', 'logs')
