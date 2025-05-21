@@ -463,7 +463,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 np.save(f'{matrices_dir}/{self.timestamp}/eigenvectors_{self.timestamp}.npy', self.eigenvectors)
                 np.save(f'{matrices_dir}/{self.timestamp}/frequencies_{self.timestamp}.npy', self.frequencies)
                 
-                print("Eigenmode computation successful with SLEPc!")
+                print("Eigenmode computation successful with SciPy!")
                 for i in range(len(self.eigenvalues)):
                     print(f"Mode {i+1}: λ = {self.eigenvalues[i]:.6e}, f = {self.frequencies[i]:.4f} Hz")
                     
@@ -473,7 +473,7 @@ class AnimationStepController(Sofa.Core.Controller):
    
                     
             except Exception as e:
-                print(f"Error computing eigenmodes with SLEPc: {e}")
+                print(f"Error computing eigenmodes: {e}")
                 import traceback
                 traceback.print_exc()
                 self.modes_computed = False
@@ -665,9 +665,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     
     # Add visual model
     visual = exactSolution.addChild("visual")
-    visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
-    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
-
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 1 0 1')
+    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./visual')
 
 
     # Create and add controller with all components
