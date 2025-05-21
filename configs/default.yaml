@@ -30,7 +30,7 @@ constraints:
 
 # Neural model configuration
 model:
-  latent_dim: 2
+  latent_dim: 10
   hid_layers: 16
   hid_dim: 64
   use_modal_derivatives: true
