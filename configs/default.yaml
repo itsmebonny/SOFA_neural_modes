@@ -5,7 +5,7 @@ mesh:
 
 # Material properties
 material:
-  youngs_modulus: 400000000
+  youngs_modulus: 10000
   poissons_ratio: 0.2
   density: 1000
   volume: 10.0
@@ -19,10 +19,10 @@ physics:
   solver_iterations: 1000
   solver_tolerance: 1e-4
   solver_threshold: 1e-4
-  num_substeps: 50 # Added for substep logic
+  num_substeps: 25 # Added for substep logic
 
 simulation:
-  steps: 1 # Default number of main steps
+  steps: 50 # Default number of main steps
   max_z_amplitude_scale: 1
 # Constraint parameters
 constraints:

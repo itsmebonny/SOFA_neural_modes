@@ -39,16 +39,6 @@ class AnimationStepController(Sofa.Core.Controller):
         self.exactSolution = kwargs.get('exactSolution')
         self.cff = kwargs.get('cff') # Keep this if createScene adds an initial one
 
-                # --- Linear Solution Components ---
-        self.linearSolution = kwargs.get('linearSolution')
-        self.MO2 = kwargs.get('MO2') # MechObj for linear
-        self.linearFEM = kwargs.get('linearFEM') # Linear FEM ForceField
-        self.cff_linear = None # Placeholder for linear solution CFF
-
-        self.MO_LinearModes = kwargs.get('MO_LinearModes') # MechObj for Linear Modes Viz
-        self.MO_NeuralPred = kwargs.get('MO_NeuralPred')   # MechObj for Neural Pred Viz
-        self.visual_LM = kwargs.get('visual_LM') # Visual for Linear Modes
-        self.visual_NP = kwargs.get('visual_NP') # Visual for Neural Pred
 
 
 
@@ -75,7 +65,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- Define Fixed Force Target Magnitude ---
         # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 1e6
+        self.target_force_magnitude = 50
         # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
@@ -199,9 +189,6 @@ class AnimationStepController(Sofa.Core.Controller):
             # Reset positions for all models
             rest_pos = self.MO1.rest_position.value
             self.MO1.position.value = rest_pos
-            if self.MO2: self.MO2.position.value = rest_pos # Reset linear model 
-            if self.MO_LinearModes: self.MO_LinearModes.position.value = rest_pos # Reset viz model
-            if self.MO_NeuralPred: self.MO_NeuralPred.position.value = rest_pos # Reset viz model
 
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
@@ -222,7 +209,9 @@ class AnimationStepController(Sofa.Core.Controller):
         current_force_magnitude = self.target_force_magnitude * substep_fraction # Store magnitude for analysis
         incremental_force = self.current_main_step_direction * current_force_magnitude # Apply magnitude to current direction
 
-        print(f"  Substep {substep_fraction}/{self.num_substeps}: Applying force = {incremental_force}")
+        current_substep_in_main_step = (self.current_substep % self.num_substeps) + 1
+        print(f"  Main Step {self.current_main_step + 1}, Substep {current_substep_in_main_step}/{self.num_substeps}: Applying force = {incremental_force}")
+
 
         if self.cff is not None:
             try:
@@ -231,16 +220,6 @@ class AnimationStepController(Sofa.Core.Controller):
                 print(f"Warning: Error removing CFF (Exact): {e}")
             finally:
                  self.cff = None # Clear the reference
-        # Linear Solution
-        if self.cff_linear is not None:
-            try:
-                self.linearSolution.removeObject(self.cff_linear)
-            except Exception as e:
-                print(f"Warning: Error removing CFF (Linear): {e}")
-            finally:
-                 self.cff_linear = None # Clear the reference
-        # --- End Remove CFFs ---
-
 
         # --- Create and add new CFFs ---
         try:
@@ -253,16 +232,6 @@ class AnimationStepController(Sofa.Core.Controller):
                                totalForce=incremental_force.tolist(),
                                showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
             self.cff.init()
-
-            # Linear Solution
-            force_roi_linear = self.linearSolution.getObject('ForceROI')
-            if force_roi_linear is None: raise ValueError("ForceROI (Linear) not found.")
-            self.cff_linear = self.linearSolution.addObject('ConstantForceField',
-                               name="CFF_Linear_Step",
-                               indices="@ForceROI.indices",
-                               totalForce=incremental_force.tolist(),
-                               showArrowSize=0.0) # Hide arrow for linear model
-            self.cff_linear.init()
 
             # --- Initialize Parent Nodes (if needed after adding objects) ---
             # self.exactSolution.init() # May not be needed if cff.init() is sufficient
@@ -312,76 +281,27 @@ class AnimationStepController(Sofa.Core.Controller):
                 save_folder = os.path.join("z_dataset", f"{num_modes}_modes")
                 os.makedirs(save_folder, exist_ok=True)
                 
-                existing_files = glob.glob(os.path.join(save_folder, "data_*.npz"))
-                next_index = len(existing_files)
-                save_filename = os.path.join(save_folder, f"data_{next_index:04d}.npz")
+                # Determine the next index for saving files
+                existing_data_files = glob.glob(os.path.join(save_folder, "data_*.npz"))
+                next_index = len(existing_data_files)
                 
-                np.savez(save_filename, 
+                # --- Save modal data (z and energy) ---
+                data_filename = os.path.join(save_folder, f"data_{next_index:04d}.npz")
+                np.savez(data_filename, 
                     z=z_real, 
-                    energy=energy_real, 
-                    force_magnitude=self.last_applied_force_magnitude,
-                    force_direction=self.current_main_step_direction,
-                    displacement_hyperelastic=u_real_all_dofs) # Added displacement for completeness
-                # print(f"Saved modal data to {save_filename}")
-            except Exception as e:
-                print(f"Error saving modal data: {e}")
+                    energy=energy_real)
+                # print(f"Saved modal data to {data_filename}")
 
-        # --- Get SOFA Linear State (MO2) ---
-        u_sofa_linear_all_dofs = np.full_like(u_real_all_dofs, np.nan)
-        energy_sofa_linear = np.nan
-        if self.MO2:
-            try:
-                pos_sofa_linear_all_dofs = self.MO2.position.value
-                # Assuming MO2 shares the same rest_position as MO1 or its own rest_position is set correctly
-                u_sofa_linear_all_dofs = pos_sofa_linear_all_dofs - self.MO2.rest_position.value 
-                energy_sofa_linear = self.computeInternalEnergy(u_sofa_linear_all_dofs)
-            except Exception as e:
-                print(f"Warning: Could not process SOFA Linear (MO2) state: {e}")
-        
-        # --- Linear Modes Prediction (based on z_real) ---
-        u_linear_modes_pred_flat = np.full(u_real_all_dofs.flatten().shape, np.nan)
-        energy_linear_modes = np.nan
-        if self.linear_modes is not None and self.MO_LinearModes:
-            try:
-                linear_modes_np = self.linear_modes.cpu().numpy() if isinstance(self.linear_modes, torch.Tensor) else self.linear_modes
-                u_linear_modes_pred_flat = linear_modes_np @ z_real
-                u_linear_modes_pred_all_dofs = u_linear_modes_pred_flat.reshape(rest_pos_all_dofs.shape)
-                pos_linear_modes_pred_all_dofs = rest_pos_all_dofs + u_linear_modes_pred_all_dofs
-                self.MO_LinearModes.position.value = pos_linear_modes_pred_all_dofs
-                energy_linear_modes = self.computeInternalEnergy(u_linear_modes_pred_all_dofs)
-            except Exception as e:
-                print(f"Warning: Error during Linear Modes prediction/visualization: {e}")
+                # --- Save displacement data ---
+                displacement_filename = os.path.join(save_folder, f"displacement_{next_index:04d}.npz")
+                np.savez(displacement_filename,
+                    u_flat=u_real_all_dofs.flatten())
+                # print(f"Saved displacement data to {displacement_filename}")
 
-        # --- Neural Network Prediction (based on z_real) ---
-        u_nn_pred_flat = np.full(u_real_all_dofs.flatten().shape, np.nan)
-        energy_nn_pred = np.nan
-        if hasattr(self.routine, 'model') and self.routine.model is not None and \
-           hasattr(self.routine.model, 'decode') and \
-           hasattr(self.routine, 'device') and self.linear_modes is not None and self.MO_NeuralPred:
-            try:
-                z_real_tensor = torch.tensor(z_real, device=self.routine.device, dtype=torch.float64).unsqueeze(0)
-                u_correction_y_tensor = self.routine.model.decode(z_real_tensor)
-                u_correction_y_flat = u_correction_y_tensor.squeeze(0).detach().cpu().numpy()
-
-                # Use the already computed u_linear_modes_pred_flat if available and not NaN
-                if not np.any(np.isnan(u_linear_modes_pred_flat)):
-                    u_nn_pred_flat_calc = u_linear_modes_pred_flat + u_correction_y_flat
-                else: # Fallback if linear modes prediction failed
-                    linear_modes_np_nn = self.linear_modes.cpu().numpy() if isinstance(self.linear_modes, torch.Tensor) else self.linear_modes
-                    u_linear_part_for_nn = linear_modes_np_nn @ z_real
-                    u_nn_pred_flat_calc = u_linear_part_for_nn + u_correction_y_flat
-                
-                if not np.any(np.isnan(u_nn_pred_flat_calc)) and not np.any(np.isinf(u_nn_pred_flat_calc)):
-                    u_nn_pred_flat = u_nn_pred_flat_calc
-                    u_nn_pred_all_dofs = u_nn_pred_flat.reshape(rest_pos_all_dofs.shape)
-                    pos_nn_pred_all_dofs = rest_pos_all_dofs + u_nn_pred_all_dofs
-                    self.MO_NeuralPred.position.value = pos_nn_pred_all_dofs
-                    energy_nn_pred = self.computeInternalEnergy(u_nn_pred_all_dofs)
-                else:
-                    print("Warning: NN prediction contained NaN/Inf. Using NaN for energy and displacement.")
             except Exception as e:
-                print(f"Warning: Error during NN prediction: {e}")
-        
+                print(f"Error saving data: {e}")
+                traceback.print_exc()
+
 
         _substep_idx_this_main_step = self.current_substep # This is the one that just ran (0 to N-1)
         _main_step_idx_this_main_step = self.current_main_step # This is the one that just ran (0 to M-1)
@@ -643,77 +563,6 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
     visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
 
-    # Add a second model beam with TetrahedronFEMForceField, which is linear
-    # --- Add Linear Solution Node ---
-    linearSolution = rootNode.addChild('LinearSolution', activated=True)
-    linearSolution.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
-    linearSolution.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
-    MO2 = linearSolution.addObject('MechanicalObject', name='MO2', template='Vec3d', src='@grid') # Named MO2
-
-    # Add system components (similar to exactSolution)
-    linearSolution.addObject('StaticSolver', name="ODEsolver",
-                           newton_iterations=20,
-                           printLog=True) # Maybe less logging for this one
-
-    linearSolution.addObject('CGLinearSolver',
-                           template="CompressedRowSparseMatrixMat3x3d",
-                           iterations=config['physics'].get('solver_iterations', 1000),
-                           tolerance=config['physics'].get('solver_tolerance', 1e-6),
-                           threshold=config['physics'].get('solver_threshold', 1e-6),
-                           warmStart=True)
-
-    # Use the linear FEM force field
-    linearFEM = linearSolution.addObject('TetrahedronFEMForceField', # Store reference
-                           name="LinearFEM",
-                           youngModulus=young_modulus,
-                           poissonRatio=poisson_ratio,
-                           method="small") 
-
-    # Add constraints (same as exactSolution)
-    linearSolution.addObject('BoxROI',
-                           name='ROI',
-                           box=" ".join(str(x) for x in fixed_box_coords),
-                           drawBoxes=False) # Maybe hide this box
-    linearSolution.addObject('FixedConstraint', indices="@ROI.indices")
-
-    linearSolution.addObject('BoxROI',
-                           name='ForceROI',
-                           box=" ".join(str(x) for x in force_box_coords),
-                           drawBoxes=False) # Maybe hide this box
-    # Add a CFF to the linear model as well, controlled separately if needed, or linked
-    # For now, just add it so the structure is parallel. It won't be actively controlled by the current controller.
-    linearSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.0)
-
-    # Add visual model for the linear solution (optional, maybe different color)
-    visualLinear = linearSolution.addChild("visualLinear")
-    visualLinear.addObject('OglModel', src='@../MO2', color='0 0 1 1') # Blue color
-    visualLinear.addObject('BarycentricMapping', input='@../MO2', output='@./')
-    # --- End Linear Solution Node ---
-
-
-    # --- Add Node for Linear Modes Visualization Only ---
-    linearModesViz = rootNode.addChild('LinearModesViz', activated=True)
-    linearModesViz.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
-    linearModesViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
-    MO_LinearModes = linearModesViz.addObject('MechanicalObject', name='MO_LinearModes', template='Vec3d', src='@grid')
-    # Add visual model
-    visualLinearModes = linearModesViz.addChild("visualLinearModes")
-    visualLinearModes.addObject('OglModel', src='@../MO_LinearModes', color='1 1 0 1') # Yellow color
-    visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./')
-    # --- End Linear Modes Viz Node ---
-
-
-    # --- Add Node for Neural Prediction Visualization Only ---
-    neuralPredViz = rootNode.addChild('NeuralPredViz', activated=True)
-    neuralPredViz.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
-    neuralPredViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
-    MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
-    # Add visual model
-    visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    visualNeuralPred.addObject('OglModel', src='@../MO_NeuralPred', color='1 0 1 1') # Magenta color
-    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./')
-    # --- End Neural Pred Viz Node ---
-
 
     # Create and add controller with all components
     controller = AnimationStepController(rootNode,
@@ -723,13 +572,6 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         surface_topo=surface_topo,
                                         MO1=MO1, # Real SOFA solution
                                         fixed_box=fixed_box,
-                                        linearSolution=linearSolution, # Pass linear node
-                                        MO2=MO2, # SOFA Linear MechObj
-                                        linearFEM=linearFEM, # Pass linear FEM FF
-                                        MO_LinearModes=MO_LinearModes, # Pass Linear Modes Viz MechObj
-                                        MO_NeuralPred=MO_NeuralPred,   # Pass Neural Pred Viz MechObj
-                                        visualLinearModes=visualLinearModes, # Pass Linear Modes Viz
-                                        visualNeuralPred=visualNeuralPred, # Pass Neural Pred Viz
                                         directory=directory,
                                         sample=sample,
                                         key=key,
