@@ -5,10 +5,10 @@ import numpy as np
 import logging
 from abc import ABC, abstractmethod
 import pyvista
-from dolfinx import plot
+#from dolfinx import plot
 import traceback
-from dolfinx.io import gmshio
-from mpi4py import MPI
+#from dolfinx.io import gmshio
+#from mpi4py import MPI
 import matplotlib.pyplot as plt
 
 from torch import nn
