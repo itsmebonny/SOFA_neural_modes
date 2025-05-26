@@ -743,18 +743,30 @@ class Routine:
         from itertools import product
         import random
 
+        # mode_scale = 25
+        # print(f"Generating regularly spaced samples in [{-mode_scale}, {mode_scale}] for latent dim {L}")
+        # num_samples_per_mode = 7  # Number of samples along each mode
+        # numbers = np.linspace(-1, 1, num_samples_per_mode)
+        # combo = torch.Tensor(list(product(numbers, repeat=self.latent_dim)))
+        # num_samples = len(combo)
+        # print(f"Number of samples: {num_samples}")
+        # z_all = combo * mode_scale
+        # np.savetxt('z.txt', z_all, fmt='%.2f') 
+        # random_indices = random.sample(range(num_samples), num_samples) #random list of indices in the full sample set (z_all)
+      
+
         mode_scale = 25
         print(f"Generating regularly spaced samples in [{-mode_scale}, {mode_scale}] for latent dim {L}")
-        num_samples_per_mode = 5  # Number of samples along each mode
+        num_samples_per_mode = 20  # Number of samples along each mode
         numbers = np.linspace(-1, 1, num_samples_per_mode)
-        combo = torch.Tensor(list(product(numbers, repeat=self.latent_dim)))
+        combo = torch.Tensor(list(product(numbers, repeat=1))) ## only one mode 
         num_samples = len(combo)
         print(f"Number of samples: {num_samples}")
-        z_all = combo * mode_scale
+        z_all = torch.zeros([num_samples, L], dtype=torch.float64)
+        z_all[:,4] = (combo * mode_scale).flatten()
         np.savetxt('z.txt', z_all, fmt='%.2f') 
-        random_indices = random.sample(range(num_samples), num_samples) #random list of indices in the full sample set (z_all)
-        #print(f"Samples: {z}")
-      
+        random_indices = random.sample(range(num_samples), num_samples) #random list of indices in the full sample set (z_all)      
+        print(f"Samples: {z_all}")
 
         while iteration < num_epochs:  # Set a maximum iteration count or use other stopping criteria
             # Generate random latent vectors and linear displacements
@@ -801,7 +813,8 @@ class Routine:
                 # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
 
-                z = z_all[random_indices[iteration*batch_size:(iteration+1)*batch_size]] 
+                #z = z_all[random_indices[iteration*batch_size:(iteration+1)*batch_size]] 
+                z = z_all[random_indices[iteration:iteration+batch_size]] 
                 print("z = ", z)
                 
                 # Compute linear displacements
