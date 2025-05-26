@@ -700,7 +700,7 @@ class Routine:
                 
                 # Generate latent vectors 
                 deformation_scale_init = 1
-                deformation_scale_final = 20
+                deformation_scale_final = 10
                 #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
                 current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
@@ -917,7 +917,7 @@ class Routine:
                     'loss': loss_val,
                 }
                 patience = 0
-                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa.pt'))
+                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa_paper.pt'))
                 print(f"============ BEST MODEL UPDATED ============")
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
                 print(f"============================================")
@@ -1133,7 +1133,7 @@ class Routine:
         
         if is_best:
             print(f"Epoch {epoch+1}: New best model with loss {loss:.6e}")
-            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_sofa.pt'))
+            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_sofa_paper.pt'))
 
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint with robust error handling"""
@@ -1631,7 +1631,7 @@ def main():
     print("Starting main function...")
     # Parse arguments
     parser = argparse.ArgumentParser(description='Hybrid Simulation SOFA')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path') # Default to sofa config
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='config file path') # Default to sofa config
     parser.add_argument('--resume', action='store_true', help='resume from best checkpoint')
     parser.add_argument('--skip-training', action='store_true', help='skip training and load best model')
     parser.add_argument('--checkpoint', type=str, default=None, help='specific checkpoint path to load')
@@ -1656,7 +1656,7 @@ def main():
 
     # Determine checkpoint path
     checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
-    best_checkpoint_filename = 'best_sofa.pt' # Specific name for SOFA training
+    best_checkpoint_filename = 'best_sofa_paper.pt' # Specific name for SOFA training
     default_checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint_filename)
 
     # Use specific checkpoint if provided, otherwise default best, handle resume flag

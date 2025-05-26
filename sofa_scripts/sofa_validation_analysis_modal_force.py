@@ -195,10 +195,10 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateBeginEvent(self, event):
 
 
-        modes_to_use = [4]
+        self.modes_to_use = [4] # Example: Use mode 4 only, it is a list of indices to use for modal coordinates
         #check if the indices are valid
-        if any(idx >= self.linear_modes_np.shape[1] for idx in modes_to_use):
-            print(f"Error: One or more mode indices {modes_to_use} exceed available modes ({self.linear_modes_np.shape[1]}).")
+        if any(idx >= self.linear_modes_np.shape[1] for idx in self.modes_to_use):
+            print(f"Error: One or more mode indices {self.modes_to_use} exceed available modes ({self.linear_modes_np.shape[1]}).")
             return
 
         if self.current_substep == 0: # Start of a new main step
@@ -209,7 +209,7 @@ class AnimationStepController(Sofa.Core.Controller):
             if self.MO_NeuralPred: self.MO_NeuralPred.position.value = rest_pos
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
-            base_z_coeffs = np.random.rand(len(modes_to_use)) * 2 - 1 # Random coefficients in [-1, 1]
+            base_z_coeffs = np.random.rand(len(self.modes_to_use)) * 2 - 1 # Random coefficients in [-1, 1]
          
 
             self.base_z_pattern_for_main_step = base_z_coeffs * self.max_z_amplitude_scale
@@ -223,7 +223,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.current_applied_z = self.base_z_pattern_for_main_step * current_amplitude_scale
 
         # Compute distributed forces: F = Phi * z
-        current_step_distributed_forces = self.linear_modes_np[:, modes_to_use] @ self.current_applied_z  # (num_dofs,)
+        current_step_distributed_forces = self.linear_modes_np[:, self.modes_to_use] @ self.current_applied_z  # (num_dofs,)
 
         # Reshape forces to (num_nodes, 3)
         self.force_in_newton = current_step_distributed_forces.reshape(-1, 3)
@@ -389,14 +389,14 @@ class AnimationStepController(Sofa.Core.Controller):
                 num_available_modes = self.routine.linear_modes.shape[1]
                 modes_to_select = min(latent_dim_for_z, num_available_modes)
                 
-                modes_to_use = self.routine.linear_modes[:, :modes_to_select].to(self.routine.device)
+                modes_used = self.routine.linear_modes[:, :modes_to_select].to(self.routine.device)
                 
                 # Adjust z_for_nn_th if it was longer than available modes
                 if z_for_nn_th.shape[1] > modes_to_select:
                     z_for_nn_th = z_for_nn_th[:, :modes_to_select]
 
                 # l_th is Phi * z_input_to_NN (which is now z_actual_sofa)
-                l_th = torch.matmul(modes_to_use, z_for_nn_th.T).squeeze() # Squeeze if z_for_nn_th was unsqueezed
+                l_th = torch.matmul(modes_used, z_for_nn_th.T).squeeze() # Squeeze if z_for_nn_th was unsqueezed
 
                 with torch.no_grad():
                     y_th = self.routine.model(z_for_nn_th).squeeze() # Squeeze if z_for_nn_th was unsqueezed

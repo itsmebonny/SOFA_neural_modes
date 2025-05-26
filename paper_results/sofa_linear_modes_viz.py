@@ -197,7 +197,7 @@ class AnimationStepController(Sofa.Core.Controller):
         print("Boundary conditions applied to matrices")
 
         # Create directory for matrices and mesh data
-        matrices_dir = 'matrices'
+        matrices_dir = 'matrices_paper'
         os.makedirs(matrices_dir, exist_ok=True)
         output_subdir = os.path.join(matrices_dir, self.timestamp)
         os.makedirs(output_subdir, exist_ok=True)
@@ -617,7 +617,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
 
     # Create high resolution solution node
     exactSolution = rootNode.addChild('HighResSolution2D', activated=True)
-    exactSolution.addObject('MeshOBJLoader', name='grid', filename=mesh_filename)
+    exactSolution.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
     print(f"Loading mesh from {mesh_filename}")
     surface_topo = exactSolution.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
     MO1 = exactSolution.addObject('MechanicalObject', name='DOFs', template='Vec3d', src='@grid')
