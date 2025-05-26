@@ -7,6 +7,9 @@
 /z_debug
 z_dataset
 
+runSofa.ini
+/configs
+
 cantilever_modal.py
 neohookean.cpp
 pablo_loss.py

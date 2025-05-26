@@ -195,7 +195,11 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateBeginEvent(self, event):
 
 
-        num_modes_modal_force = min(5, self.routine.latent_dim)
+        modes_to_use = [4]
+        #check if the indices are valid
+        if any(idx >= self.linear_modes_np.shape[1] for idx in modes_to_use):
+            print(f"Error: One or more mode indices {modes_to_use} exceed available modes ({self.linear_modes_np.shape[1]}).")
+            return
 
         if self.current_substep == 0: # Start of a new main step
             rest_pos = self.MO1.rest_position.value
@@ -205,7 +209,7 @@ class AnimationStepController(Sofa.Core.Controller):
             if self.MO_NeuralPred: self.MO_NeuralPred.position.value = rest_pos
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
-            base_z_coeffs = np.random.rand(num_modes_modal_force) * 2 - 1 # Random coefficients in [-1, 1]
+            base_z_coeffs = np.random.rand(len(modes_to_use)) * 2 - 1 # Random coefficients in [-1, 1]
          
 
             self.base_z_pattern_for_main_step = base_z_coeffs * self.max_z_amplitude_scale
@@ -219,7 +223,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.current_applied_z = self.base_z_pattern_for_main_step * current_amplitude_scale
 
         # Compute distributed forces: F = Phi * z
-        current_step_distributed_forces = self.linear_modes_np[:, :num_modes_modal_force] @ self.current_applied_z  # (num_dofs,)
+        current_step_distributed_forces = self.linear_modes_np[:, modes_to_use] @ self.current_applied_z  # (num_dofs,)
 
         # Reshape forces to (num_nodes, 3)
         self.force_in_newton = current_step_distributed_forces.reshape(-1, 3)
