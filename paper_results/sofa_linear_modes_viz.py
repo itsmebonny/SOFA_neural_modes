@@ -617,7 +617,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
 
     # Create high resolution solution node
     exactSolution = rootNode.addChild('HighResSolution2D', activated=True)
-    exactSolution.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
+    exactSolution.addObject('MeshOBJLoader', name='grid', filename=mesh_filename)
+    print(f"Loading mesh from {mesh_filename}")
     surface_topo = exactSolution.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
     MO1 = exactSolution.addObject('MechanicalObject', name='DOFs', template='Vec3d', src='@grid')
     
@@ -699,7 +700,7 @@ if __name__ == "__main__":
     
     # Add argument parser
     parser = argparse.ArgumentParser(description='SOFA Matrix Creation and Modal Analysis')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='Path to config file')
     parser.add_argument('--gui', action='store_true', help='Enable GUI mode')
     parser.add_argument('--steps', type=int, default=2, help='Number of steps to run in headless mode')
     
