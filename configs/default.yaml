@@ -5,7 +5,7 @@ mesh:
 
 # Material properties
 material:
-  youngs_modulus: 10000
+  youngs_modulus: 1000000
   poissons_ratio: 0.4
   density: 1000
   volume: 10.0
@@ -37,7 +37,7 @@ model:
 
 # Training parameters
 training:
-  num_epochs: 310
+  num_epochs: 11
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"

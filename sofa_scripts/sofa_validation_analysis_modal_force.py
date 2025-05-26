@@ -394,8 +394,11 @@ class AnimationStepController(Sofa.Core.Controller):
                 # Use up to latent_dim_for_z modes, or all available modes if fewer
                 num_available_modes = self.routine.linear_modes.shape[1]
                 modes_to_select = min(latent_dim_for_z, num_available_modes)
-                
                 modes_to_use = self.routine.linear_modes[:, :modes_to_select].to(self.routine.device)
+
+                modes_to_select = 1
+                modes_to_use = torch.Tensor([4])
+                print("modes_to_use : ", modes_to_use)
                 
                 # Adjust z_for_nn_th if it was longer than available modes
                 if z_for_nn_th.shape[1] > modes_to_select:
@@ -868,8 +871,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     
     # Add visual model
     visual = exactSolution.addChild("visual")
-    visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
-    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 1 0 1')
+    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./visual')
 
     # Add a second model beam with TetrahedronFEMForceField, which is linear
     # --- Add Linear Solution Node ---
@@ -915,9 +919,10 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     # For now, just add it so the structure is parallel. It won't be actively controlled by the current controller.
 
     # Add visual model for the linear solution (optional, maybe different color)
-    visualLinear = linearSolution.addChild("visualLinear")
-    visualLinear.addObject('OglModel', src='@../MO2', color='0 0 1 1') # Blue color
-    visualLinear.addObject('BarycentricMapping', input='@../MO2', output='@./')
+    visual = exactSolution.addChild("visual")
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 0 1 1')
+    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./visual')
     # --- End Linear Solution Node ---
 
 
@@ -927,9 +932,10 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     linearModesViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
     MO_LinearModes = linearModesViz.addObject('MechanicalObject', name='MO_LinearModes', template='Vec3d', src='@grid')
     # Add visual model
-    visualLinearModes = linearModesViz.addChild("visualLinearModes")
-    visual_LM = visualLinearModes.addObject('OglModel', src='@../MO_LinearModes', color='1 1 0 1') # Yellow color
-    visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./')
+    visualLinearModes = exactSolution.addChild("visualLinearModes")
+    visual_LM = visualLinearModes.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visualLinearModes.addObject('OglModel', name='visual', src='@surface_mesh', color='1 1 0 1') # yellow color
+    visualLinearModes.addObject('BarycentricMapping', input='@../DOFs', output='@./visual')
     # --- End Linear Modes Viz Node ---
 
 
@@ -940,8 +946,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
     # Add visual model
     visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    visual_NP = visualNeuralPred.addObject('OglModel', src='@../MO_NeuralPred', color='1 0 1 1') # Magenta color
-    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./')
+    visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
+    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
     # --- End Neural Pred Viz Node ---
 
 
