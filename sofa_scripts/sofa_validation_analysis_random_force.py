@@ -76,7 +76,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- Define Fixed Force Target Magnitude ---
         # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 1e6
+        self.target_force_magnitude = 50
         # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
@@ -296,7 +296,7 @@ class AnimationStepController(Sofa.Core.Controller):
             linear_solution_sofa_disp = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
             real_energy = self.computeInternalEnergy(real_solution_disp)
             
-            z = self.computeModalCoordinates(linear_solution_sofa_disp)
+            z = self.computeModalCoordinates(real_solution_disp)
             print(f"  Modal coordinates (z) computed with shape {z.shape} for linear solution.")
             print(f"  Z-coordinates: {z}")
             if z is not None and not np.isnan(z).any():

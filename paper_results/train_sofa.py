@@ -1,21 +1,19 @@
+
+
+
+
+
 import argparse
 import os, sys, logging
 import numpy as np
 import torch
 torch.set_default_dtype(torch.float64)
 from torch.utils.tensorboard import SummaryWriter
+import math
+
+
 import traceback
 from scipy import sparse
-
-if torch.backends.mps.is_available():
-    mps_device = torch.device("mps")
-    print ("Using Mac GPU through MPS")
-elif torch.cuda.is_available():
-    torch.device("gpu")
-    print ("Using CUDA")
-else :
-    torch.device("cpu")
-    print ("Using CPU")
 
 # --- Import the renamed solver class ---
 
@@ -220,6 +218,14 @@ class ResidualNet(torch.nn.Module):
         return y
     
    
+
+
+
+
+
+
+
+
 
 # Add this class near the top of your file, after imports
 class LBFGSScheduler:
@@ -620,10 +626,10 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 20  # You can add this to config
+        batch_size = 8  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
-        print_every = 10
-        checkpoint_every = 5
+        print_every = 1
+        checkpoint_every = 50
         
         # Get rest shape (undeformed configuration)
         coordinates_th = torch.tensor(self.coordinates_np, device=self.device, dtype=torch.float64)
@@ -631,7 +637,7 @@ class Routine:
         X = X.view(1, -1).expand(batch_size, -1)
         
         # Use a subset of linear modes (you might need to adjust indices)
-        L = self.num_modes  # Use at least 3 linear modes
+        L = self.num_modes  # Use at most 3 linear modes
         linear_modes = self.linear_modes[:, :L]  # Use the first L modes
         
         # Setup iteration counter and best loss tracking
@@ -682,54 +688,9 @@ class Routine:
         if not hasattr(self, 'viz_plotter'):
             self.create_live_visualizer()
 
-        # Generate latent vectors 
-        deformation_scale_init = 1
-        deformation_scale_final = 1.5
-        #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
-        #current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
+        
 
-        # # Create a grid of latent vectors
-        # #grid_coords = [torch.linspace(-1, 1, num_samples_per_mode, device=self.device) for _ in range(L)]
-        # grid_coords = torch.linspace(-1, 1, num_samples_per_mode, device=self.device)
-                
-        # # Use torch.meshgrid to create all combinations of latent values
-        # mesh = torch.meshgrid(*grid_coords, indexing='ij')
-                
-        # # Stack the meshgrid tensors and reshape to (num_samples_total, latent_dim)
-        # z_unit_range = torch.stack(mesh).reshape(-1, L)
-                                
-
-        # --- Regular Sampling of Latent Space ---
-        from itertools import product
-        import random
-
-        print(f"Generating regularly spaced samples for latent dim {L}")
-        num_samples_per_mode = 9  # Number of samples along each mode
-        mode_scale = torch.ones(self.latent_dim) # uniform weight (z) of 1 for all modes
-        mode_scale[0] = 5.0 # set bending range
-        mode_scale[1] = 10.0 # set bending range
-        mode_scale[4] = 25.0 # set twist scale to a larger value
-        numbers = np.linspace(-1, 1, num_samples_per_mode)
-        combo = torch.Tensor(list(product(numbers, repeat=self.latent_dim)))
-        num_samples = len(combo)
-        print(f"Number of samples: {num_samples}")
-        z_all = combo * mode_scale
-        np.savetxt('z.txt', z_all, fmt='%.2f') 
-        random_indices = random.sample(range(num_samples), num_samples) #random list of indices in the full sample set (z_all)
-      
-
-        # mode_scale = 25
-        # print(f"Generating regularly spaced samples in [{-mode_scale}, {mode_scale}] for latent dim {L}")
-        # num_samples_per_mode = 11  # Number of samples along each mode
-        # numbers = np.linspace(-1, 1, num_samples_per_mode)
-        # combo = torch.Tensor(list(product(numbers, repeat=1))) ## only one mode 
-        # num_samples = len(combo)
-        # print(f"Number of samples: {num_samples}")
-        # z_all = torch.zeros([num_samples, L], dtype=torch.float64)
-        # z_all[:,4] = (combo * mode_scale).flatten()
-        # np.savetxt('z.txt', z_all, fmt='%.2f') 
-        # random_indices = random.sample(range(num_samples), num_samples) #random list of indices in the full sample set (z_all)      
-        # print(f"Samples: {z_all}")
+       
 
         while iteration < num_epochs:  # Set a maximum iteration count or use other stopping criteria
             # Generate random latent vectors and linear displacements
@@ -737,48 +698,50 @@ class Routine:
             lbfgs_iter = 0
             with torch.no_grad():
                 
-                #print(f"Current scale: {current_scale}")
-                # mode_scales = torch.tensor(self.compute_eigenvalue_based_scale(), device=self.device, dtype=torch.float64)[:L]
-                # mode_scales[4] = mode_scales[0]
-                # mode_scales[5] = mode_scales[1]
-                
-                # mode_scales = mode_scales * current_scale
-                # # # --- New Logistic Decay for Z sampling range ---
-                # # current_scale is the max amplitude for the first mode
-                # # Hyperparameters for logistic decay:
-                # min_amplitude_factor = 0.05  # Min amplitude as a factor of current_scale (e.g., 5%)
-                # inflection_point_mode_ratio = 0.1 # Decay is sharpest around this fraction of modes (e.g., first 10%)
-                # decay_steepness = 1.0 # Controls how sharp the decay is. Higher is sharper.
+                # Generate latent vectors 
+                deformation_scale_init = 1
+                deformation_scale_final = 10
+                #current_scale = deformation_scale_init * (deformation_scale_final/deformation_scale_init)**(iteration/num_epochs) #expoential scaling
+                current_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) #* (iteration/num_epochs) #linear scaling
 
-                # max_amplitude_mode0 = current_scale
-                # min_amplitude_higher_modes = max_amplitude_mode0 * min_amplitude_factor
-                
-                # mode_indices = torch.arange(L, device=self.device, dtype=torch.float64)
-                # inflection_point_abs = L * inflection_point_mode_ratio
-                
-                # # Logistic decay formula: Min + (Max - Min) / (1 + exp(steepness * (x - x0)))
-                # # This creates a decay from Max down to Min
-                # exponent_term = decay_steepness * (mode_indices - inflection_point_abs)
-                # logistic_decay_value = 1.0 / (1.0 + torch.exp(exponent_term))
-                
-                # individual_mode_scales = min_amplitude_higher_modes + \
-                #                          (max_amplitude_mode0 - min_amplitude_higher_modes) * logistic_decay_value
-                # # --- End of New Logistic Decay ---
+                print(f"Current scale: {current_scale}")
+
+                # --- Random Sampling of Latent Space ---
                 
                 # Generate random samples in [-1, 1]
-                #print(f"Generating random samples in [{-current_scale}, {current_scale}] for batch size {batch_size} and latent dim {L}")
-                #z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
-            
+                print(f"Generating random samples in [{-current_scale}, {current_scale}] for batch size {batch_size} and latent dim {L}")
+                z_unit_range = torch.rand(batch_size, L, device=self.device) * 2.0 - 1.0
+
+                # --- End Random Sampling of Latent Space ---
+
+                # # --- Regular Sampling of Latent Space ---
+                # num_samples_per_mode = 15  # Number of samples along each mode
+                
+                # # Create a grid of latent vectors
+                # grid_coords = [torch.linspace(-1, 1, num_samples_per_mode, device=self.device) for _ in range(L)]
+                
+                # # Use torch.meshgrid to create all combinations of latent values
+                # mesh = torch.meshgrid(*grid_coords, indexing='ij')
+                
+                # # Stack the meshgrid tensors and reshape to (num_samples_total, latent_dim)
+                # z_unit_range = torch.stack(mesh).reshape(-1, L)
+                # print(f"Number of samples: {z_unit_range.shape[0]}")
+
+                # # --- End Regular Sampling of Latent Space ---
+
+                ### ==================== Comment either the random or regular sampling section above, depending on your needs ==================== ###
+                                
+                # Apply the decaying scales
+                # Unsqueeze individual_mode_scales to (1, L) for broadcasting with (batch_size, L)
+                z = z_unit_range * current_scale
+                
                 # Ensure the rest shape (if used) has zero latent activation
                 #z = z * torch.rand(batch_size, 1, device=self.device) * 0.999 + 0.001
+
 
                 # z = torch.rand(batch_size, L, device=self.device) * mode_scales * 2 - mode_scales
                 # z[rest_idx, :] = 0  # Set rest shape latent to zero
                 #concatenate the generated samples with the rest shape
-
-                #z = z_all[random_indices[iteration*batch_size:(iteration+1)*batch_size]] 
-                z = z_all[random_indices[iteration:iteration+batch_size]] 
-                #print("z = ", z)
                 
                 # Compute linear displacements
                 l = torch.matmul(z, linear_modes.T)
@@ -812,12 +775,17 @@ class Routine:
                     # Compute energy (use your energy calculator)
                     u_total_batch = l + y
                     
+                    
+                    
                     # After (if processing a batch):
                     batch_size = u_total_batch.shape[0]
 
                     energies = self.energy_calculator(u_total_batch)
                     energy = torch.mean(energies)  # Average energy across batch
              
+
+          
+                    
                     # Compute orthogonality constraint (using the same approach as reference)
                     ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
                     
@@ -833,9 +801,10 @@ class Routine:
                         # Calculate the squared L2 norm of displacements at fixed DOFs, averaged over batch
                         bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
 
-                    # Scale energy by maximum linear displacement to get comparable units
-                    max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
-                    energies_scaling = energies / max_linear_disp**2
+
+
+                 
+
 
 
                     # Compute improvement in energy for metric  
@@ -843,18 +812,23 @@ class Routine:
                     energy_linear = self.energy_calculator(u_linear_only).mean()
                     energy_improvement = (torch.relu(energy_linear - energy))/(energy_linear + 1e-8)  
 
-                    scale_value = 0.00001
-                    energy_tanh = torch.tanh(scale_value * energy)
+
                                 
                     # Get the raw div(P) tensor
                     # raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
+
+
+
+
+
                     # Modified loss
-                    loss = energy + 1e8 * ortho + 1e8 * bc_penalty 
+                    loss = energy + 1e10 * ortho + 1e10 * bc_penalty 
 
                     loss.backward()
 
-                
+                    
+
                     # Print stats periodically
                     if iteration % print_every == 0:
                         # Create a clean, organized training progress display
@@ -943,7 +917,7 @@ class Routine:
                     'loss': loss_val,
                 }
                 patience = 0
-                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa.pt'))
+                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa_paper.pt'))
                 print(f"============ BEST MODEL UPDATED ============")
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
                 print(f"============================================")
@@ -1029,7 +1003,7 @@ class Routine:
         for i in range(2):
             plotter.subplot(0, i)
             plotter.camera_position = [(20.0, 3.0, 2.0), (0.0, -2.0, 0.0), (0.0, 0.0, 2.0)]
-            plotter.camera.zoom(0.5)
+            plotter.camera.zoom(1.5)
         plotter.link_views()
 
         print("Visualizer created.")
@@ -1159,7 +1133,7 @@ class Routine:
         
         if is_best:
             print(f"Epoch {epoch+1}: New best model with loss {loss:.6e}")
-            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_sofa.pt'))
+            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_sofa_paper.pt'))
 
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint with robust error handling"""
@@ -1657,7 +1631,7 @@ def main():
     print("Starting main function...")
     # Parse arguments
     parser = argparse.ArgumentParser(description='Hybrid Simulation SOFA')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path') # Default to sofa config
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='config file path') # Default to sofa config
     parser.add_argument('--resume', action='store_true', help='resume from best checkpoint')
     parser.add_argument('--skip-training', action='store_true', help='skip training and load best model')
     parser.add_argument('--checkpoint', type=str, default=None, help='specific checkpoint path to load')
@@ -1682,7 +1656,7 @@ def main():
 
     # Determine checkpoint path
     checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
-    best_checkpoint_filename = 'best_sofa.pt' # Specific name for SOFA training
+    best_checkpoint_filename = 'best_sofa_paper.pt' # Specific name for SOFA training
     default_checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint_filename)
 
     # Use specific checkpoint if provided, otherwise default best, handle resume flag

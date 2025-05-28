@@ -1,12 +1,12 @@
 # Mesh configuration
 mesh:
-  filename: "mesh/beam_732.msh"
+  filename: "mesh/bunny.msh"
   fem_degree: 1  # Degree of the finite element space
 
 # Material properties
 material:
-  youngs_modulus: 100000000 # was 1000000
-  poissons_ratio: 0.2 # was 0.4
+  youngs_modulus: 400000000
+  poissons_ratio: 0.2
   density: 1000
   volume: 10.0
 
@@ -17,27 +17,27 @@ physics:
   rayleigh_stiffness: 0.1
   rayleigh_mass: 0.1
   solver_iterations: 1000
-  solver_tolerance: 1e-6
-  solver_threshold: 1e-6
-  num_substeps: 50 # Added for substep logic
+  solver_tolerance: 1e-4
+  solver_threshold: 1e-4
+  num_substeps: 25 # Added for substep logic
 
 simulation:
-  steps: 1 # Default number of main steps
-  max_z_amplitude_scale: 750 # was 75
+  steps: 50 # Default number of main steps
+  max_z_amplitude_scale: 1
 # Constraint parameters
 constraints:
-  fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]
+  fixed_box: [-1.01, -0.78, -1.01, 1.01, -0.72, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]
 
 # Neural model configuration
 model:
-  latent_dim: 5
+  latent_dim: 10
   hid_layers: 16
   hid_dim: 64
   use_modal_derivatives: true
 
 # Training parameters
 training:
-  num_epochs: 366
+  num_epochs: 1000
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"
@@ -48,5 +48,5 @@ training:
 # Matrix handling configuration
 matrices:
   use_sofa_matrices: true
-  matrices_path: "matrices"
+  matrices_path: "matrices_paper"
   timestamp: null  # Set to specific timestamp or null for latest

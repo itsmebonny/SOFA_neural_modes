@@ -5,6 +5,11 @@
 /validation_results
 /force_inference
 /z_debug
+z_dataset
+/matrices_paper
+
+runSofa.ini
+/configs
 
 cantilever_modal.py
 neohookean.cpp

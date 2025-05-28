@@ -440,7 +440,7 @@ if __name__ == '__main__':
     import sys
     import os
 
-    mesh_type = "beam"
+    mesh_type = "stl_one"
 
     if mesh_type == "beam":
         gmsh.initialize(sys.argv)
@@ -463,7 +463,7 @@ if __name__ == '__main__':
         create_plate_with_hole(length, width, thickness, hole_radius, hole_x, hole_y, 0.07)
         gmsh.finalize()
     elif mesh_type == "stl":
-        object_folder = "mesh/objects"
+        object_folder = "mesh"
 
         # Initialize GMSH
         gmsh.initialize(sys.argv)
@@ -498,7 +498,7 @@ if __name__ == '__main__':
     elif mesh_type == "stl_one":
 
 
-        stl_file = "mesh/armadillo.stl"
+        stl_file = "mesh/bunny.stl"
         if not os.path.exists(stl_file):
             print(f"Error: STL file not found: {stl_file}")
         else:

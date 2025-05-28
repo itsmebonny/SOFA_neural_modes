@@ -69,7 +69,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- Define Fixed Force Target Magnitude ---
         # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 1
+        self.target_force_magnitude = 1e7
         # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
@@ -102,7 +102,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- For Reconstruction Analysis ---
         self.perform_reconstruction_analysis = kwargs.get('perform_reconstruction_analysis', True)
-        self.max_modes_reconstruction = kwargs.get('max_modes_reconstruction', 25)
+        self.max_modes_reconstruction = kwargs.get('num_modes_to_show', 5)
         self.reconstruction_analysis_data = [] # Stores dicts: {'ForceMag': fm, 'NumModes_k': k, 'RMSE_Reconstruction': rmse}
         # --- End Reconstruction Analysis Init ---
 
@@ -233,7 +233,6 @@ class AnimationStepController(Sofa.Core.Controller):
         self.start_time = process_time()
 
 
-
     def onAnimateEndEvent(self, event):
         """
         Called by SOFA's animation loop after each physics step.
@@ -244,50 +243,124 @@ class AnimationStepController(Sofa.Core.Controller):
             real_solution_disp = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
             real_energy = self.computeInternalEnergy(real_solution_disp)
             
-            z = self.computeModalCoordinates(real_solution_disp) 
+            # --- Primary Modal Analysis (using all routine.latent_dim modes) ---
+            z = self.computeModalCoordinates(real_solution_disp) # This uses all modes in self.routine.linear_modes
             if z is not None and not np.isnan(z).any():
                 self.all_z_coords.append(z.copy())
 
-
-            predicted_energy, linear_energy_modes = float('nan'), float('nan')
+            linear_energy_modes = float('nan')
             l2_err_lin_real, rmse_lin_real, mse_lin_real = float('nan'), float('nan'), float('nan')
             l_th_reshaped_np, real_solution_reshaped = None, None
 
             if z is None or np.isnan(z).any():
-                print(f"  Warning: NaN or None detected in modal coordinates (z). Skipping NN prediction.")
+                print(f"  Warning: NaN or None detected in modal coordinates (z) for primary analysis.")
             else:
-                z_th = torch.tensor(z, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
-                if z_th.shape[1] != self.routine.latent_dim:
-                     print(f"Warning: z_th shape {z_th.shape} does not match routine.latent_dim {self.routine.latent_dim}. Adjusting z_th.")
-                     if z_th.shape[1] > self.routine.latent_dim:
-                         z_th = z_th[:, :self.routine.latent_dim]
-                     else: 
-                         padding = torch.zeros((1, self.routine.latent_dim - z_th.shape[1]), dtype=z_th.dtype, device=z_th.device)
-                         z_th = torch.cat((z_th, padding), dim=1)
+                # Ensure z matches routine.latent_dim for the primary l_th calculation
+                # computeModalCoordinates projects onto ALL modes in self.routine.linear_modes.
+                # For l_th, we typically use up to routine.latent_dim, which might be less than total modes.
+                z_for_l_th = z 
+                if len(z_for_l_th) > self.routine.latent_dim:
+                    z_for_l_th = z_for_l_th[:self.routine.latent_dim]
+                elif len(z_for_l_th) < self.routine.latent_dim:
+                    # This case should ideally not happen if computeModalCoordinates uses linear_modes up to latent_dim
+                    # OR if self.routine.linear_modes itself is already truncated to latent_dim.
+                    # Assuming self.routine.linear_modes has at least latent_dim columns.
+                    print(f"  Warning: z_for_l_th length {len(z_for_l_th)} is less than latent_dim {self.routine.latent_dim}. Padding with zeros for l_th.")
+                    z_primary_padded = np.zeros(self.routine.latent_dim)
+                    z_primary_padded[:len(z_for_l_th)] = z_for_l_th
+                    z_for_l_th = z_primary_padded
+                
+                # Convert z_for_l_th to tensor for matmul
+                z_th_tensor = torch.tensor(z_for_l_th, dtype=torch.float64, device=self.routine.device) # Shape [latent_dim]
+                
+                # Use modes up to latent_dim for the primary linear reconstruction l_th
+                # Assuming self.routine.linear_modes is [num_dofs, total_modes_available]
+                modes_for_l_th_torch = self.routine.linear_modes[:, :self.routine.latent_dim].to(self.routine.device) # Shape [num_dofs, latent_dim]
+                
+                l_th = torch.matmul(modes_for_l_th_torch, z_th_tensor).squeeze() # Shape [num_dofs]
 
-                modes_to_use = self.routine.linear_modes[:, :self.routine.latent_dim].to(self.routine.device)
-                l_th = torch.matmul(modes_to_use, z_th.T).squeeze()
-                num_nodes_mo1 = self.MO1.position.value.shape[0]  # Get num_nodes from MO1
+                num_nodes_mo1 = self.MO1.position.value.shape[0]
                 try:
                     l_th_reshaped = l_th.reshape(num_nodes_mo1, 3)
                     l_th_reshaped_np = l_th_reshaped.cpu().numpy()
-                    real_solution_reshaped = real_solution_disp.reshape(num_nodes_mo1, 3)
-
-                    # Compute energies
+                    real_solution_reshaped = real_solution_disp.reshape(num_nodes_mo1, 3) # Reshape real solution here
                     linear_energy_modes = self.computeInternalEnergy(l_th_reshaped_np)
-
-              
-
                     diff_lin_real = real_solution_reshaped - l_th_reshaped_np
                     l2_err_lin_real = np.linalg.norm(diff_lin_real)
                     mse_lin_real = np.mean(diff_lin_real**2)
                     rmse_lin_real = np.sqrt(mse_lin_real)
-
-    
                 except (RuntimeError, ValueError) as e:
-                    print(f"  Error during prediction processing/reshaping/error calc: {e}")
+                    print(f"  Error during primary linear reconstruction processing: {e}")
+            # --- End Primary Modal Analysis ---
+
+            # --- Displacement Reconstruction Analysis with Varying Number of Modes ---
+            if self.perform_reconstruction_analysis and hasattr(self.routine, 'linear_modes') and self.routine.linear_modes is not None:
+                if isinstance(self.routine.linear_modes, torch.Tensor):
+                    linear_modes_np_all = self.routine.linear_modes.cpu().numpy() # All available modes
+                else: # Assuming it's already NumPy
+                    linear_modes_np_all = self.routine.linear_modes 
+
+                M_sparse = self.routine.M if hasattr(self.routine, 'M') else None
+                num_total_available_modes = linear_modes_np_all.shape[1]
+                
+                # Ensure real_solution_reshaped is available for RMSE calculation
+                if real_solution_reshaped is None:
+                    try:
+                        real_solution_reshaped = real_solution_disp.reshape(self.MO1.position.value.shape[0], 3)
+                    except ValueError as e_reshape_real:
+                        print(f"  Error reshaping real_solution_disp for reconstruction analysis: {e_reshape_real}. Skipping reconstruction.")
+                        # Skip reconstruction for this step if real solution can't be reshaped
+                        linear_modes_np_all = None # To skip the loop below
+
+                if linear_modes_np_all is not None: # Proceed only if modes and reshaped real solution are ready
+                    max_k_to_consider = min(num_total_available_modes, self.max_modes_reconstruction)
+                    
+                    k_values_to_test = sorted(list(set(
+                        [1] + \
+                        list(range(5, max_k_to_consider + 1, 5)) + \
+                        ([max_k_to_consider] if max_k_to_consider not in list(range(5, max_k_to_consider + 1, 5)) and max_k_to_consider != 1 else [])
+                    )))
+                    # Ensure k_values are valid and do not exceed available modes
+                    k_values_to_test = [k_val for k_val in k_values_to_test if 0 < k_val <= num_total_available_modes]
 
 
+                    real_solution_flat = real_solution_disp.flatten()
+
+                    for k_modes in k_values_to_test:
+                        modes_k = linear_modes_np_all[:, :k_modes] # Select first k modes
+
+                        # Compute modal coordinates z_k for these k modes
+                        z_k_reconstruction = np.zeros(k_modes) # Initialize
+                        if M_sparse is not None and isinstance(M_sparse, sparse.spmatrix):
+                            try:
+                                modes_t_m_k = modes_k.T @ M_sparse
+                                z_k_reconstruction = modes_t_m_k @ real_solution_flat
+                            except Exception as e_proj:
+                                print(f"  Error projecting with M for k={k_modes} in reconstruction: {e_proj}. Using simple projection.")
+                                z_k_reconstruction = modes_k.T @ real_solution_flat # Fallback
+                        else: 
+                            try:
+                                z_k_reconstruction = modes_k.T @ real_solution_flat
+                            except ValueError as e_simple_proj_k:
+                                print(f"  Error during simple projection for k={k_modes}: {e_simple_proj_k}")
+                                print(f"  Shapes - modes_k.T: {modes_k.T.shape}, real_solution_flat: {real_solution_flat.shape}")
+                                continue # Skip this k_modes if projection fails
+                        
+                        u_reconstructed_k_flat = modes_k @ z_k_reconstruction
+                        try:
+                            u_reconstructed_k_reshaped = u_reconstructed_k_flat.reshape(self.MO1.position.value.shape[0], 3)
+                            diff_reconstruction = real_solution_reshaped - u_reconstructed_k_reshaped
+                            mse_reconstruction = np.mean(diff_reconstruction**2)
+                            rmse_reconstruction = np.sqrt(mse_reconstruction)
+
+                            self.reconstruction_analysis_data.append({
+                                'ForceMag': current_force_magnitude,
+                                'NumModes_k': k_modes,
+                                'RMSE_Reconstruction': rmse_reconstruction
+                            })
+                        except ValueError as e_reshape_rec:
+                            print(f"  Error reshaping reconstructed displacement for k={k_modes}: {e_reshape_rec}")
+            # --- End Reconstruction Analysis ---
             
             if self.original_positions is not None:
                 rest_pos = self.original_positions
@@ -298,11 +371,9 @@ class AnimationStepController(Sofa.Core.Controller):
                 current_force_magnitude, real_energy, linear_energy_modes,
                 l2_err_lin_real, rmse_lin_real, mse_lin_real))
             
-
         except Exception as e:
             print(f"ERROR during analysis in onAnimateEndEvent: {e}")
             traceback.print_exc()
-            # Ensure lists are appended to even on error to maintain consistent lengths
             self.substep_results.append((
                 self.last_applied_force_magnitude, 
                 float('nan'), float('nan'),
@@ -313,11 +384,12 @@ class AnimationStepController(Sofa.Core.Controller):
         if (self.current_substep % self.num_substeps) == 0:
             self.current_main_step += 1
             print(f"--- Main Step {self.current_main_step} Completed (Total Substeps: {self.current_substep}) ---")
-            # Access args globally if __main__ defines it
             if 'args' in globals() and not args.gui and self.current_main_step >= self.max_main_steps:
                  print(f"Reached maximum main steps ({self.max_main_steps}). Stopping simulation.")
                  if self.root: self.root.animate = False
         self.end_time = process_time()
+
+
 
     def computeModalCoordinates(self, displacement):
         """
@@ -425,104 +497,150 @@ class AnimationStepController(Sofa.Core.Controller):
     def close(self):
         print("\n--- Simulation Finished ---")
         if not self.substep_results:
-            print("No results collected. Skipping analysis and plotting.")
-            return
+            print("No results collected for primary analysis. Skipping analysis and plotting.")
+            # Still check if reconstruction data exists, as it might have been collected
+            # even if primary substep_results are empty (though unlikely with current flow)
+        else:
+            try:
+                import pandas as pd
+                result_columns = [
+                    'ForceMag', 'RealE', 'LinearModesE',
+                    'L2Err_Lin_Real', 'RMSE_Lin_Real', 'MSE_Lin_Real'
+                ]
+                df = pd.DataFrame(self.substep_results, columns=result_columns)
 
-        result_columns = [
-            'ForceMag', 'RealE', 'LinearModesE',
-            'L2Err_Lin_Real', 'RMSE_Lin_Real', 'MSE_Lin_Real'
-        ]
-        try:
-            import pandas as pd
-            df = pd.DataFrame(self.substep_results, columns=result_columns)
+                avg_results = df.groupby('ForceMag').mean().reset_index()
+                avg_results = avg_results.sort_values(by='ForceMag')
 
-            avg_results = df.groupby('ForceMag').mean().reset_index()
-            avg_results = avg_results.sort_values(by='ForceMag')
+                print("\n--- Average Results per Force Magnitude (Primary Analysis) ---")
+                cols_to_print = [
+                    'ForceMag', 'RealE', 'LinearModesE',
+                    'RMSE_Lin_Real', 'MSE_Lin_Real'
+                ]
+                cols_to_print_existing = [col for col in cols_to_print if col in avg_results.columns]
+                print(avg_results[cols_to_print_existing].to_string(index=False, float_format="%.4e"))
+                print("--------------------------------------------------------------\n")
 
-            print("\n--- Average Results per Force Magnitude ---")
-            cols_to_print = [
-                'ForceMag', 'RealE', 'LinearModesE',
-                'RMSE_Lin_Real', 'MSE_Lin_Real'
-            ]
-            cols_to_print_existing = [col for col in cols_to_print if col in avg_results.columns]
-            print(avg_results[cols_to_print_existing].to_string(index=False, float_format="%.4e"))
-            print("-------------------------------------------\n")
+                force_mags_plot = avg_results['ForceMag'].values
+                avg_real_e = avg_results['RealE'].values
+                avg_linear_modes_e = avg_results['LinearModesE'].values
+                avg_rmse_lin_real = avg_results['RMSE_Lin_Real'].values
+                avg_mse_lin_real = avg_results['MSE_Lin_Real'].values
 
-            force_mags_plot = avg_results['ForceMag'].values
-            avg_real_e = avg_results['RealE'].values
-            avg_linear_modes_e = avg_results['LinearModesE'].values
-            avg_rmse_lin_real = avg_results['RMSE_Lin_Real'].values
-            avg_mse_lin_real = avg_results['MSE_Lin_Real'].values
+                plot_dir = self.output_subdir if self.save else "."
+                if self.save and not os.path.exists(plot_dir):
+                    os.makedirs(plot_dir)
 
-            plot_dir = self.output_subdir if self.save else "."
-            if self.save and not os.path.exists(plot_dir):
-                os.makedirs(plot_dir)
+                num_modes_primary_analysis = None
+                if hasattr(self, 'routine') and hasattr(self.routine, 'latent_dim'):
+                    num_modes_primary_analysis = self.routine.latent_dim
+                
+                num_modes_str_primary = f" (Primary Lin. Recon. using {num_modes_primary_analysis} modes)" if num_modes_primary_analysis is not None else ""
 
-            # Determine number of linear modes for annotation
-            num_modes = None
-            if hasattr(self, 'routine') and hasattr(self.routine, 'linear_modes'):
-                lm = self.routine.linear_modes
-                if isinstance(lm, torch.Tensor):
-                    num_modes = lm.shape[1]
-                elif isinstance(lm, np.ndarray):
-                    num_modes = lm.shape[1]
+
+                # 1. Average Energy vs. Force Magnitude Plot (Linear Scale)
+                plt.figure(figsize=(10, 6))
+                plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
+                plt.plot(force_mags_plot, avg_linear_modes_e, label=f'Avg Linear Modes Energy (l, {num_modes_primary_analysis} modes)', marker='s', linestyle=':')
+                plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy')
+                plt.title(f'Average Energy vs. Applied Force Magnitude{num_modes_str_primary}')
+                plt.legend(); plt.grid(True); plt.tight_layout()
+                plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force.png")); plt.close()
+
+                # 1b. Average Energy vs. Force Magnitude Plot (Log Scale)
+                plt.figure(figsize=(10, 6))
+                valid_indices_real = avg_real_e > 0; 
+                valid_indices_linear_modes = avg_linear_modes_e > 0; 
+                if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
+                if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label=f'Avg Linear Modes Energy (l, {num_modes_primary_analysis} modes)', marker='s', linestyle=':')
+                plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy (log scale)')
+                plt.title(f'Average Energy vs. Applied Force Magnitude (Log Scale){num_modes_str_primary}')
+                plt.yscale('log')
+                plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
+                plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_log.png")); plt.close()
+
+                # 2. RMSE Errors vs Force Magnitude
+                plt.figure(figsize=(10, 6))
+                plt.plot(force_mags_plot, avg_rmse_lin_real, label=f'RMSE: LinModes (l, {num_modes_primary_analysis} modes) vs Real (MO1)', marker='v', linestyle='--')
+                plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average RMSE')
+                plt.title(f'Average RMSE vs. Applied Force Magnitude{num_modes_str_primary}')
+                plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+                plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png")); plt.close()
+
+                # 3. MSE Errors vs Force Magnitude
+                plt.figure(figsize=(10, 6))
+                plt.plot(force_mags_plot, avg_mse_lin_real, label=f'MSE: LinModes (l, {num_modes_primary_analysis} modes) vs Real (MO1)', marker='v', linestyle='--')
+                plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average MSE')
+                plt.title(f'Average MSE vs. Applied Force Magnitude{num_modes_str_primary}')
+                plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+                plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force.png")); plt.close()
+                
+                print(f"Primary analysis plots saved to {plot_dir}")
+
+            except ImportError:
+                print("Warning: pandas not found. Cannot compute average results or plot for primary analysis.")
+            except Exception as e_close_primary:
+                print(f"Error during primary analysis plotting in close method: {e_close_primary}")
+                traceback.print_exc()
+
+        # --- Plotting for Reconstruction Analysis ---
+        if self.perform_reconstruction_analysis and self.reconstruction_analysis_data:
+            try:
+                # Ensure pandas is imported if not already done by primary analysis
+                if 'pd' not in locals(): import pandas as pd
+
+                df_reconstruction = pd.DataFrame(self.reconstruction_analysis_data)
+                
+                if not df_reconstruction.empty:
+                    # Average RMSE for each number of modes used in reconstruction, across all forces
+                    avg_rmse_per_k = df_reconstruction.groupby('NumModes_k')['RMSE_Reconstruction'].mean().reset_index()
+                    avg_rmse_per_k = avg_rmse_per_k.sort_values(by='NumModes_k')
+
+                    # Get total number of available modes for plot title
+                    total_modes_available_str = ""
+                    if hasattr(self, 'routine') and hasattr(self.routine, 'linear_modes') and self.routine.linear_modes is not None:
+                        if isinstance(self.routine.linear_modes, torch.Tensor):
+                            total_modes_available_str = f" (Total Avail. Modes: {self.routine.linear_modes.shape[1]})"
+                        elif isinstance(self.routine.linear_modes, np.ndarray):
+                             total_modes_available_str = f" (Total Avail. Modes: {self.routine.linear_modes.shape[1]})"
+
+
+                    plt.figure(figsize=(10, 6))
+                    plt.plot(avg_rmse_per_k['NumModes_k'], avg_rmse_per_k['RMSE_Reconstruction'], marker='o', linestyle='-')
+                    plt.xlabel('Number of Modes (k) for Reconstruction')
+                    plt.ylabel('Average RMSE of Displacement Reconstruction')
+                    plt.title(f'Reconstruction Accuracy vs. Number of Modes Used{total_modes_available_str}')
+                    plt.grid(True, which="both", ls="--")
+                    plt.yscale('log') 
+                    plt.tight_layout()
+                    
+                    # Ensure plot_dir is defined (it would be if primary analysis ran)
+                    # If primary analysis didn't run, define it here.
+                    if 'plot_dir' not in locals():
+                        plot_dir = self.output_subdir if self.save else "."
+                        if self.save and not os.path.exists(plot_dir):
+                            os.makedirs(plot_dir)
+
+                    plt.savefig(os.path.join(plot_dir, "avg_reconstruction_rmse_vs_num_modes.png"))
+                    plt.close()
+                    print(f"Reconstruction analysis plot saved to {plot_dir}")
+
+                    print("\n--- Average Reconstruction RMSE per Number of Modes ---")
+                    print(avg_rmse_per_k.to_string(index=False, float_format="%.4e"))
+                    print("-------------------------------------------------------\n")
                 else:
-                    try:
-                        num_modes = len(lm[0])
-                    except Exception:
-                        num_modes = None
-            if num_modes is None:
-                num_modes_str = ""
-            else:
-                num_modes_str = f" (Num Linear Modes: {num_modes})"
+                    print("No data for reconstruction analysis plotting.")
 
-            # 1. Average Energy vs. Force Magnitude Plot (Linear Scale)
-            plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
-            plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
-            plt.title(f'Average Energy vs. Applied Force Magnitude{num_modes_str}')
-            plt.legend(); plt.grid(True); plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force.png")); plt.close()
+            except ImportError:
+                 print("Warning: pandas not found. Cannot process or plot reconstruction analysis data.")
+            except Exception as e_close_reconstruction:
+                print(f"Error during reconstruction analysis plotting in close method: {e_close_reconstruction}")
+                traceback.print_exc()
+        elif self.perform_reconstruction_analysis:
+            print("Reconstruction analysis was enabled, but no data was collected.")
+        # --- End Reconstruction Plotting ---
 
-            # 1b. Average Energy vs. Force Magnitude Plot (Log Scale)
-            plt.figure(figsize=(10, 6))
-            valid_indices_real = avg_real_e > 0; 
-            valid_indices_linear_modes = avg_linear_modes_e > 0; 
-            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
-            if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
-            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy (log scale)')
-            plt.title(f'Average Energy vs. Applied Force Magnitude (Log Scale){num_modes_str}')
-            plt.yscale('log')
-            plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_log.png")); plt.close()
-
-            # 2. RMSE Errors vs Force Magnitude
-            plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average RMSE')
-            plt.title(f'Average RMSE vs. Applied Force Magnitude{num_modes_str}')
-            plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png")); plt.close()
-
-            # 3. MSE Errors vs Force Magnitude
-            plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average MSE')
-            plt.title(f'Average MSE vs. Applied Force Magnitude{num_modes_str}')
-            plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force.png")); plt.close()
-
-
-            print(f"All plots saved to {plot_dir}")
-
-        except ImportError:
-            print("Warning: pandas not found. Cannot compute average results or plot.")
-        except Exception as e_close:
-            print(f"Error during close method processing: {e_close}")
-            traceback.print_exc()
-        finally:
-            print("Closing simulation")
-
+        print("Closing simulation") # This should be the final print
 
 
 def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), *args, **kwargs):
