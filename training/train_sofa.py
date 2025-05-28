@@ -704,7 +704,7 @@ class Routine:
         import random
 
         print(f"Generating regularly spaced samples for latent dim {L}")
-        num_samples_per_mode = 9  # Number of samples along each mode
+        num_samples_per_mode = 5  # Number of samples along each mode
         mode_scale = torch.ones(self.latent_dim) # uniform weight (z) of 1 for all modes
         mode_scale[0] = 5.0 # set bending range
         mode_scale[1] = 10.0 # set bending range
@@ -915,7 +915,7 @@ class Routine:
                 # Perform optimization step
                 optimizer.step(closure)
 
-                scheduler.step(loss_val)  
+                #scheduler.step(loss_val)  
 
                 # Choose a random latent vector from the batch
                 random_idx = np.random.randint(1, batch_size)

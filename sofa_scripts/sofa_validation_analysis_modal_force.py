@@ -219,7 +219,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
             #base_z_coeffs = np.random.rand(len(self.modes_to_use)) * 2 - 1 # Random coefficients in [-1, 1]
-            base_z_coeffs = np.ones(len(self.modes_to_use))  
+            base_z_coeffs = -np.ones(len(self.modes_to_use))  
 
             self.base_z_pattern_for_main_step = base_z_coeffs * self.max_z_amplitude_scale
             print(f"  Base Z pattern for main step (norm): {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}")
@@ -305,6 +305,15 @@ class AnimationStepController(Sofa.Core.Controller):
         self.start_time = process_time()
 
     def onAnimateEndEvent(self, event):
+        real_solution = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
+        linear_solution = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
+        z_nonlinear=self.computeModalCoordinates(real_solution)
+        z_linear = self.computeModalCoordinates(linear_solution)
+
+        print("z_linear    = ", z_linear)
+        print("z_nonlinear = ", z_nonlinear)
+        print("=================================")
+        
         if (self.num_substeps - self.current_substep <= 2):
             try:
                 if self.current_applied_z is not None and len(self.current_applied_z) > 0:
@@ -959,10 +968,10 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     neuralPredViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
     MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
     # Add visual model
-    # visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    # visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
-    # visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
-    # visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
+    visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
+    visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
+    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
     # --- End Neural Pred Viz Node ---
 
 
