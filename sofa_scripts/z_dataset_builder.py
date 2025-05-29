@@ -36,6 +36,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.surface_topo = kwargs.get('surface_topo')
         self.MO1 = kwargs.get('MO1')
         self.fixed_box = kwargs.get('fixed_box')
+        self.force_box = kwargs.get('force_box')
         self.exactSolution = kwargs.get('exactSolution')
         self.cff = kwargs.get('cff') # Keep this if createScene adds an initial one
 
@@ -100,9 +101,9 @@ class AnimationStepController(Sofa.Core.Controller):
         self.grad_diff_lin_modes_list = []
         self.grad_diff_nn_pred_list = []
         self.grad_diff_sofa_linear_list = []
-        # --- End lists for Deformation Gradient Differences ---
+            # --- End lists for Deformation Gradient Differences ---
 
-      
+              
 
 
     def onSimulationInitDoneEvent(self, event):
@@ -161,6 +162,7 @@ class AnimationStepController(Sofa.Core.Controller):
         if self.save:
             if not os.path.exists(output_base_dir):
                 os.mkdir(output_base_dir)
+            # Define output_subdir regardless of whether output_base_dir existed
             self.output_subdir = os.path.join(output_base_dir, self.directory)
             if not os.path.exists(self.output_subdir):
                 os.makedirs(self.output_subdir)
@@ -182,7 +184,7 @@ class AnimationStepController(Sofa.Core.Controller):
     def onAnimateBeginEvent(self, event):
         """
         Called by SOFA's animation loop before each physics step.
-        Applies incremental force based on substep, with a random direction per main step.
+        Applies incremental force based on substep, with a random side and box per main step.
         """
         # --- Check if starting a new MAIN step ---
         if self.current_substep == 0:
@@ -199,59 +201,168 @@ class AnimationStepController(Sofa.Core.Controller):
                 self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction
             else:
                 self.current_main_step_direction = random_vec / norm # Normalize to get unit vector
-            print(f"  New Random Force Direction: {self.current_main_step_direction}")
-            # --- End Generate Random Direction ---
+                print(f"  New Random Force Direction: {self.current_main_step_direction}")
+
+            # --- Define random box ---
+            # Define patch dimensions and ROI thickness
+            # These determine the size of the area where force is applied on a surface
+            patch_size_x = 1.0  # Extent of the patch in the X-direction (if applicable)
+            patch_size_y = 0.2  # Extent of the patch in the Y-direction (if applicable)
+            patch_size_z = 0.2  # Extent of the patch in the Z-direction (if applicable)
+            roi_thickness = 0.1 # Thickness of the ROI box, extending into the beam from the surface
+
+            # Beam dimensions
+            beam_x_min, beam_x_max = 0.0, 10.0
+            beam_y_min, beam_y_max = 0.0, 1.0
+            beam_z_min, beam_z_max = 0.0, 1.0
+
+            # Force application constraint for X-coordinate
+            force_x_min_limit = 2.0
+            force_x_max_limit = 10.0
+
+            # Ensure patch sizes are not too large for the beam dimensions and force limits
+            if patch_size_x > (force_x_max_limit - force_x_min_limit):
+                print(f"Warning: patch_size_x ({patch_size_x}) is too large for the X-range [{force_x_min_limit}, {force_x_max_limit}]. Adjusting.")
+                patch_size_x = force_x_max_limit - force_x_min_limit
+            if patch_size_y > (beam_y_max - beam_y_min):
+                print(f"Warning: patch_size_y ({patch_size_y}) is too large for the Y-range. Adjusting.")
+                patch_size_y = beam_y_max - beam_y_min
+            if patch_size_z > (beam_z_max - beam_z_min):
+                print(f"Warning: patch_size_z ({patch_size_z}) is too large for the Z-range. Adjusting.")
+                patch_size_z = beam_z_max - beam_z_min
+
+
+            side = np.random.randint(1, 6)  # Choose one of the 5 faces (excluding X=0 face)
+
+            if side == 1:  # Patch on Z = beam_z_max face (front face, normal pointing +Z)
+                # X-range for the patch: [force_x_min_limit, force_x_max_limit - patch_size_x]
+                x_min = np.random.uniform(force_x_min_limit, force_x_max_limit - patch_size_x)
+                x_max = x_min + patch_size_x
+                # Y-range for the patch: [beam_y_min, beam_y_max - patch_size_y]
+                y_min = np.random.uniform(beam_y_min, beam_y_max - patch_size_y)
+                y_max = y_min + patch_size_y
+                # Z-range for the patch (thin layer at the surface)
+                z_min = beam_z_max - roi_thickness
+                z_max = beam_z_max
+            elif side == 2:  # Patch on Z = beam_z_min face (back face, normal pointing -Z)
+                x_min = np.random.uniform(force_x_min_limit, force_x_max_limit - patch_size_x)
+                x_max = x_min + patch_size_x
+                y_min = np.random.uniform(beam_y_min, beam_y_max - patch_size_y)
+                y_max = y_min + patch_size_y
+                z_min = beam_z_min
+                z_max = beam_z_min + roi_thickness
+            elif side == 3:  # Patch on Y = beam_y_max face (top face, normal pointing +Y)
+                x_min = np.random.uniform(force_x_min_limit, force_x_max_limit - patch_size_x)
+                x_max = x_min + patch_size_x
+                z_min = np.random.uniform(beam_z_min, beam_z_max - patch_size_z)
+                z_max = z_min + patch_size_z
+                y_min = beam_y_max - roi_thickness
+                y_max = beam_y_max
+            elif side == 4:  # Patch on Y = beam_y_min face (bottom face, normal pointing -Y)
+                x_min = np.random.uniform(force_x_min_limit, force_x_max_limit - patch_size_x)
+                x_max = x_min + patch_size_x
+                z_min = np.random.uniform(beam_z_min, beam_z_max - patch_size_z)
+                z_max = z_min + patch_size_z
+                y_min = beam_y_min
+                y_max = beam_y_min + roi_thickness
+            elif side == 5:  # Patch on X = force_x_max_limit face (right end face, normal pointing +X)
+                    # This face is at X = 10.0 (beam_x_max)
+                y_min = np.random.uniform(beam_y_min, beam_y_max - patch_size_y)
+                y_max = y_min + patch_size_y
+                z_min = np.random.uniform(beam_z_min, beam_z_max - patch_size_z)
+                z_max = z_min + patch_size_z
+                x_min = force_x_max_limit - roi_thickness # or beam_x_max - roi_thickness
+                x_max = force_x_max_limit                 # or beam_x_max
+
+            # Ensure coordinates are within beam boundaries, just in case of float precision issues
+            x_min = np.clip(x_min, beam_x_min, beam_x_max)
+            x_max = np.clip(x_max, beam_x_min, beam_x_max)
+            y_min = np.clip(y_min, beam_y_min, beam_y_max)
+            y_max = np.clip(y_max, beam_y_min, beam_y_max)
+            z_min = np.clip(z_min, beam_z_min, beam_z_max)
+            z_max = np.clip(z_max, beam_z_min, beam_z_max)
+
+            bbox = [x_min, y_min, z_min, x_max, y_max, z_max]
+
+            # Remove existing force box and create new one
+            existing_force_roi = self.exactSolution.getObject('DynamicForceROI')
+            if existing_force_roi:
+                self.exactSolution.removeObject(existing_force_roi)
+
+            self.cff_box = self.exactSolution.addObject('BoxROI', name='DynamicForceROI', box=bbox, drawBoxes=True)
+            self.cff_box.init()
+
+            # Get the intersection with the surface
+            indices = list(self.cff_box.indices.value)
+            indices = list(set(indices).intersection(set(self.idx_surface)))
+            print(f"Number of nodes in the high resolution solution: {len(indices)}")
+
+            print(f"Bounding box: [{x_min}, {y_min}, {z_min}, {x_max}, {y_max}, {z_max}]")
+            print(f"Side: {side}")
+            
+            if indices == []:
+                print("Empty intersection")
+                self.bad_sample = True
+            else:
+                self.bad_sample = False
+            
+            # Store the indices for use in substeps
+            self.current_step_indices = indices
+            # --- End Random Box Selection ---
+
+        # Skip if bad sample
+        if hasattr(self, 'bad_sample') and self.bad_sample:
+            print("Skipping step due to bad sample (empty intersection)")
+            # If we skip, we need to advance substep/main_step correctly
+            # This part might need adjustment if bad_sample leads to premature main_step end
+            self.current_substep += 1 # Treat as a completed substep
+            if self.current_substep >= self.num_substeps:
+                self.current_substep = 0
+                self.current_main_step += 1
+            if self.current_main_step >= self.max_main_steps:
+                if self.root: self.root.animate = False # Stop simulation
+            return
 
         # --- Calculate and apply force for the CURRENT substep ---
         # Force ramps from F/N to F (where F is the target magnitude * direction)
-        # Ensure substep index is within [0, num_substeps-1] for calculation
-        substep_fraction = (self.current_substep % self.num_substeps + 1) / self.num_substeps
-        current_force_magnitude = self.target_force_magnitude * substep_fraction # Store magnitude for analysis
-        incremental_force = self.current_main_step_direction * current_force_magnitude # Apply magnitude to current direction
+        # self.current_substep is 0-indexed (0 to num_substeps-1)
+        substep_fraction = (self.current_substep + 1) / self.num_substeps
+        current_force_magnitude = self.target_force_magnitude * substep_fraction
+        incremental_force = self.current_main_step_direction * current_force_magnitude
 
-        current_substep_in_main_step = (self.current_substep % self.num_substeps) + 1
+        current_substep_in_main_step = self.current_substep + 1
         print(f"  Main Step {self.current_main_step + 1}, Substep {current_substep_in_main_step}/{self.num_substeps}: Applying force = {incremental_force}")
 
-
+        # Remove existing force field
         if self.cff is not None:
             try:
                 self.exactSolution.removeObject(self.cff)
             except Exception as e:
                 print(f"Warning: Error removing CFF (Exact): {e}")
             finally:
-                 self.cff = None # Clear the reference
+                self.cff = None
 
-        # --- Create and add new CFFs ---
+        # --- Create and add new CFF with current step indices ---
         try:
-            # Exact Solution
-            force_roi_exact = self.exactSolution.getObject('ForceROI')
-            if force_roi_exact is None: raise ValueError("ForceROI (Exact) not found.")
             self.cff = self.exactSolution.addObject('ConstantForceField',
-                               name="CFF_Exact_Step",
-                               indices="@ForceROI.indices",
-                               totalForce=incremental_force.tolist(),
-                               showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
+                    name="CFF_Exact_Step",
+                    indices=self.current_step_indices,
+                    totalForce=incremental_force.tolist(),
+                    showArrowSize=0.1, 
+                    showColor="0.8 0.2 0.2 1")  # Red arrows for random forces
             self.cff.init()
 
-            # --- Initialize Parent Nodes (if needed after adding objects) ---
-            # self.exactSolution.init() # May not be needed if cff.init() is sufficient
-            # self.linearSolution.init() # May not be needed if cff_linear.init() is sufficient
-            # --- End Initialization ---
-
-            # Store the magnitude applied in this step for analysis in onAnimateEndEvent
+            # Store the magnitude applied in this step for analysis
             self.last_applied_force_magnitude = current_force_magnitude
-            # print(f"  Substep {(self.current_substep % self.num_substeps) + 1}/{self.num_substeps}: Applied force mag = {current_force_magnitude:.4f}")
 
         except Exception as e:
-            print(f"ERROR: Failed to create/add/init ConstantForceField(s): {e}")
+            print(f"ERROR: Failed to create/add/init ConstantForceField: {e}")
             traceback.print_exc()
             self.cff = None
-            self.cff_linear = None
-            if self.root: self.root.animate = False
+            if self.root: 
+                self.root.animate = False
 
         self.start_time = process_time()
-
-
 
     def onAnimateEndEvent(self, event):
         # --- Get Real SOFA (Hyperelastic) State (MO1) ---
@@ -262,71 +373,70 @@ class AnimationStepController(Sofa.Core.Controller):
         energy_real = np.nan
         z_real = np.zeros(self.linear_modes.shape[1] if self.linear_modes is not None else 0) # Default z_real
 
-        try:
-            energy_real = self.computeInternalEnergy(u_real_all_dofs)
-        except Exception as e:
-            print(f"Warning: Could not compute real energy: {e}")
-
-        try:
-            z_real = self.computeModalCoordinates(u_real_all_dofs)
-            self.all_z_coords.append(np.copy(z_real)) # Store a copy
-        except Exception as e:
-            print(f"Warning: Could not compute modal coordinates: {e}")
-            # z_real remains default, self.all_z_coords does not get an entry for this step if error
-
-        # --- Save z_real and energy_real ---
-        if self.save: # Only save if saving is enabled
+        # Skip processing if it was a bad sample that was skipped in onAnimateBeginEvent
+        if hasattr(self, 'bad_sample') and self.bad_sample:
+            # Reset bad_sample flag if it was set for the next substep check in onAnimateBeginEvent
+            # This ensures that if a main step starts with a bad sample, it doesn't affect
+            # the processing of the *next* main step's first substep.
+            # However, the bad_sample flag is reset at the start of each main step anyway.
+            # The main thing is that we don't try to compute energy/z_coords for a skipped step.
+            pass # Data processing skipped
+        else:
             try:
-                num_modes = self.linear_modes.shape[1] if self.linear_modes is not None else 0
-                save_folder = os.path.join("z_dataset", f"{num_modes}_modes")
-                os.makedirs(save_folder, exist_ok=True)
-                
-                # Determine the next index for saving files
-                existing_data_files = glob.glob(os.path.join(save_folder, "data_*.npz"))
-                next_index = len(existing_data_files)
-                
-                # --- Save modal data (z and energy) ---
-                data_filename = os.path.join(save_folder, f"data_{next_index:04d}.npz")
-                np.savez(data_filename, 
+                energy_real = self.computeInternalEnergy(u_real_all_dofs)
+            except Exception as e:
+                print(f"Warning: Could not compute real energy: {e}")
+
+            try:
+                z_real = self.computeModalCoordinates(u_real_all_dofs)
+                self.all_z_coords.append(np.copy(z_real)) # Store a copy
+            except Exception as e:
+                print(f"Warning: Could not compute modal coordinates: {e}")
+                # z_real remains default, self.all_z_coords does not get an entry for this step if error
+
+            # --- Save z_real and energy_real ---
+            if self.save and self.current_substep >= (self.num_substeps // 2) and not np.isnan(z_real).any() and not np.isnan(energy_real):
+
+                try:
+                    num_modes = self.linear_modes.shape[1] if self.linear_modes is not None else 0
+                    save_folder = os.path.join("z_dataset", f"{num_modes}_modes")
+                    os.makedirs(save_folder, exist_ok=True)
+                    
+                    # Determine the next index for saving files
+                    existing_data_files = glob.glob(os.path.join(save_folder, "data_*.npz"))
+                    next_index = len(existing_data_files)
+                    
+                    # --- Save modal data (z and energy) ---
+                    data_filename = os.path.join(save_folder, f"data_{next_index:04d}.npz")
+                    np.savez(data_filename, 
                     z=z_real, 
                     energy=energy_real)
-                # print(f"Saved modal data to {data_filename}")
+                    print(f"Saved modal data to {data_filename}")
 
-                # --- Save displacement data ---
-                displacement_filename = os.path.join(save_folder, f"displacement_{next_index:04d}.npz")
-                np.savez(displacement_filename,
+                    # --- Save displacement data ---
+                    displacement_filename = os.path.join(save_folder, f"displacement_{next_index:04d}.npz")
+                    np.savez(displacement_filename,
                     u_flat=u_real_all_dofs.flatten())
-                # print(f"Saved displacement data to {displacement_filename}")
+                    # print(f"Saved displacement data to {displacement_filename}")
 
-            except Exception as e:
-                print(f"Error saving data: {e}")
-                traceback.print_exc()
+                except Exception as e:
+                    print(f"Error saving data: {e}")
+                    traceback.print_exc()
+            else:
+                print("Skipping saving modal data due to NaN values or substep condition not met.")
 
+        # --- Advance substep and main_step ---
+        self.current_substep += 1
 
-        _substep_idx_this_main_step = self.current_substep # This is the one that just ran (0 to N-1)
-        _main_step_idx_this_main_step = self.current_main_step # This is the one that just ran (0 to M-1)
+        if self.current_substep >= self.num_substeps:
+            # Current main step finished all its substeps
+            self.current_substep = 0  # Reset for the next main step
+            self.current_main_step += 1
 
-        # Now, determine the *next* substep and main_step
-        next_substep_idx = _substep_idx_this_main_step + 1
-        next_main_step_idx = _main_step_idx_this_main_step
-
-        if next_substep_idx >= self.num_substeps:
-            next_substep_idx = 0
-            next_main_step_idx = _main_step_idx_this_main_step + 1
+            # Check if all main steps are completed
+            if self.current_main_step >= self.max_main_steps:
+                print(f"All {self.max_main_steps} main steps have been processed. Stopping simulation.")
         
-        # The stopping condition:
-        if next_main_step_idx >= self.max_main_steps:
-            print(f"All {self.max_main_steps} main steps have been processed. Stopping simulation.")
-            if self.root: self.root.animate = False
-        
-        self.current_substep += 1 # This is the global substep counter for the simulation.
-        
-        current_main_step_effectively_processed = (self.current_substep -1) // self.num_substeps
-
-        if (current_main_step_effectively_processed + 1) >= self.max_main_steps and \
-           ((self.current_substep -1) % self.num_substeps == self.num_substeps -1) :
-            print(f"All {self.max_main_steps} main steps completed after global substep {self.current_substep-1}. Stopping.")
-            if self.root: self.root.animate = False
         self.end_time = process_time()
 
     def computeModalCoordinates(self, displacement):
@@ -550,10 +660,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
 
     force_box_coords = config['constraints'].get('force_box', [0.01, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
-                                        name='ForceROI',
+                                        name='DynamicForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
                                         drawBoxes=True)
-    cff = exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
 
     
 
@@ -572,6 +681,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         surface_topo=surface_topo,
                                         MO1=MO1, # Real SOFA solution
                                         fixed_box=fixed_box,
+                                        force_box=force_box,
                                         directory=directory,
                                         sample=sample,
                                         key=key,
@@ -676,7 +786,7 @@ if __name__ == "__main__":
         root.animate = True
         step_count = 0
         # We need a loop that runs until the controller stops it or a max iteration limit
-        max_total_iterations = max_main_steps * num_substeps * 1.1 # Safety limit
+        max_total_iterations = max_main_steps * num_substeps  # Safety limit
         pbar = tqdm(total=max_main_steps, desc="Main Steps Progress")
         last_main_step = -1
 

@@ -75,7 +75,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 1e6
+        self.target_force_magnitude = 1e5
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
         self.current_main_step_direction = np.zeros(3) # Initialize direction
@@ -737,7 +737,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     # Handle default config if not provided
     if config is None:
         config = {
-            'physics': {'gravity': [0, 0, 0], 'dt': 0.01},
+            'physics': {'gravity': [0, 0, 0], 'dt': 0.001},
             'material': {'youngs_modulus': 5000, 'poissons_ratio': 0.25, 'density': 10},
             'mesh': {'filename': 'mesh/beam_615.msh'},
             'constraints': {'fixed_box': [-0.01, -0.01, -0.02, 1.01, 0.01, 0.02]}

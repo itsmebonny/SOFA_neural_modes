@@ -197,9 +197,8 @@ class AnimationStepController(Sofa.Core.Controller):
         try:
             # Define axis and origin (could be stored in self if constant)
             torsion_axis_val = [1.0, 0.0, 0.0]
-            # Assuming beam_end_x is accessible or stored (e.g., from config)
             # If not, you might need to retrieve it or hardcode it here
-            beam_end_x = 10.0 # Example value, ensure this is correct
+            beam_end_x = 0.0 # Example value, ensure this is correct
             torsion_origin_val = [beam_end_x, 0.0, 0.0]
 
             # Ensure the TorsionROI component exists (it should, added in createScene)
@@ -217,7 +216,6 @@ class AnimationStepController(Sofa.Core.Controller):
                 torque=incremental_torque # Set the calculated torque
             )
 
-            # --- CRITICAL: Initialize the parent node AFTER adding the new object ---
             # print(f"  Substep {self.current_substep + 1}: Initializing exactSolution node.")
             self.exactSolution.init() # Initialize the node containing the new TorsionFF
             # --- End Initialization ---
@@ -259,7 +257,6 @@ class AnimationStepController(Sofa.Core.Controller):
                 self.RMSE_error.append(float('nan'))
                 self.MSE_error.append(float('nan'))
             else:
-                # ... (existing calculations for l_th, y_th, u_pred_th) ...
                 z_th = torch.tensor(z, dtype=torch.float64, device=self.routine.device).unsqueeze(0)
                 linear_modes_th = self.routine.linear_modes.to(self.routine.device)
                 l_th = torch.matmul(linear_modes_th, z_th.T).squeeze()
@@ -621,13 +618,13 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     torsion_axis_val = [1.0, 0.0, 0.0] # Twist around X-axis
     torsion_origin_val = [beam_end_x, 0.0, 0.0] # Center of the end face
 
-    torsion_ff = exactSolution.addObject('TorsionForceField',
-                                         name='TorsionFF',
-                                         # 'object' link is implicit to parent's MechanicalObject
-                                         indices="@TorsionROI.indices", # Apply to nodes in the ROI
-                                         axis=torsion_axis_val,         
-                                         origin=torsion_origin_val,       
-                                         torque=0.0)                    
+    # torsion_ff = exactSolution.addObject('TorsionForceField',
+    #                                      name='TorsionFF',
+    #                                      # 'object' link is implicit to parent's MechanicalObject
+    #                                      indices="@TorsionROI.indices", # Apply to nodes in the ROI
+    #                                      axis=torsion_axis_val,         
+    #                                      origin=torsion_origin_val,       
+    #                                      torque=0.0)                    
     # --- End Torsion ---
 
     # --- Visual Model ---
@@ -646,7 +643,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                          surface_topo=surface_topo,
                                          MO1=MO1,
                                          fixed_box=fixed_box,
-                                         torsion_ff=torsion_ff, # Pass the TorsionForceField
+                                        #  torsion_ff=torsion_ff, # Pass the TorsionForceField
                                          directory=directory,
                                          sample=sample,
                                          key=key,

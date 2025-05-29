@@ -303,7 +303,7 @@ class AnimationStepController(Sofa.Core.Controller):
             real_energy = self.computeInternalEnergy(real_solution)
 
             # Compute actual modal coordinates from SOFA's real solution
-            z_actual_sofa = self.computeModalCoordinates(linear_solution) # This is z_actual
+            z_actual_sofa = self.computeModalCoordinates(real_solution) # This is z_actual
             if z_actual_sofa is not None and len(z_actual_sofa) > 0:
                 self.actual_z0_vals.append(float(z_actual_sofa[0]))
             else:

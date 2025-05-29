@@ -22,8 +22,8 @@ physics:
   num_substeps: 25 # Added for substep logic
 
 simulation:
-  steps: 50 # Default number of main steps
-  max_z_amplitude_scale: 1
+  steps: 1 # Default number of main steps
+  max_z_amplitude_scale: 10
 # Constraint parameters
 constraints:
   fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]

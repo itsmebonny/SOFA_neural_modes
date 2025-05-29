@@ -87,10 +87,10 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 1e6
-        self.current_main_step_direction = np.zeros(3) # Initialize direction
+        self.target_force_magnitude = 1e4
+        self.current_main_step_direction = np.random.randn(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
-        self.current_main_step_direction = np.zeros(3) # Initialize direction
+        self.current_main_step_direction = np.random.randn(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
         # --- End Fixed Force ---
         
@@ -281,7 +281,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print(f"\n--- Timestep {self.timestep_counter}: Starting Force Period {self.current_main_step}/{self.max_main_steps} ---")
 
             # Generate a new random direction for this force period
-            random_vec = np.random.randn(3) # Generate random vector
+            random_vec = [0.0, 1, 0.0] # Generate random vector
             norm = np.linalg.norm(random_vec)
             if norm < 1e-9: # Avoid division by zero
                 self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction
