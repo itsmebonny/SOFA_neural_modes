@@ -757,7 +757,7 @@ if __name__ == "__main__":
     )
 
     # Initialize simulation
-    Sofa.Simulation.initRoot(root)
+    Sofa.Simulation.init(root)
     controller.save = True
 
     if args.gui:

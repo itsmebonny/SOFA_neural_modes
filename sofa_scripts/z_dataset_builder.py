@@ -2,14 +2,25 @@ import Sofa
 import SofaRuntime
 import numpy as np 
 import os
+import sys
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+
 from Sofa import SofaDeformable
 from time import process_time, time
 import datetime
 from sklearn.preprocessing import MinMaxScaler
-from training.train_sofa import Routine, load_config
+from training.train_sofa import Routine, load_config # Assuming train_sofa.py is in training/
 # add network path to the python path
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '../network'))
+
+
+
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '../network')) # If network.py is in ../network
+sys.path.append(os.path.join(os.path.dirname(__file__), '..')) # Add project root for training.train_sofa
 
 import json
 import torch
@@ -27,7 +38,6 @@ from scipy.sparse.linalg import eigsh
 import matplotlib.pyplot as plt
 
 
-
 class AnimationStepController(Sofa.Core.Controller):
     def __init__(self, node, *args, **kwargs):
         Sofa.Core.Controller.__init__(self, *args, **kwargs)
@@ -37,10 +47,21 @@ class AnimationStepController(Sofa.Core.Controller):
         self.MO1 = kwargs.get('MO1')
         self.fixed_box = kwargs.get('fixed_box')
         self.exactSolution = kwargs.get('exactSolution')
-        self.cff = kwargs.get('cff') # Keep this if createScene adds an initial one
+        # self.cff = kwargs.get('cff') # Controller will manage CFF creation
 
+                # --- Linear Solution Components ---
+        self.linearSolution = kwargs.get('linearSolution')
+        self.MO2 = kwargs.get('MO2') # MechObj for linear
+        self.linearFEM = kwargs.get('linearFEM') # Linear FEM ForceField
+        
+        # CFFs will be created per step
+        self.cff_exact = None 
+        self.cff_linear = None 
 
-
+        self.MO_LinearModes = kwargs.get('MO_LinearModes') # MechObj for Linear Modes Viz
+        self.MO_NeuralPred = kwargs.get('MO_NeuralPred')   # MechObj for Neural Pred Viz
+        self.visual_LM = kwargs.get('visual_LM') # Visual for Linear Modes
+        self.visual_NP = kwargs.get('visual_NP') # Visual for Neural Pred
 
         self.key = kwargs.get('key')
         self.iteration = kwargs.get("sample")
@@ -48,31 +69,27 @@ class AnimationStepController(Sofa.Core.Controller):
         self.root = node
         self.save = True
 
-        # --- Add list to store results per substep ---
-        # Expanded tuple: (ForceMag, RealE, PredE, LinModesE, SOFALinE,
-        #                  L2Err_Pred_vs_Real, RMSE_Pred_vs_Real, MSE_Pred_vs_Real,
-        #                  L2Err_Lin_vs_Real,  RMSE_Lin_vs_Real,  MSE_Lin_vs_Real,
-        #                  L2Err_Lin_vs_SOFALin, RMSE_Lin_vs_SOFALin, MSE_Lin_vs_SOFALin)
         self.substep_results = []
-        self.all_z_coords = []    # Stores numpy arrays of modal coordinates (z)
-
-        # --- End Add list ---
-
+        self.all_z_coords = []    # Stores numpy arrays of actual modal coordinates (z_actual) from SOFA solution
+        self.z0_vals = []
+        self.scaled_z0_vals = []
+        self.actual_z0_vals = []        
         self.num_substeps = kwargs.get('num_substeps', 1)
         self.current_substep = 0
         self.current_main_step = 0
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
-        # --- Define Fixed Force Target Magnitude ---
-        # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 50
-        # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
-        self.current_main_step_direction = np.zeros(3) # Initialize direction
-        print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
-        # --- End Fixed Force ---
+        # --- New parameter for scaling modal coordinates 'z' ---
+        self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 1000) # Tune this value
+        print(f"Max Z Amplitude Scale (for random z generation): {self.max_z_amplitude_scale}")
+        # --- End New Parameter ---
         
+        # Store the z pattern for the current main step and applied z for current substep
+        self.base_z_pattern_for_main_step = None
+        self.current_applied_z = None # This will be used for NN prediction
+        self.last_applied_force_magnitude = 0.0 # Norm of the applied distributed force Phi*z
+
         self.directory = kwargs.get('directory')
-        # Add material properties to controller
         self.young_modulus = kwargs.get('young_modulus', 5000)
         self.poisson_ratio = kwargs.get('poisson_ratio', 0.25)
         self.density = kwargs.get('density', 10)
@@ -82,25 +99,20 @@ class AnimationStepController(Sofa.Core.Controller):
         print(f"Using directory: {self.directory}")
         print(f"Material properties: E={self.young_modulus}, nu={self.poisson_ratio}, rho={self.density}")
         
-        # Add eigenmodes visualization parameters
         self.show_modes = kwargs.get('show_modes', True)
-        self.current_mode_index = -1  # Start with -1 to compute matrices first
+        self.current_mode_index = -1
         self.mode_animation_step = 0
-        self.mode_animation_steps = kwargs.get('steps_per_mode', 100)  # Steps to animate each mode
-        self.mode_scale = kwargs.get('mode_scale', 50.0)  # Scaling factor for eigenmodes
+        self.mode_animation_steps = kwargs.get('steps_per_mode', 100)
+        self.mode_scale = kwargs.get('mode_scale', 50.0)
         self.num_modes_to_show = kwargs.get('num_modes_to_show', 5)
         self.modes_computed = False
         self.eigenvectors = None
         self.eigenvalues = None
         self.original_positions = None
-        self.transition_steps = 20  # Steps to transition between modes
-        self.pause_steps = 30  # Steps to pause at maximum amplitude
+        self.transition_steps = 20
+        self.pause_steps = 30
 
-        # --- Add lists for Deformation Gradient Differences ---
-        self.grad_diff_lin_modes_list = []
-        self.grad_diff_nn_pred_list = []
-        self.grad_diff_sofa_linear_list = []
-        # --- End lists for Deformation Gradient Differences ---
+        self.force_verification_done = False 
 
       
 
@@ -111,29 +123,43 @@ class AnimationStepController(Sofa.Core.Controller):
         """
         self.inputs = []
         self.outputs = []
-        cfg = load_config(args.config)
-        print(f"Loaded config from {args.config}")
+        
+        # Find the config file relative to this script's location or project root
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(script_dir, '..'))
+        default_config_path = os.path.join(project_root, 'configs', 'default.yaml') # Adjust if your default is elsewhere
+
+        # Use global args if available (e.g., from __main__), otherwise use a default path
+        config_path_from_args = default_config_path # Default
+        if 'args' in globals() and hasattr(args, 'config'):
+            config_path_from_args = args.config
+            if not os.path.isabs(config_path_from_args):
+                 config_path_from_args = os.path.join(project_root, config_path_from_args)
+
+        try:
+            cfg = load_config(config_path_from_args)
+            print(f"Controller loaded config from {config_path_from_args}")
+        except FileNotFoundError:
+            print(f"Config file not found at {config_path_from_args}. Attempting default project structure.")
+            cfg = load_config(default_config_path) # Fallback
+            print(f"Controller loaded config from {default_config_path}")
+
 
         # --- Instantiate Routine ---
         try:
             print("Instantiating Routine...")
-            # Pass the loaded config dictionary to Routine
             self.routine = Routine(cfg)
             print("Routine instantiated successfully.")
         except Exception as e:
             print(f"Error instantiating Routine: {e}")
-            traceback.print_exc() # Print detailed traceback
+            traceback.print_exc() 
             sys.exit(1)
         # --- End Routine Instantiation ---
 
         checkpoint_dir_rel = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
+        checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) 
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.abspath(os.path.join(script_dir, '..')) # Go one level up from sofa_scripts
-        checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) # Join with project root
-
-        # Define the specific checkpoint file name (e.g., 'best_sofa.pt')
-        checkpoint_filename = 'best_sofa.pt' # Or read from config if specified differently
+        checkpoint_filename = 'best_sofa.pt' 
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")
@@ -141,23 +167,18 @@ class AnimationStepController(Sofa.Core.Controller):
             try:
                 self.routine.load_checkpoint(best_checkpoint_path)
                 print("Successfully loaded best model checkpoint.")
-                # Ensure model is in evaluation mode after loading
                 self.routine.model.eval()
             except Exception as e:
                 print(f"Error loading checkpoint {best_checkpoint_path}: {e}")
                 print("Proceeding without loaded model weights.")
         else:
             print(f"Warning: Best checkpoint file not found at {best_checkpoint_path}. Using initialized model.")
-        # --- End Checkpoint Loading ---
+        
+        self.linear_modes_np = self.routine.linear_modes.cpu().numpy() # Store as NumPy
+        self.original_positions = np.copy(self.MO1.position.value) 
 
-        # Extract necessary data from Routine instance
-        self.linear_modes = self.routine.linear_modes # This should be a torch tensor
-        self.original_positions = np.copy(self.MO1.position.value) # Store original positions
-
-        # --- Prepare for Saving (if enabled) ---
-        # Use the directory name passed during scene creation or default
         self.directory = self.root.directory_name.value if hasattr(self.root, 'directory_name') else datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_base_dir = 'modal_data' # Or read from config
+        output_base_dir = 'modal_data' 
         if self.save:
             if not os.path.exists(output_base_dir):
                 os.mkdir(output_base_dir)
@@ -165,92 +186,123 @@ class AnimationStepController(Sofa.Core.Controller):
             if not os.path.exists(self.output_subdir):
                 os.makedirs(self.output_subdir)
             print(f"Data saving enabled. Output directory: {self.output_subdir}")
-        # --- End Saving Prep ---
-
-        self.sampled = False # Reset sampling flag
+        
+        self.sampled = False 
 
         surface = self.surface_topo
         self.idx_surface = surface.triangles.value.reshape(-1)
         self.timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # Store the original positions for mode animation
         if self.show_modes and self.MO1:
-            self.original_positions = np.copy(self.MO1.position.value)
+            # self.original_positions already stored
             print(f"Stored original positions with shape {self.original_positions.shape}")
+        
+        # Get ForceROI indices once
+        self.force_roi_indices_exact = self.exactSolution.getObject('ForceROI').indices.value
 
 
     def onAnimateBeginEvent(self, event):
-        """
-        Called by SOFA's animation loop before each physics step.
-        Applies incremental force based on substep, with a random direction per main step.
-        """
-        # --- Check if starting a new MAIN step ---
-        if self.current_substep == 0:
-            # Reset positions for all models
+
+        self.latent_dim = self.routine.linear_modes.shape[1]
+        
+
+        
+
+        self.latent_dim = self.routine.linear_modes.shape[1] 
+   
+        if self.current_substep % self.num_substeps == 0:
             rest_pos = self.MO1.rest_position.value
             self.MO1.position.value = rest_pos
-
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
+                    # Determine a random length for modes_to_use, from 1 to latent_dim
+            if self.latent_dim > 0:
+                num_modes_to_select = random.randint(1, self.latent_dim)
+                # Select random distinct mode indices
+                self.modes_to_use = sorted(random.sample(range(self.latent_dim), num_modes_to_select))
+                print(f"Randomly selected {len(self.modes_to_use)} modes to use: {self.modes_to_use}")
+                     #check if the indices are valid
+                if any(idx >= self.linear_modes_np.shape[1] for idx in self.modes_to_use):
+                    print(f"Error: One or more mode indices {self.modes_to_use} exceed available modes ({self.linear_modes_np.shape[1]}).")
+                    return
 
-            # --- Generate a new random direction for this main step ---
-            random_vec = np.random.randn(3) # Generate random vector from normal distribution
-            norm = np.linalg.norm(random_vec)
-            if norm < 1e-9: # Avoid division by zero if vector is near zero
-                self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction
+
             else:
-                self.current_main_step_direction = random_vec / norm # Normalize to get unit vector
-            print(f"  New Random Force Direction: {self.current_main_step_direction}")
-            # --- End Generate Random Direction ---
+                self.modes_to_use = [] # No modes available
 
-        # --- Calculate and apply force for the CURRENT substep ---
-        # Force ramps from F/N to F (where F is the target magnitude * direction)
-        # Ensure substep index is within [0, num_substeps-1] for calculation
+            #base_z_coeffs = np.random.rand(len(self.modes_to_use)) * 2 - 1 # Random coefficients in [-1, 1]
+            base_z_coeffs = np.random.choice([-1, 1], size=self.latent_dim)
+
+            base_z_coeffs[~np.isin(np.arange(self.latent_dim), self.modes_to_use)] = 0.0 # Set unused modes to 0
+
+            self.base_z_pattern_for_main_step = base_z_coeffs 
+            print(f"  Base Z pattern for main step (norm): {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}")
+            # print(f"  Base Z pattern components (first few): {self.base_z_pattern_for_main_step[:min(L,5)]}")
+
+
+        # Calculate force for the CURRENT substep based on modal coordinates
         substep_fraction = (self.current_substep % self.num_substeps + 1) / self.num_substeps
-        current_force_magnitude = self.target_force_magnitude * substep_fraction # Store magnitude for analysis
-        incremental_force = self.current_main_step_direction * current_force_magnitude # Apply magnitude to current direction
-
-        current_substep_in_main_step = (self.current_substep % self.num_substeps) + 1
-        print(f"  Main Step {self.current_main_step + 1}, Substep {current_substep_in_main_step}/{self.num_substeps}: Applying force = {incremental_force}")
 
 
-        if self.cff is not None:
-            try:
-                self.exactSolution.removeObject(self.cff)
-            except Exception as e:
-                print(f"Warning: Error removing CFF (Exact): {e}")
-            finally:
-                 self.cff = None # Clear the reference
 
-        # --- Create and add new CFFs ---
+
+        current_amplitude_scale = self.max_z_amplitude_scale * substep_fraction
+        self.current_applied_z = self.base_z_pattern_for_main_step * current_amplitude_scale
+
+        # Compute distributed forces: F = Phi * z
+        current_step_distributed_forces = self.linear_modes_np @ self.current_applied_z  # (num_dofs,)
+        print(f"  Applied Z = {self.current_applied_z[:min(5, len(self.current_applied_z))]}...")
+
+        # Reshape forces to (num_nodes, 3)
+        self.force_in_newton = current_step_distributed_forces.reshape(-1, 3)
+
+        # Compute the total force magnitude as the sum of the magnitudes of the forces at each node
+        node_force_magnitudes = np.linalg.norm(self.force_in_newton, axis=1)  # Magnitude of force at each node
+        self.last_applied_force_magnitude_newton = np.sum(node_force_magnitudes)  # Total force magnitude
+        print(f"  Total Force Magnitude (sum of node magnitudes): {self.last_applied_force_magnitude_newton:.4f}")
+
+        # Store the force magnitude for plotting
+        if not hasattr(self, 'all_force_magnitudes_newton'):
+            self.all_force_magnitudes_newton = []
+        self.all_force_magnitudes_newton.append(self.last_applied_force_magnitude_newton)
+
+        # Debug: Print force statistics
+        print(f"  Norm of Force in Newtons: {np.linalg.norm(self.force_in_newton):.4f}")
+        print(f"  Total Force Magnitude (sum of node magnitudes): {self.last_applied_force_magnitude_newton:.4f}")
+        print(f"  Norm of Applied z components: {np.linalg.norm(self.current_applied_z):.4f}")
+        forces_reshaped = current_step_distributed_forces.reshape(-1, 3) # (num_nodes, 3)
+        
+        # Extract forces for the ROI nodes
+        forces_for_roi_exact_nodes = forces_reshaped[self.force_roi_indices_exact]
+
+        # print(f"  Substep {substep_fraction*100:.1f}%: Applied Z norm={np.linalg.norm(self.current_applied_z):.4f}, Applied Force Norm={self.last_applied_force_magnitude:.4e}")
+
+        # Remove previous CFFs
+        if self.cff_exact is not None:
+            try: self.exactSolution.removeObject(self.cff_exact)
+            except Exception as e: print(f"Warning: Error removing CFF (Exact): {e}")
+            finally: self.cff_exact = None
+        
+
+        #Try with only one force
         try:
             # Exact Solution
-            force_roi_exact = self.exactSolution.getObject('ForceROI')
-            if force_roi_exact is None: raise ValueError("ForceROI (Exact) not found.")
-            self.cff = self.exactSolution.addObject('ConstantForceField',
-                               name="CFF_Exact_Step",
-                               indices="@ForceROI.indices",
-                               totalForce=incremental_force.tolist(),
-                               showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
-            self.cff.init()
+            self.cff_exact = self.exactSolution.addObject('ConstantForceField',
+                               name="CFF_Exact_Modal",
+                               indices=self.force_roi_indices_exact.tolist(), # Use stored indices
+                               forces=forces_for_roi_exact_nodes.tolist(), # Apply per-node forces
+                               showArrowSize=1, showColor="0.2 0.2 0.8 1")
+            if self.cff_exact: self.cff_exact.init()
 
-            # --- Initialize Parent Nodes (if needed after adding objects) ---
-            # self.exactSolution.init() # May not be needed if cff.init() is sufficient
-            # self.linearSolution.init() # May not be needed if cff_linear.init() is sufficient
-            # --- End Initialization ---
 
-            # Store the magnitude applied in this step for analysis in onAnimateEndEvent
-            self.last_applied_force_magnitude = current_force_magnitude
-            # print(f"  Substep {(self.current_substep % self.num_substeps) + 1}/{self.num_substeps}: Applied force mag = {current_force_magnitude:.4f}")
-
+            
         except Exception as e:
-            print(f"ERROR: Failed to create/add/init ConstantForceField(s): {e}")
+            print(f"ERROR: Failed to create/add/init ConstantForceField(s) with modal forces: {e}")
             traceback.print_exc()
-            self.cff = None
+            self.cff_exact = None
             self.cff_linear = None
             if self.root: self.root.animate = False
 
         self.start_time = process_time()
-
 
 
     def onAnimateEndEvent(self, event):
@@ -260,7 +312,7 @@ class AnimationStepController(Sofa.Core.Controller):
         u_real_all_dofs = pos_real_all_dofs - rest_pos_all_dofs
         
         energy_real = np.nan
-        z_real = np.zeros(self.linear_modes.shape[1] if self.linear_modes is not None else 0) # Default z_real
+        z_real = np.zeros(self.routine.linear_modes.shape[1]) # Default to zero if computation fails
 
         try:
             energy_real = self.computeInternalEnergy(u_real_all_dofs)
@@ -275,9 +327,11 @@ class AnimationStepController(Sofa.Core.Controller):
             # z_real remains default, self.all_z_coords does not get an entry for this step if error
 
         # --- Save z_real and energy_real ---
-        if self.save: # Only save if saving is enabled
+        if self.save and not np.isnan(z_real).any(): # Only save if saving is enabled and z_real is not NaN
+            print(f"Saving modal coordinates and energy for substep {self.current_substep} of main step {self.current_main_step}...")
+
             try:
-                num_modes = self.linear_modes.shape[1] if self.linear_modes is not None else 0
+                num_modes = self.routine.linear_modes.shape[1] 
                 save_folder = os.path.join("z_dataset", f"{num_modes}_modes")
                 os.makedirs(save_folder, exist_ok=True)
                 
@@ -288,7 +342,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 # --- Save modal data (z and energy) ---
                 data_filename = os.path.join(save_folder, f"data_{next_index:04d}.npz")
                 np.savez(data_filename, 
-                    z=z_real, 
+                    z=self.current_applied_z, 
                     energy=energy_real)
                 # print(f"Saved modal data to {data_filename}")
 
@@ -326,7 +380,7 @@ class AnimationStepController(Sofa.Core.Controller):
         if (current_main_step_effectively_processed + 1) >= self.max_main_steps and \
            ((self.current_substep -1) % self.num_substeps == self.num_substeps -1) :
             print(f"All {self.max_main_steps} main steps completed after global substep {self.current_substep-1}. Stopping.")
-            if self.root: self.root.animate = False
+            #if self.root: self.root.animate = False
         self.end_time = process_time()
 
     def computeModalCoordinates(self, displacement):
@@ -499,6 +553,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     total_mass = density * volume
     print(f"Using E={young_modulus}, nu={poisson_ratio}, rho={density}, V={volume}, M={total_mass}")
 
+    max_z_amplitude_scale = config['simulation'].get('max_z_amplitude_scale', 1000)
+
     # Calculate Lamé parameters
     mu = young_modulus / (2 * (1 + poisson_ratio))
     lam = young_modulus * poisson_ratio / ((1 + poisson_ratio) * (1 - 2 * poisson_ratio))
@@ -530,7 +586,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                           iterations=config['physics'].get('solver_iterations', 1000), 
                                           tolerance=config['physics'].get('solver_tolerance', 1e-6), 
                                           threshold=config['physics'].get('solver_threshold', 1e-6), 
-                                          warmStart=True)
+                                          warmStart=False)
     
     fem = exactSolution.addObject('TetrahedronHyperelasticityFEMForceField',
                                 name="FEM", 
@@ -582,7 +638,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         total_mass=total_mass,
                                         mesh_filename=mesh_filename,
                                         num_modes_to_show=num_modes_to_show,
-                                        # cff=cff, # REMOVED - Controller manages CFFs
+                                        max_z_amplitude_scale=max_z_amplitude_scale,
                                         **kwargs)
     rootNode.addObject(controller)
 
@@ -595,6 +651,7 @@ if __name__ == "__main__":
     import yaml
     import argparse
     import traceback
+    import random
     import time # Import time for headless loop
 
     # Add argument parser

@@ -367,21 +367,21 @@ class Routine:
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
         print(f"Output dimension: {self.output_dim}")        
-        # self.model = Net(self.num_modes, self.output_dim, hid_layers, hid_dim).to(device).double()
+        self.model = Net(self.num_modes, self.num_modes, hid_layers, hid_dim).to(device).double()
 
-        # print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
+        print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
-        self.model = ResidualNet(
-            self.num_modes, 
-            self.output_dim, 
-            hid_layers=hid_layers, 
-            hid_dim=hid_dim,
-            activation=torch.nn.functional.leaky_relu,
-            zero_init_output=True
-        ).to(device).double()
+        # self.model = ResidualNet(
+        #     self.num_modes, 
+        #     self.output_dim, 
+        #     hid_layers=hid_layers, 
+        #     hid_dim=hid_dim,
+        #     activation=torch.nn.functional.leaky_relu,
+        #     zero_init_output=True
+        # ).to(device).double()
 
-        # # After model creation, verify zero property
-        # # self.model.verify_zero_property()
+        # # # After model creation, verify zero property
+        # # # self.model.verify_zero_property()
 
         # Load linear modes
         print(f"Linear modes shape: {self.linear_modes.shape}")
@@ -655,7 +655,7 @@ class Routine:
     def load_z_dataset(self, dataset_base_path="z_dataset"):
         """
         Load z coordinates, ground truth energies, and ground truth displacements
-        from the z_dataset folder.
+        from the z_dataset folder. Skips files containing NaN values.
         """
         print(f"Loading z_dataset from base path: {dataset_base_path} for {self.num_modes} modes...")
         
@@ -692,6 +692,10 @@ class Routine:
         loaded_z_list = []
         loaded_energies_list = []
         loaded_displacements_list = []
+        
+        # Track statistics
+        skipped_files = 0
+        total_files = len(data_files)
 
         # Determine how many pairs to load
         # If displacement files are missing for some data files, we'll only load z and energy for those.
@@ -706,6 +710,28 @@ class Routine:
                     z_sample = data['z']
                     energy_sample = data['energy']
                 
+                # Check for NaN values in z and energy
+                if np.isnan(z_sample).any():
+                    print(f"Warning: Skipping {data_file_path} - z contains NaN values")
+                    skipped_files += 1
+                    continue
+                    
+                if np.isnan(energy_sample).any():
+                    print(f"Warning: Skipping {data_file_path} - energy contains NaN values")
+                    skipped_files += 1
+                    continue
+                    
+                # Check for infinite values as well
+                if np.isinf(z_sample).any():
+                    print(f"Warning: Skipping {data_file_path} - z contains infinite values")
+                    skipped_files += 1
+                    continue
+                    
+                if np.isinf(energy_sample).any():
+                    print(f"Warning: Skipping {data_file_path} - energy contains infinite values")
+                    skipped_files += 1
+                    continue
+                
                 loaded_z_list.append(z_sample)
                 loaded_energies_list.append(energy_sample)
                 processed_data_indices.add(file_index_str)
@@ -714,7 +740,17 @@ class Routine:
                 disp_file_path = os.path.join(mode_subfolder_path, f"displacement_{file_index_str}.npz")
                 if os.path.exists(disp_file_path):
                     with np.load(disp_file_path) as disp_data:
-                        loaded_displacements_list.append(disp_data['u_flat'])
+                        displacement_sample = disp_data['u_flat']
+                        
+                        # Check for NaN values in displacement
+                        if np.isnan(displacement_sample).any():
+                            print(f"Warning: Displacement file {disp_file_path} contains NaN values - using zero placeholder")
+                            loaded_displacements_list.append(np.zeros(self.output_dim, dtype=np.float64))
+                        elif np.isinf(displacement_sample).any():
+                            print(f"Warning: Displacement file {disp_file_path} contains infinite values - using zero placeholder")
+                            loaded_displacements_list.append(np.zeros(self.output_dim, dtype=np.float64))
+                        else:
+                            loaded_displacements_list.append(displacement_sample)
                 else:
                     # If no displacement file, append None or a zero array of expected shape
                     # For simplicity, let's append None and handle it later if necessary
@@ -724,11 +760,20 @@ class Routine:
 
             except Exception as e:
                 print(f"Error loading data from {data_file_path}: {e}")
+                skipped_files += 1
                 continue
         
+        # Print statistics
+        valid_files = len(loaded_z_list)
+        print(f"Dataset loading statistics:")
+        print(f"  Total files found: {total_files}")
+        print(f"  Valid files loaded: {valid_files}")
+        print(f"  Files skipped (NaN/Inf/Error): {skipped_files}")
+        print(f"  Success rate: {100 * valid_files / total_files:.1f}%")
+        
         if not loaded_z_list:
-            print("No data successfully loaded from z_dataset.")
-            print("Please ensure you have run the 'sofa_scripts/z_dataset_builder.py' script to generate the dataset.")
+            print("No valid data successfully loaded from z_dataset after NaN/Inf filtering.")
+            print("Please check your dataset for data quality issues.")
             self.loaded_z_coords = None
             self.loaded_energies_gt = None
             self.loaded_displacements_gt = None
@@ -771,9 +816,6 @@ class Routine:
 
 
 
-
-
-
     def train(self, num_epochs=1000):
         """
         Train the model using batched processing with strong orthogonality constraints.
@@ -782,7 +824,7 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 8  # You can add this to config
+        batch_size = 16  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
         print_every = 1
         checkpoint_every = 50
@@ -873,14 +915,14 @@ class Routine:
                 #concatenate the generated samples with the rest shape
                 
                 # Compute linear displacements
-                l = torch.matmul(z, linear_modes.T)
+                # l = torch.matmul(z, linear_modes.T)
                 
                 # Create normalized constraint directions
-                constraint_dir = torch.matmul(z, linear_modes.T)
-                constraint_norms = torch.norm(constraint_dir, p=2, dim=1, keepdim=True)
-                # Avoid division by zero
-                constraint_norms = torch.clamp(constraint_norms, min=1e-8)
-                constraint_dir = constraint_dir / constraint_norms
+                # constraint_dir = torch.matmul(z, linear_modes.T)
+                # constraint_norms = torch.norm(constraint_dir, p=2, dim=1, keepdim=True)
+                # # Avoid division by zero
+                # constraint_norms = torch.clamp(constraint_norms, min=1e-8)
+                # constraint_dir = constraint_dir / constraint_norms
                 # constraint_dir[rest_idx] = 0  # Zero out rest shape constraints
             
                 # Track these values outside the closure
@@ -889,10 +931,14 @@ class Routine:
                 origin_val = 0
                 loss_val = 0
                 
+                # Extract ground truth data outside closure for proper scope
+                ground_truth_energy = self.loaded_energies_gt[indices] if self.loaded_energies_gt is not None else None
+                ground_truth_displacement = self.loaded_displacements_gt[indices] if self.loaded_displacements_gt is not None else None
+                
                 # Define closure for optimizer
                 def closure():
                     nonlocal energy_val, ortho_val, origin_val, loss_val, lbfgs_iter, iteration, best_loss
-                    nonlocal z, l, rest_idx, constraint_dir
+                    nonlocal z, ground_truth_energy, ground_truth_displacement
 
                     lbfgs_iter += 1
                     
@@ -901,9 +947,12 @@ class Routine:
                     # Compute nonlinear correction
                     y = self.model(z)
                     
-                    # Compute energy (use your energy calculator)
-                    u_total_batch = l + y
+                    # y is modal coordinates, convert to displacement
+                    neural_correction_displacement = torch.matmul(y, linear_modes.T)
                     
+                    # Compute energy (use your energy calculator)
+                    u_total_batch = neural_correction_displacement
+                                    
                     
                     
                     # After (if processing a batch):
@@ -911,9 +960,6 @@ class Routine:
 
                     energies = self.energy_calculator(u_total_batch)
                     energy = torch.mean(energies)  # Average energy across batch
-
-                    ground_truth_energy = self.loaded_energies_gt[indices] if self.loaded_energies_gt is not None else None
-                    ground_truth_displacement = self.loaded_displacements_gt[indices] if self.loaded_displacements_gt is not None else None
              
 
                     # volume_sample_indices = [0, min(10, batch_size-1), rest_idx]  # Rest shape + a couple samples
@@ -941,10 +987,10 @@ class Routine:
                     # nonlinear_ratio = mean_correction / mean_total
                     
                     # Compute orthogonality constraint (using the same approach as reference)
-                    ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
+                    # ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
                     
                     # Compute origin constraint for rest shape
-                    origin = torch.sum(y[rest_idx]**2)
+                    # origin = torch.sum(y[rest_idx]**2)
 
                     bc_penalty = 0.0
                     if self.fixed_dofs_th is not None and len(self.fixed_dofs_th) > 0:
@@ -960,16 +1006,16 @@ class Routine:
                  
 
                     # Scale energy by maximum linear displacement to get comparable units
-                    max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
-                    energies_scaling = energies / max_linear_disp**2
+                    # max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2))
+                    # energies_scaling = energies / max_linear_disp**2
 
-                    energy_scaling = torch.log10(torch.mean(energies_scaling))  # Average energy across batch
+                    # energy_scaling = torch.log10(torch.mean(energies_scaling))  # Average energy across batch
 
                     # Add incentive for beneficial nonlinearity (energy improvement term)
-                    u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
-                    energy_linear = self.energy_calculator(u_linear_only).mean()
-                    energy_improvement = (torch.relu(energy_linear - energy))/(energy_linear + 1e-8)  
-                    improvement_loss = (energy_linear - energy) / (energy_linear + 1e-8)  
+                    # u_linear_only = l.detach()  # Detach to avoid affecting linear gradients
+                    # energy_linear = self.energy_calculator(u_linear_only).mean()
+                    # energy_improvement = (torch.relu(energy_linear - energy))/(energy_linear + 1e-8)  
+                    # improvement_loss = (energy_linear - energy) / (energy_linear + 1e-8)  
                     mse_energy_val_for_print = float('nan')
                     if ground_truth_energy is not None:
                         # 'energy' is the mean predicted energy for the batch (scalar tensor)
@@ -1036,17 +1082,19 @@ class Routine:
                         # 'ground_truth_energy' is a tensor of GT energies for the batch
                         # Squeeze ground_truth_energy in case it's (batch_size, 1)
                         mean_gt_energy_for_batch = torch.mean(ground_truth_energy.squeeze()) # scalar tensor
-                        mse_energy_loss_term = (energy - mean_gt_energy_for_batch)**2
-                    
+                        
+                        # Compare log10 of energies to make gradients easier
+                        log_energy_pred = torch.log10(torch.clamp(energy, min=1e-10))
+                        log_energy_gt = torch.log10(torch.clamp(mean_gt_energy_for_batch, min=1e-10))
+                        mse_energy_loss_term = (log_energy_pred - log_energy_gt)**2     
                     # Define weights for the new loss terms. 
                     # These weights might need tuning.
                     # Using a large weight similar to ortho and bc_penalty.
                     weight_mse_displacement = 1e6
-                    weight_mse_energy = 1e6 
+                    weight_mse_energy = 1e-6 
 
                     # Modified loss: includes original energy term, ortho, bc, and new MSE terms
-                    loss = 1e10 * ortho + \
-                           1e10 * bc_penalty + \
+                    loss = 1e10 * bc_penalty + \
                            weight_mse_displacement * mse_displacement_loss_term + \
                            weight_mse_energy * mse_energy_loss_term
                     loss.backward()
@@ -1068,23 +1116,17 @@ class Routine:
                         
                         # Energy metrics section
                         print(f"│ ENERGY METRICS:")
-                        print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f} │ {'Linear Energy:':<20} {energy_linear.item():<12.6f}")
+                        print(f"│ {'Raw Energy:':<20} {energy.item():<12.6f}")
                         # Inside the closure, before the print block:
                         
                         # Ground Truth Comparison Metrics
                         print(f"│ GROUND TRUTH COMPARISON:")
                         rmse_linear_vs_gt_val_for_print = float('nan')
-                        if ground_truth_displacement is not None and l is not None:
-                            squared_errors_linear_gt = (l - ground_truth_displacement)**2
-                            mean_squared_errors_linear_gt = torch.mean(squared_errors_linear_gt)
-                            rmse_linear_vs_gt_calc = torch.sqrt(mean_squared_errors_linear_gt)
-                            rmse_linear_vs_gt_val_for_print = rmse_linear_vs_gt_calc.item()
 
                         print(f"│ {'AE Energy (Pred vs GT):':<25} {mse_energy_val_for_print:<12.6e} │ {'RMSE Disp (Total vs GT):':<25} {mse_displacement_val_for_print:<12.6e}")
                         print(f"│ {'RMSE Disp (Linear vs GT):':<25} {rmse_linear_vs_gt_val_for_print:<12.6e} │")
                         # Constraint metrics section
                         print(f"│ CONSTRAINT METRICS:")
-                        print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6f}  │ {'BC Penalty:':<20} {bc_penalty.item():<12.6f} │ {'Origin Penalty:':<20} {origin.item():<12.6f}")
                                         
                                             # # Displacement metrics section
                         # print(f"│ DISPLACEMENT METRICS:")
@@ -1115,8 +1157,7 @@ class Routine:
                     
 
                     energy_val = energy.item()  # Convert tensor to Python scalar
-                    ortho_val = ortho.item()
-                    origin_val = origin.item()
+
                     loss_val = loss.item()
 
                     return loss
@@ -1127,10 +1168,26 @@ class Routine:
                 scheduler.step(loss_val)  
 
                 # Choose a random latent vector from the batch
-                random_idx = np.random.randint(1, batch_size)
+                random_idx = np.random.randint(0, batch_size)
                 random_z = z[random_idx].detach().clone()
-                self.visualize_latent_vector(random_z, iteration, loss_val)
 
+                # Compute predicted displacement for visualization
+                with torch.no_grad():
+                    neural_correction = self.model(random_z)
+                    predicted_displacement = torch.matmul(neural_correction, linear_modes.T)
+
+                # Get ground truth displacement if available
+                gt_displacement = None
+                if ground_truth_displacement is not None:
+                    gt_displacement = ground_truth_displacement[random_idx]
+
+                # Update visualization with computed displacements
+                self.visualize_latent_vector(
+                    predicted_displacement=predicted_displacement,
+                    ground_truth_displacement=gt_displacement,
+                    iteration=iteration,
+                    loss=loss_val
+                )
             if iteration % 1 == 0:  # Update visualization every 5 iterations
                 pass
                 # Update visualization
@@ -1152,7 +1209,7 @@ class Routine:
                     'loss': loss_val,
                 }
                 patience = 0
-                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa.pt'))
+                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa_dataset.pt'))
                 print(f"============ BEST MODEL UPDATED ============")
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
                 print(f"============================================")
@@ -1184,259 +1241,6 @@ class Routine:
 
 
         return best_loss    
-    # def train(self, num_epochs=1000):
-    #     """
-    #     Train the model using batched processing with strong orthogonality constraints.
-    #     Similar to the reference implementation with St. Venant-Kirchhoff energy.
-    #     """
-    #     print("Starting training...")
-        
-    #     # Setup training parameters
-    #     batch_size = 16  # You can add this to config
-    #     rest_idx = 0    # Index for rest shape in batch
-    #     print_every = 1
-    #     checkpoint_every = 50
-        
-    #     # Get rest shape (undeformed configuration)
-    #     coordinates_th = torch.tensor(self.coordinates_np, device=self.device, dtype=torch.float64)
-    #     X = torch.zeros_like(coordinates_th, device=self.device, dtype=torch.float64)
-    #     X = X.view(1, -1).expand(batch_size, -1)
-        
-    #     # Use a subset of linear modes (you might need to adjust indices)
-    #     L = self.num_modes  # Use at most L linear modes
-    #     linear_modes = self.linear_modes[:, :L].detach()  # Use the first L modes, detach as it's fixed
-        
-    #     # Setup iteration counter and best loss tracking
-    #     iteration = 0
-    #     best_loss = float('inf')
-        
-    #     # Make sure model accepts batched inputs
-    #     original_forward = self.model.forward
-        
-    #     def new_forward(x):
-    #         is_batch = x.dim() > 1
-    #         if not is_batch:
-    #             x = x.unsqueeze(0)
-    #         result = original_forward(x)
-    #         if not is_batch:
-    #             result = result.squeeze(0)
-    #         return result
-            
-    #     self.model.forward = new_forward
-        
-    #     optimizer = torch.optim.LBFGS(self.model.parameters(), 
-    #                                 lr=1,
-    #                                 max_iter=200,
-    #                                 max_eval=200,
-    #                                 tolerance_grad=1e-06,
-    #                                 tolerance_change=1e-06,
-    #                                 history_size=200,
-    #                                 line_search_fn="strong_wolfe")
-        
-    #     scheduler = LBFGSScheduler(
-    #         optimizer,
-    #         factor=0.5,
-    #         patience=100,
-    #         threshold=0.01,
-    #         min_lr=1e-6,
-    #         verbose=True
-    #     )
-    #     patience_counter = 0
-    #     example_eigenvalue_scale = self.compute_eigenvalue_based_scale()
-    #     print(f"Example eigenvalue scale: {example_eigenvalue_scale}")
-
-    #     if not hasattr(self, 'viz_plotter'):
-    #         self.create_live_visualizer()
-
-    #     while iteration < num_epochs:
-    #         lbfgs_iter = 0
-    #         with torch.no_grad():
-    #             # Curriculum scaling (currently overridden by current_scale = 1)
-    #             # deformation_scale_init = 10.0 
-    #             # deformation_scale_final = 15.0
-    #             # if num_epochs <= 1:
-    #             #     scale_fraction = 1.0
-    #             # else:
-    #             #     scale_fraction = iteration / (num_epochs - 1)
-    #             # curriculum_calculated_scale = deformation_scale_init + (deformation_scale_final - deformation_scale_init) * scale_fraction
-    #             # curriculum_calculated_scale = min(curriculum_calculated_scale, deformation_scale_final)
-
-    #             # User override for z generation scale
-    #             current_scale_for_z = self.compute_eigenvalue_based_scale()[:L]*10
-    #             # Generate samples with the chosen scale
-    #             z = torch.rand(batch_size, L, device=self.device) * current_scale_for_z * 2 - current_scale_for_z
-                
-    #             #z[rest_idx, :] = 0
-                
-    #             l = torch.matmul(z, linear_modes.T)
-                
-    #             constraint_dir = torch.matmul(z, linear_modes.T)
-    #             constraint_norms = torch.norm(constraint_dir, p=2, dim=1, keepdim=True)
-    #             constraint_norms = torch.clamp(constraint_norms, min=1e-8)
-    #             constraint_dir = constraint_dir / constraint_norms
-    #             #constraint_dir[rest_idx] = 0
-            
-    #             energy_val = 0.0
-    #             ortho_val = 0.0
-    #             origin_val = 0.0
-    #             loss_val = 0.0
-    #             bc_penalty_val = 0.0
-    #             pot_energy_residual_loss_val = 0.0 # Renamed from force_loss_val
-                
-    #             def closure():
-    #                 nonlocal energy_val, ortho_val, origin_val, loss_val, lbfgs_iter, iteration, best_loss
-    #                 nonlocal z, l, rest_idx, constraint_dir, linear_modes
-    #                 nonlocal bc_penalty_val, pot_energy_residual_loss_val # Renamed
-
-    #                 lbfgs_iter += 1
-    #                 optimizer.zero_grad()
-                    
-    #                 y = self.model(z)
-    #                 u_total_batch = l + y
-                    
-    #                 energies = self.energy_calculator(u_total_batch) # This is E_int(u_total)
-    #                 # energy_term_for_loss = torch.mean(energies) # Keep if direct energy minimization is also desired
-             
-    #                 volume_sample_indices = [0, min(10, batch_size-1) if batch_size > 1 else 0, rest_idx]
-    #                 volume_results = []
-    #                 for idx in volume_sample_indices:
-    #                     vol_result = self.energy_calculator.compute_volume_comparison(
-    #                         l[idx:idx+1], u_total_batch[idx:idx+1])
-    #                     volume_results.append(vol_result)
-    #                 avg_linear_ratio = sum(r['linear_volume_ratio'] for r in volume_results) / len(volume_results)
-    #                 avg_neural_ratio = sum(r['neural_volume_ratio'] for r in volume_results) / len(volume_results)
-    #                 vol_penalty_val = 1000.0 * torch.mean((torch.tensor(
-    #                     [r['neural_volume_ratio'] for r in volume_results], 
-    #                     device=self.device, dtype=torch.float64) - 1.0)**2)
-                    
-    #                 ortho = torch.mean(torch.sum(y * constraint_dir, dim=1)**2)
-    #                 origin = torch.sum(y[rest_idx]**2)
-
-    #                 bc_penalty = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-    #                 if self.fixed_dofs_th is not None and len(self.fixed_dofs_th) > 0:
-    #                     fixed_displacements = u_total_batch[:, self.fixed_dofs_th]
-    #                     bc_penalty = torch.mean(torch.sum(fixed_displacements**2, dim=1))
-
-    #                 # --- Potential Energy Residual Loss ---
-    #                 # Approximated external forces: f_e_approx = -Phi @ z
-    #                 approximated_external_forces = -torch.einsum('dl,bl->bd', linear_modes, z)
-                                        
-    #                 # Work done by approximated external forces: W_ext_approx = f_e_approx^T @ u_total
-    #                 # u_total_batch is (batch_size, output_dim)
-    #                 # approximated_external_forces is (batch_size, output_dim)
-    #                 external_work_approx_batch = torch.einsum('bd,bd->b', approximated_external_forces, u_total_batch)
-                    
-    #                 # Potential energy residual term per sample: E_int(u_total) - W_ext_approx
-    #                 potential_energy_residuals = energies + external_work_approx_batch # Shape: (batch_size,)
-    #                 residual_mean = torch.mean(potential_energy_residuals)
-                    
-    #                 # Loss term (mean squared error of the potential energy residuals)
-    #                 pot_res_loss_weight = 1 # Example weight, needs tuning. Was 1 for force_loss.
-    #                 # potential_energy_residual_loss = pot_res_loss_weight * torch.mean(potential_energy_residuals**2)
-    #                 # --- End Potential Energy Residual Loss ---
-
-    #                                     # Huber Loss (alternative):
-    #                 beta_huber = 1.0 # Hyperparameter for Huber loss
-    #                 potential_energy_residual_loss = pot_res_loss_weight * torch.nn.functional.huber_loss(
-    #                     potential_energy_residuals, 
-    #                     torch.zeros_like(potential_energy_residuals), 
-    #                     reduction='mean', 
-    #                     delta=beta_huber
-    #                 )
-                 
-    #                 max_linear_disp = torch.max(torch.norm(l.reshape(batch_size, -1, 3), dim=2)) if batch_size > 0 else torch.tensor(1.0, device=self.device)
-    #                 max_linear_disp = torch.clamp(max_linear_disp, min=1e-6)
-    #                 # energies_scaling = energies / max_linear_disp**2 # energies is E_int
-    #                 # energy_scaling_log = torch.log10(torch.mean(energies_scaling)) # For printout
-                    
-    #                 # For printout, use the mean of energies (which is E_int)
-    #                 energy_for_printout = torch.mean(energies).item()
-                    
-    #                 u_linear_only = l.detach()
-    #                 energy_linear_for_printout = self.energy_calculator(u_linear_only).mean().item()
-    #                 energy_improvement_for_printout = (torch.relu(torch.tensor(energy_linear_for_printout) - torch.tensor(energy_for_printout)))/(torch.abs(torch.tensor(energy_linear_for_printout)) + 1e-8)
-                                
-    #                 # Modified loss (based on user's current visible code structure)
-    #                 loss = 1e6 * ortho + 1e6 * bc_penalty  + potential_energy_residual_loss
-
-    #                 loss.backward()
-                    
-    #                 if iteration % print_every == 0: # Print only on first LBFGS eval per iteration
-    #                     progress = f"{iteration}/{num_epochs}"
-    #                     progress_pct = f"({100 * iteration / num_epochs:.1f}%)"
-                        
-    #                     sep_line = "=" * 80
-    #                     print(f"\n{sep_line}")
-    #                     print(f"TRAINING ITERATION {progress} {progress_pct} - Best Loss: {best_loss:.6e}")
-    #                     # print(f"Curriculum Scale (calculated): {curriculum_calculated_scale:.4f}, Scale for Z: {current_scale_for_z:.4f}")
-    #                     print(f"Scale for Z: {current_scale_for_z.mean():.4f}")
-    #                     print(f"{sep_line}")
-                        
-    #                     print(f"│ ENERGY METRICS (Informational):")
-    #                     print(f"│ {'Mean E_int:':<20} {energy_for_printout:<12.6e} │ {'Mean E_linear:':<20} {energy_linear_for_printout:<12.6e}")
-    #                     print(f"│ {'E Improvement:':<20} {energy_improvement_for_printout.item()*100:.2f}% │")
-                        
-    #                     print(f"│ CONSTRAINT METRICS:")
-    #                     print(f"│ {'Orthogonality:':<20} {ortho.item():<12.6e}  │ {'BC Penalty:':<20} {bc_penalty.item():<12.6e}")
-    #                     print(f"│ {'Residual:':<20} {residual_mean.item():<12.6e}  │ {'Mean Ext. Work:':<20} {torch.mean(external_work_approx_batch).item():<12.6e} │")
-                                                
-    #                     print(f"│ VOLUME PRESERVATION:")
-    #                     print(f"│ {'Linear Vol Ratio:':<20} {avg_linear_ratio:<12.6f} │ {'Neural Vol Ratio:':<20} {avg_neural_ratio:<12.6f}")
-    #                     print(f"│ {'Volume Penalty:':<20} {vol_penalty_val.item():<12.6e}")
-                        
-    #                     print(f"{sep_line}")
-    #                     print(f"TOTAL LOSS: {loss.item():.6e} - LBFGS iter: {lbfgs_iter}")
-    #                     print(f"{sep_line}\n")
-                    
-    #                 energy_val = energy_for_printout # Store mean E_int for logging
-    #                 ortho_val = ortho.item()
-    #                 origin_val = origin.item()
-    #                 loss_val = loss.item()
-    #                 bc_penalty_val = bc_penalty.item()
-    #                 pot_energy_residual_loss_val = potential_energy_residual_loss.item()
-
-    #                 return loss
-                
-    #             optimizer.step(closure)
-    #             scheduler.step(loss_val)  
-
-    #             if batch_size > 1:
-    #                 vis_indices = [i for i in range(batch_size)]
-    #                 if vis_indices:
-    #                      random_idx = np.random.choice(vis_indices)
-    #                      random_z = z[random_idx].detach().clone()
-    #                      self.visualize_latent_vector(random_z, iteration, loss_val)
-    #             elif batch_size == 1:
-    #                  self.visualize_latent_vector(z[0].detach().clone(), iteration, loss_val)
-
-    #         self.writer.add_scalar('train/loss', loss_val, iteration)
-    #         self.writer.add_scalar('train/mean_internal_energy', energy_val, iteration) # Changed tag
-    #         self.writer.add_scalar('train/ortho', ortho_val, iteration)
-    #         self.writer.add_scalar('train/origin', origin_val, iteration)
-    #         self.writer.add_scalar('train/bc_penalty', bc_penalty_val, iteration)
-    #         self.writer.add_scalar('train/potential_energy_residual_loss', pot_energy_residual_loss_val, iteration) # Changed tag
-    #         self.writer.add_scalar('train/current_scale_for_z', current_scale_for_z.mean(), iteration) # Log actual scale used for z
-            
-    #         if loss_val < best_loss:
-    #             best_loss = loss_val
-    #             checkpoint = {
-    #                 'epoch': iteration,
-    #                 'model_state_dict': self.model.state_dict(),
-    #                 'optimizer_state_dict': optimizer.state_dict(),
-    #                 'loss': loss_val,
-    #             }
-    #             patience_counter = 0
-    #             torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa.pt'))
-    #             print(f"============ BEST MODEL UPDATED (Iter {iteration}, Loss: {loss_val:.6e}) ============")
-    #         else:
-    #             patience_counter +=1
-            
-    #         iteration += 1
-            
-    #     self.model.forward = original_forward
-    #     print(f"Training complete. Best loss: {best_loss:.8e}")
-    #     return best_loss
-
 
 
     def create_live_visualizer(self):
@@ -1457,113 +1261,195 @@ class Routine:
             cell_type = pyvista.CellType.HEXAHEDRON
             cells = np.hstack((np.full((num_elements, 1), 8), self.elements_np)).flatten()
         elif nodes_per_elem == 10: # Quadratic Tetrahedron
-             cell_type = pyvista.CellType.QUADRATIC_TETRA
-             cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
+            cell_type = pyvista.CellType.QUADRATIC_TETRA
+            cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
         # Add other element types if needed (e.g., quadratic hex)
         else:
-             print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Using points.")
-             # Fallback: visualize as points
-             grid = pyvista.PolyData(self.coordinates_np)
-             cell_type = None # Indicate no cells
-             cells = None
-             # Or raise error: raise ValueError(f"Unsupported element type for visualization: {nodes_per_elem} nodes")
+            print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Using points.")
+            # Fallback: visualize as points
+            grid = pyvista.PolyData(self.coordinates_np)
+            cell_type = None # Indicate no cells
+            cells = None
+            # Or raise error: raise ValueError(f"Unsupported element type for visualization: {nodes_per_elem} nodes")
 
         if cell_type is not None:
-             grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
+            grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
         else: # Fallback to PolyData (points)
-             grid = pyvista.PolyData(self.coordinates_np)
+            grid = pyvista.PolyData(self.coordinates_np)
 
-
-        # Create plotter (same as before)
-        plotter = pyvista.Plotter(shape=(1, 2), title="Neural Modes Training Visualization",
-                            window_size=[1600, 720], off_screen=False)
+        # Create plotter with single view showing both wireframe GT and solid prediction
+        plotter = pyvista.Plotter(title="Neural Network Training: Ground Truth (Wireframe) vs Prediction (Solid)",
+                            window_size=[1200, 800], off_screen=False)
 
         # Store grid and visualization components
         self.viz_grid = grid # Store the PyVista grid
         self.viz_plotter = plotter
-        self.mesh_actor_left = None
-        self.mesh_actor_right = None
+        self.mesh_actor_gt_wireframe = None  # Ground truth wireframe
+        self.mesh_actor_prediction_solid = None  # Neural network prediction solid
         self.info_actor = None
 
-        # Initialize the render window (same as before)
+        # Initialize the render window
         plotter.show(interactive=False, auto_close=False)
-        for i in range(2):
-            plotter.subplot(0, i)
-            plotter.camera_position = [(20.0, 3.0, 2.0), (0.0, -2.0, 0.0), (0.0, 0.0, 2.0)]
-            plotter.camera.zoom(1.5)
-        plotter.link_views()
+        plotter.camera_position = [(20.0, 3.0, 2.0), (0.0, -2.0, 0.0), (0.0, 0.0, 2.0)]
+        plotter.camera.zoom(1.5)
 
         print("Visualizer created.")
         return plotter
 
-    def visualize_latent_vector(self, z, iteration=None, loss=None):
-        """Update visualization using loaded mesh data"""
+
+    def visualize_latent_vector(self, predicted_displacement, ground_truth_displacement=None, iteration=None, loss=None):
+        """Update visualization showing ground truth wireframe and network prediction solid mesh, colored by RMSE"""
         if not hasattr(self, 'viz_plotter') or self.viz_plotter is None:
-             print("Visualizer not initialized. Skipping visualization.")
-             return
+            print("Visualizer not initialized. Skipping visualization.")
+            return
         try:
-            # Ensure z is properly formatted (same as before)
-            # ...
-            if not isinstance(z, torch.Tensor): z = torch.tensor(z, device=self.device, dtype=torch.float64)
-            if z.dim() > 1: z = z.squeeze()
+            # Convert inputs to numpy if they're tensors
+            if isinstance(predicted_displacement, torch.Tensor):
+                predicted_displacement = predicted_displacement.detach().cpu().numpy()
+            
+            if ground_truth_displacement is not None and isinstance(ground_truth_displacement, torch.Tensor):
+                ground_truth_displacement = ground_truth_displacement.detach().cpu().numpy()
 
+            # Reshape displacements to 3D coordinates
+            u_pred_reshaped = predicted_displacement.reshape((-1, 3))
+            
+            # Prepare ground truth displacement if available
+            if ground_truth_displacement is not None:
+                u_gt_reshaped = ground_truth_displacement.reshape((-1, 3))
+                print("Using provided ground truth displacement")
+                
+                # Calculate RMSE per node (3D vector RMSE)
+                node_errors = u_pred_reshaped - u_gt_reshaped  # Error vectors per node
+                node_rmse = np.sqrt(np.mean(node_errors**2, axis=1))  # RMSE per node
+                
+                # Use RMSE for coloring
+                color_scalars_gt = node_rmse  # Same RMSE for both meshes
+                color_scalars_pred = node_rmse
+                color_label = "RMSE (Prediction vs Ground Truth)"
+                
+                # Calculate color range based on RMSE
+                max_rmse = np.max(node_rmse)
+                min_rmse = np.min(node_rmse)
+                color_range = [min_rmse, max(max_rmse, 1e-9)]  # Avoid zero max
+                
+            else:
+                # If no ground truth available, use displacement magnitude as fallback
+                u_gt_reshaped = np.zeros_like(u_pred_reshaped)
+                print("No ground truth provided - using displacement magnitude as fallback")
+                
+                # Fall back to displacement magnitude
+                gt_mag = np.linalg.norm(u_gt_reshaped, axis=1)
+                pred_mag = np.linalg.norm(u_pred_reshaped, axis=1)
+                
+                color_scalars_gt = gt_mag
+                color_scalars_pred = pred_mag
+                color_label = "Displacement Magnitude"
+                
+                max_mag = max(np.max(gt_mag), np.max(pred_mag), 1e-9)
+                min_mag = min(np.min(gt_mag), np.min(pred_mag))
+                color_range = [min_mag, max_mag]
 
-            # Compute displacements (same as before)
-            with torch.no_grad():
-                linear_contribution = torch.matmul(z, self.linear_modes.T)
-                neural_correction = self.model(z)
-                u_total = linear_contribution + neural_correction
-                linear_only_np = linear_contribution.detach().cpu().numpy()
-                u_total_np = u_total.detach().cpu().numpy()
+            # Remove existing actors
+            if self.mesh_actor_gt_wireframe is not None: 
+                self.viz_plotter.remove_actor(self.mesh_actor_gt_wireframe)
+            if self.mesh_actor_prediction_solid is not None: 
+                self.viz_plotter.remove_actor(self.mesh_actor_prediction_solid)
 
-            # --- No dolfinx interpolation needed ---
-            # Displacements are already defined on the nodes
-            linear_np = linear_only_np.reshape((-1, 3))
-            total_np = u_total_np.reshape((-1, 3))
+            # Create ground truth wireframe mesh
+            gt_grid = self.viz_grid.copy()
+            gt_grid.points = self.coordinates_np + u_gt_reshaped  # Apply ground truth displacement
+            gt_grid[color_label] = color_scalars_gt
 
-            # Compute magnitudes (same as before)
-            linear_mag = np.linalg.norm(linear_np, axis=1)
-            total_mag = np.linalg.norm(total_np, axis=1)
-            max_mag = max(np.max(linear_mag), np.max(total_mag), 1e-9) # Avoid zero max
-            min_mag = min(np.min(linear_mag), np.min(total_mag))
-            color_range = [min_mag, max_mag]
-
-            # --- Update PyVista Plotter ---
-            # Left subplot - Linear
-            self.viz_plotter.subplot(0, 0)
-            if self.mesh_actor_left is not None: self.viz_plotter.remove_actor(self.mesh_actor_left)
-            linear_grid = self.viz_grid.copy()
-            linear_grid.points = self.coordinates_np + linear_np # Apply displacement directly
-            linear_grid["displacement_magnitude"] = linear_mag
-            self.mesh_actor_left = self.viz_plotter.add_mesh(
-                linear_grid, scalars="displacement_magnitude", cmap="viridis",
-                show_edges=False, clim=color_range, reset_camera=False
+            # Add ground truth as wireframe
+            self.mesh_actor_gt_wireframe = self.viz_plotter.add_mesh(
+                gt_grid, 
+                scalars=color_label, 
+                cmap="coolwarm",  # Different colormap for distinction
+                style="wireframe",  # Wireframe style
+                line_width=2,
+                opacity=0.8,
+                clim=color_range, 
+                reset_camera=False,
+                label="Ground Truth"
             )
-            self.viz_plotter.add_text("Linear Modes Only", position="upper_edge", font_size=12, color='black')
 
-            # Right subplot - Neural
-            self.viz_plotter.subplot(0, 1)
-            if self.mesh_actor_right is not None: self.viz_plotter.remove_actor(self.mesh_actor_right)
-            total_grid = self.viz_grid.copy()
-            total_grid.points = self.coordinates_np + total_np # Apply displacement directly
-            total_grid["displacement_magnitude"] = total_mag
-            self.mesh_actor_right = self.viz_plotter.add_mesh(
-                total_grid, scalars="displacement_magnitude", cmap="viridis",
-                show_edges=False, clim=color_range, reset_camera=False
+            # Create neural network prediction solid mesh
+            pred_grid = self.viz_grid.copy()
+            pred_grid.points = self.coordinates_np + u_pred_reshaped  # Apply predicted displacement
+            pred_grid[color_label] = color_scalars_pred
+
+            # Add prediction as solid mesh
+            self.mesh_actor_prediction_solid = self.viz_plotter.add_mesh(
+                pred_grid, 
+                scalars=color_label, 
+                cmap="viridis",  # Different colormap
+                style="surface",  # Solid surface
+                opacity=0.7,  # Slightly transparent to see wireframe through
+                show_edges=False,
+                clim=color_range, 
+                reset_camera=False,
+                label="Neural Network Prediction"
             )
-            self.viz_plotter.add_text("Neural Network Prediction", position="upper_edge", font_size=12, color='black')
 
-            # Update info text (same as before)
-            self.viz_plotter.subplot(0, 0)
+            # Add legend
+            legend_labels = [
+                ["Ground Truth (Wireframe)", "red"], 
+                ["NN Prediction (Solid)", "blue"]
+            ]
+            if ground_truth_displacement is not None:
+                legend_labels.append(["Color: RMSE Error", "green"])
+            else:
+                legend_labels.append(["Color: Displacement Mag", "green"])
+                
+            self.viz_plotter.add_legend(legend_labels, loc="upper_right")
+
+            # Add colorbar with appropriate label
+            self.viz_plotter.add_scalar_bar(
+                color_label, 
+                position_x=0.85, position_y=0.1, 
+                width=0.1, height=0.8
+            )
+
+            # Update info text
             if iteration is not None and loss is not None:
-                if self.info_actor is not None: self.viz_plotter.remove_actor(self.info_actor)
-                nonlinear_mag = np.linalg.norm(neural_correction.detach().cpu().numpy())
-                total_mag_val = np.linalg.norm(u_total_np)
-                nonlinear_percent = (nonlinear_mag / total_mag_val) * 100 if total_mag_val > 1e-9 else 0
-                info_text = f"Iteration: {iteration}\nLoss: {loss:.6e}\nNonlinear Contribution: {nonlinear_percent:.2f}%"
-                self.info_actor = self.viz_plotter.add_text(info_text, position=(10, 10), font_size=10, color='black')
+                if self.info_actor is not None: 
+                    self.viz_plotter.remove_actor(self.info_actor)
+                
+                # Calculate metrics for info display
+                pred_magnitude = np.linalg.norm(predicted_displacement)
+                
+                # Calculate error metrics if ground truth is available
+                if ground_truth_displacement is not None:
+                    mse = np.mean((predicted_displacement - ground_truth_displacement)**2)
+                    rmse = np.sqrt(mse)
+                    relative_error = rmse / (np.linalg.norm(ground_truth_displacement) + 1e-9) * 100
+                    
+                    # Additional RMSE statistics
+                    mean_node_rmse = np.mean(node_rmse)
+                    max_node_rmse = np.max(node_rmse)
+                    
+                    info_text = (f"Iteration: {iteration}\n"
+                            f"Loss: {loss:.6e}\n"
+                            f"Pred Magnitude: {pred_magnitude:.6f}\n"
+                            f"Global RMSE: {rmse:.6f}\n"
+                            f"Mean Node RMSE: {mean_node_rmse:.6f}\n"
+                            f"Max Node RMSE: {max_node_rmse:.6f}\n"
+                            f"Relative Error: {relative_error:.2f}%")
+                else:
+                    info_text = (f"Iteration: {iteration}\n"
+                            f"Loss: {loss:.6e}\n"
+                            f"Pred Magnitude: {pred_magnitude:.6f}\n"
+                            f"(No ground truth provided)")
+                        
+                self.info_actor = self.viz_plotter.add_text(
+                    info_text, 
+                    position=(10, 10), 
+                    font_size=10, 
+                    color='black',
+                    shadow=True
+                )
 
-            # Update render window (same as before)
+            # Update render window
             self.viz_plotter.update()
             self.viz_plotter.render()
 
@@ -1571,10 +1457,8 @@ class Routine:
             print(f"Visualization error (continuing training): {str(e)}")
             import traceback
             print(traceback.format_exc())
-    
-
-    
-    
+            
+                
     def compute_safe_scaling_factor(self):
         """
         Compute appropriate scaling factor for latent variables based on:
@@ -1863,7 +1747,7 @@ class Routine:
                         width=0.5, height=0.02, title_font_size=12, label_font_size=10)
 
         # Add overall title
-        plotter.add_text("Neural Latent Space Mode Atlas", position="upper_edge",
+        plotter.add_text("Neural Latent Space Mode Atlas", position="upper edge",
                     font_size=16, color='black')
 
         print("Showing latent space visualization...")
