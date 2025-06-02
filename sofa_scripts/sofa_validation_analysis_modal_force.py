@@ -77,7 +77,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.num_substeps = kwargs.get('num_substeps', 1)
         self.current_substep = 0
         self.current_main_step = 0
-        self.max_main_steps = kwargs.get('max_main_steps', 20)
+        self.max_main_steps = kwargs.get('max_main_steps', 10)
 
         # --- New parameter for scaling modal coordinates 'z' ---
         self.max_z_amplitude_scale = kwargs.get('max_z_amplitude_scale', 1000) # Tune this value
@@ -115,8 +115,6 @@ class AnimationStepController(Sofa.Core.Controller):
         self.force_verification_done = False 
 
       
-
-
     def onSimulationInitDoneEvent(self, event):
         """
         Called within the Sofa pipeline at the end of the scene graph initialisation.
@@ -204,7 +202,28 @@ class AnimationStepController(Sofa.Core.Controller):
 
     def onAnimateBeginEvent(self, event):
 
-        self.modes_to_use = [4] # Example: Use mode 4 only, it is a list of indices to use for modal coordinates
+        match self.current_main_step:
+            case 0 : 
+                self.modes_to_use = [0] # list of indices to use for modal coordinates
+            case 1 :
+                self.modes_to_use = [1] # list of indices to use for modal coordinates
+            case 2 : 
+                self.modes_to_use = [2] # list of indices to use for modal coordinates
+            case 3 :
+                self.modes_to_use = [3] # list of indices to use for modal coordinates
+            case 4 :
+                self.modes_to_use = [4] # list of indices to use for modal coordinates
+            case 5 :
+                self.modes_to_use = [5] # list of indices to use for modal coordinates
+            case 6 :
+                self.modes_to_use = [6] # list of indices to use for modal coordinates
+            case 7 :
+                self.modes_to_use = [2,3] # list of indices to use for modal coordinates
+            case 8 :
+                self.modes_to_use = [3,4] # list of indices to use for modal coordinates
+            case _ :
+                self.modes_to_use = [2,3,4,5,6] # list of indices to use for modal coordinates
+
         #check if the indices are valid
         if any(idx >= self.linear_modes_np.shape[1] for idx in self.modes_to_use):
             print(f"Error: One or more mode indices {self.modes_to_use} exceed available modes ({self.linear_modes_np.shape[1]}).")
@@ -218,20 +237,16 @@ class AnimationStepController(Sofa.Core.Controller):
             if self.MO_NeuralPred: self.MO_NeuralPred.position.value = rest_pos
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
-            #base_z_coeffs = np.random.rand(len(self.modes_to_use)) * 2 - 1 # Random coefficients in [-1, 1]
-            base_z_coeffs = -np.ones(len(self.modes_to_use))  
+            #base_z_coeffs = 0.5*np.ones(len(self.modes_to_use)) + np.random.rand(len(self.modes_to_use)) - 0.5 # Random coefficients in [0.5, 1]
+            base_z_coeffs = np.ones(len(self.modes_to_use))  
 
             self.base_z_pattern_for_main_step = base_z_coeffs * self.max_z_amplitude_scale
             print(f"  Base Z pattern for main step (norm): {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}")
-            # print(f"  Base Z pattern components (first few): {self.base_z_pattern_for_main_step[:min(L,5)]}")
+            print(f"  Base Z pattern components (first 7 values): {self.base_z_pattern_for_main_step[:min(len(self.modes_to_use),7)]}")
 
 
         # Calculate force for the CURRENT substep based on modal coordinates
         substep_fraction = (self.current_substep % self.num_substeps + 1) / self.num_substeps
-
-
-        #substep_fraction = 1
-
 
         current_amplitude_scale = self.max_z_amplitude_scale * substep_fraction
         self.current_applied_z = self.base_z_pattern_for_main_step * current_amplitude_scale
@@ -310,11 +325,14 @@ class AnimationStepController(Sofa.Core.Controller):
         z_nonlinear=self.computeModalCoordinates(real_solution)
         z_linear = self.computeModalCoordinates(linear_solution)
 
-        print("z_linear    = ", z_linear)
+        np.set_printoptions(precision=2, suppress=True)
+        print("z_linear    = ", z_linear)   
         print("z_nonlinear = ", z_nonlinear)
         print("=================================")
+        np.set_printoptions(precision=4, suppress=False)
         
         if (self.num_substeps - self.current_substep <= 2):
+            print("=============> making prediction")
             try:
                 if self.current_applied_z is not None and len(self.current_applied_z) > 0:
                     self.z0_vals.append(float(self.current_applied_z[0]))
@@ -338,7 +356,7 @@ class AnimationStepController(Sofa.Core.Controller):
                 if z_actual_sofa is not None and not np.isnan(z_actual_sofa).any():
                     self.all_z_coords.append(z_actual_sofa.copy()) # Store z_actual
                 print(f"  Random z pattern norm: {np.linalg.norm(self.base_z_pattern_for_main_step):.4f}, Actual z norm: {np.linalg.norm(z_actual_sofa):.4f}")
-                print(f"  Random z components (first few): {self.current_applied_z[:min(len(self.current_applied_z),5)]}")
+                print(f"  Random z components (first few): {self.current_applied_z[:min(len(self.current_applied_z),7)]}")
 
                 # Divide current_applied_z by eigenvalues
                 if self.routine.eigenvalues is not None and self.current_applied_z is not None:
@@ -347,11 +365,11 @@ class AnimationStepController(Sofa.Core.Controller):
                     safe_eigenvalues = np.where(np.abs(eigenvalues_truncated) < 1e-9, 1e-9, eigenvalues_truncated)
                     z_scaled = self.current_applied_z[:num_eigenvalues_to_use] / np.sqrt(safe_eigenvalues)
                     self.scaled_z0_vals.append(float(z_scaled[0]) if len(z_scaled) > 0 else np.nan)
-                    print(f"  Scaled z components (first few): {z_scaled[:min(len(z_scaled),5)]}")
+                    print(f"  Scaled z components (first few): {z_scaled[:min(len(z_scaled),7)]}")
                 else:
                     self.scaled_z0_vals.append(np.nan)
                     print("  Eigenvalues not available, cannot scale z.")
-                print(f"  Actual z components (first few): {z_actual_sofa[:min(len(z_actual_sofa),5)]}")
+                print(f"  Actual z components (first few): {z_actual_sofa[:min(len(z_actual_sofa),7)]}")
 
                 sofa_linear_energy = float('nan')
                 linear_solution_sofa_reshaped = None
@@ -532,6 +550,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         self.current_substep += 1
         if (self.current_substep % self.num_substeps) == 0:
+            self.current_substep = 0
             self.current_main_step += 1
             print(f"--- Main Step {self.current_main_step} Completed (Total Substeps: {self.current_substep}) ---")
             if not args.gui and self.current_main_step >= self.max_main_steps:
@@ -894,6 +913,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
     visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 1 0 1')
     visual.addObject('BarycentricMapping', input='@../MO1', output='@./visual')
+    visual.addObject('VisualModelOBJExporter', filename="neuralModes-groundtruth", exportEveryNumberOfSteps=50) 
 
     # Add a second model beam with TetrahedronFEMForceField, which is linear
     # --- Add Linear Solution Node ---
@@ -953,7 +973,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     linearModesViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
     MO_LinearModes = linearModesViz.addObject('MechanicalObject', name='MO_LinearModes', template='Vec3d', src='@grid')
 
-    # Add visual model
+    # Add visual model for the reduced model 
     visualLinearModes = linearModesViz.addChild("visualLinearModes")
     visualLinearModes.addObject('VisualStyle', displayFlags='showWireframe')
     visual_LM = visualLinearModes.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
@@ -972,6 +992,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
     visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
     visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
+    visualNeuralPred.addObject('VisualModelOBJExporter', filename="neuralModes-prediction", exportEveryNumberOfSteps=50) 
     # --- End Neural Pred Viz Node ---
 
 
