@@ -23,21 +23,21 @@ physics:
 
 simulation:
   steps: 1 # Default number of main steps
-  max_z_amplitude_scale: 750 # was 75
+  max_z_amplitude_scale: 350 # was 75
 # Constraint parameters
 constraints:
   fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]
 
 # Neural model configuration
 model:
-  latent_dim: 5
+  latent_dim: 7
   hid_layers: 16
   hid_dim: 64
   use_modal_derivatives: true
 
 # Training parameters
 training:
-  num_epochs: 366
+  num_epochs: 100
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"
