@@ -705,10 +705,10 @@ class Routine:
 
         print(f"Generating regularly spaced samples for latent dim {L}")
         num_samples_per_mode = 5  # Number of samples along each mode
-        mode_scale = torch.ones(self.latent_dim) # uniform weight (z) of 1 for all modes
-        mode_scale[0] = 5.0 # set bending range
-        mode_scale[1] = 10.0 # set bending range
-        mode_scale[4] = 25.0 # set twist scale to a larger value
+        mode_scale = torch.linspace(25, 10, self.latent_dim) # set weight (z) for each deformation mode
+        #uniform_scale = 25.0 
+        #mode_scale = variable_scale*torch.ones(self.latent_dim) # uniform weight (z) of 10 for all modes
+        #mode_scale[4] = 25.0 # set twist scale to a larger value
         numbers = np.linspace(-1, 1, num_samples_per_mode)
         combo = torch.Tensor(list(product(numbers, repeat=self.latent_dim)))
         num_samples = len(combo)
