@@ -704,11 +704,27 @@ class Routine:
         import random
 
         print(f"Generating regularly spaced samples for latent dim {L}")
-        num_samples_per_mode = 5  # Number of samples along each mode
-        mode_scale = torch.linspace(25, 10, self.latent_dim) # set weight (z) for each deformation mode
-        #uniform_scale = 25.0 
-        #mode_scale = variable_scale*torch.ones(self.latent_dim) # uniform weight (z) of 10 for all modes
-        #mode_scale[4] = 25.0 # set twist scale to a larger value
+        num_samples_per_mode = 6  # Number of samples along each mode
+        use_different_scales = True  # Set to False to use linear decay, True to use custom scales
+
+        if use_different_scales:
+            # Custom scales for each mode - EDIT THESE VALUES as needed
+            custom_scales = [500.0, 500.0, 250.0, 200.0, 250.0, 10.0, 10.0, 5.0]  # Example scales
+            
+            # Ensure we have enough scales for all modes
+            if len(custom_scales) < self.latent_dim:
+                print(f"Warning: Only {len(custom_scales)} custom scales provided for {self.latent_dim} modes")
+                print("Extending with default value of 25.0")
+                custom_scales.extend([25.0] * (self.latent_dim - len(custom_scales)))
+            
+            # Use only the scales we need
+            mode_scale = torch.tensor(custom_scales[:self.latent_dim], dtype=torch.float64)
+            print(f"Using custom mode scales: {mode_scale.tolist()}")
+            
+        else:
+            # Original linear decay
+            mode_scale = torch.linspace(25, 10, self.latent_dim)
+            print(f"Using linear decay from 25 to 10: {mode_scale.tolist()}")
         numbers = np.linspace(-1, 1, num_samples_per_mode)
         combo = torch.Tensor(list(product(numbers, repeat=self.latent_dim)))
         num_samples = len(combo)

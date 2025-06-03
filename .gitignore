@@ -8,6 +8,8 @@
 z_dataset
 /matrices_paper
 
+neuralModes*
+
 runSofa.ini
 /configs
 
