@@ -367,7 +367,7 @@ class Routine:
         hid_layers = cfg['model'].get('hid_layers', 2)
         hid_dim = cfg['model'].get('hid_dim', 64)
         print(f"Output dimension: {self.output_dim}")        
-        self.model = Net(self.num_modes, self.num_modes, hid_layers, hid_dim).to(device).double()
+        self.model = Net(self.num_modes, self.output_dim, hid_layers, hid_dim).to(device).double()
 
         print(f"Neural network loaded. Latent dim: {self.latent_dim}, Num Modes: {self.num_modes}")
 
@@ -824,7 +824,7 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 16  # You can add this to config
+        batch_size = 128  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
         print_every = 1
         checkpoint_every = 50
@@ -947,11 +947,10 @@ class Routine:
                     # Compute nonlinear correction
                     y = self.model(z)
                     
-                    # y is modal coordinates, convert to displacement
-                    neural_correction_displacement = torch.matmul(y, linear_modes.T)
+                    linear_displacement = torch.matmul(z, linear_modes.T)  # Linear displacement
                     
                     # Compute energy (use your energy calculator)
-                    u_total_batch = neural_correction_displacement
+                    u_total_batch = linear_displacement + y  # Total displacement   
                                     
                     
                     
@@ -1091,7 +1090,7 @@ class Routine:
                     # These weights might need tuning.
                     # Using a large weight similar to ortho and bc_penalty.
                     weight_mse_displacement = 1e6
-                    weight_mse_energy = 1e-6 
+                    weight_mse_energy = 1e2
 
                     # Modified loss: includes original energy term, ortho, bc, and new MSE terms
                     loss = 1e10 * bc_penalty + \
@@ -1174,20 +1173,13 @@ class Routine:
                 # Compute predicted displacement for visualization
                 with torch.no_grad():
                     neural_correction = self.model(random_z)
-                    predicted_displacement = torch.matmul(neural_correction, linear_modes.T)
-
-                # Get ground truth displacement if available
+                    predicted_displacement = torch.matmul(random_z, linear_modes.T) + neural_correction     # Get ground truth displacement if available
                 gt_displacement = None
                 if ground_truth_displacement is not None:
                     gt_displacement = ground_truth_displacement[random_idx]
 
                 # Update visualization with computed displacements
-                self.visualize_latent_vector(
-                    predicted_displacement=predicted_displacement,
-                    ground_truth_displacement=gt_displacement,
-                    iteration=iteration,
-                    loss=loss_val
-                )
+                self.visualize_latent_vector(random_z, iteration=iteration, loss=loss_val)
             if iteration % 1 == 0:  # Update visualization every 5 iterations
                 pass
                 # Update visualization
@@ -1261,195 +1253,113 @@ class Routine:
             cell_type = pyvista.CellType.HEXAHEDRON
             cells = np.hstack((np.full((num_elements, 1), 8), self.elements_np)).flatten()
         elif nodes_per_elem == 10: # Quadratic Tetrahedron
-            cell_type = pyvista.CellType.QUADRATIC_TETRA
-            cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
+             cell_type = pyvista.CellType.QUADRATIC_TETRA
+             cells = np.hstack((np.full((num_elements, 1), 10), self.elements_np)).flatten()
         # Add other element types if needed (e.g., quadratic hex)
         else:
-            print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Using points.")
-            # Fallback: visualize as points
-            grid = pyvista.PolyData(self.coordinates_np)
-            cell_type = None # Indicate no cells
-            cells = None
-            # Or raise error: raise ValueError(f"Unsupported element type for visualization: {nodes_per_elem} nodes")
+             print(f"Warning: Unsupported element type ({nodes_per_elem} nodes) for PyVista visualization. Using points.")
+             # Fallback: visualize as points
+             grid = pyvista.PolyData(self.coordinates_np)
+             cell_type = None # Indicate no cells
+             cells = None
+             # Or raise error: raise ValueError(f"Unsupported element type for visualization: {nodes_per_elem} nodes")
 
         if cell_type is not None:
-            grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
+             grid = pyvista.UnstructuredGrid(cells, [cell_type] * num_elements, self.coordinates_np)
         else: # Fallback to PolyData (points)
-            grid = pyvista.PolyData(self.coordinates_np)
+             grid = pyvista.PolyData(self.coordinates_np)
 
-        # Create plotter with single view showing both wireframe GT and solid prediction
-        plotter = pyvista.Plotter(title="Neural Network Training: Ground Truth (Wireframe) vs Prediction (Solid)",
-                            window_size=[1200, 800], off_screen=False)
+
+        # Create plotter (same as before)
+        plotter = pyvista.Plotter(shape=(1, 2), title="Neural Modes Training Visualization",
+                            window_size=[1600, 720], off_screen=False)
 
         # Store grid and visualization components
         self.viz_grid = grid # Store the PyVista grid
         self.viz_plotter = plotter
-        self.mesh_actor_gt_wireframe = None  # Ground truth wireframe
-        self.mesh_actor_prediction_solid = None  # Neural network prediction solid
+        self.mesh_actor_left = None
+        self.mesh_actor_right = None
         self.info_actor = None
 
-        # Initialize the render window
+        # Initialize the render window (same as before)
         plotter.show(interactive=False, auto_close=False)
-        plotter.camera_position = [(20.0, 3.0, 2.0), (0.0, -2.0, 0.0), (0.0, 0.0, 2.0)]
-        plotter.camera.zoom(1.5)
+        for i in range(2):
+            plotter.subplot(0, i)
+            plotter.camera_position = [(20.0, 3.0, 2.0), (0.0, -2.0, 0.0), (0.0, 0.0, 2.0)]
+            plotter.camera.zoom(0.5)
+        plotter.link_views()
 
         print("Visualizer created.")
         return plotter
 
-
-    def visualize_latent_vector(self, predicted_displacement, ground_truth_displacement=None, iteration=None, loss=None):
-        """Update visualization showing ground truth wireframe and network prediction solid mesh, colored by RMSE"""
+    def visualize_latent_vector(self, z, iteration=None, loss=None):
+        """Update visualization using loaded mesh data"""
         if not hasattr(self, 'viz_plotter') or self.viz_plotter is None:
-            print("Visualizer not initialized. Skipping visualization.")
-            return
+             print("Visualizer not initialized. Skipping visualization.")
+             return
         try:
-            # Convert inputs to numpy if they're tensors
-            if isinstance(predicted_displacement, torch.Tensor):
-                predicted_displacement = predicted_displacement.detach().cpu().numpy()
-            
-            if ground_truth_displacement is not None and isinstance(ground_truth_displacement, torch.Tensor):
-                ground_truth_displacement = ground_truth_displacement.detach().cpu().numpy()
+            # Ensure z is properly formatted (same as before)
+            # ...
+            if not isinstance(z, torch.Tensor): z = torch.tensor(z, device=self.device, dtype=torch.float64)
+            if z.dim() > 1: z = z.squeeze()
 
-            # Reshape displacements to 3D coordinates
-            u_pred_reshaped = predicted_displacement.reshape((-1, 3))
-            
-            # Prepare ground truth displacement if available
-            if ground_truth_displacement is not None:
-                u_gt_reshaped = ground_truth_displacement.reshape((-1, 3))
-                print("Using provided ground truth displacement")
-                
-                # Calculate RMSE per node (3D vector RMSE)
-                node_errors = u_pred_reshaped - u_gt_reshaped  # Error vectors per node
-                node_rmse = np.sqrt(np.mean(node_errors**2, axis=1))  # RMSE per node
-                
-                # Use RMSE for coloring
-                color_scalars_gt = node_rmse  # Same RMSE for both meshes
-                color_scalars_pred = node_rmse
-                color_label = "RMSE (Prediction vs Ground Truth)"
-                
-                # Calculate color range based on RMSE
-                max_rmse = np.max(node_rmse)
-                min_rmse = np.min(node_rmse)
-                color_range = [min_rmse, max(max_rmse, 1e-9)]  # Avoid zero max
-                
-            else:
-                # If no ground truth available, use displacement magnitude as fallback
-                u_gt_reshaped = np.zeros_like(u_pred_reshaped)
-                print("No ground truth provided - using displacement magnitude as fallback")
-                
-                # Fall back to displacement magnitude
-                gt_mag = np.linalg.norm(u_gt_reshaped, axis=1)
-                pred_mag = np.linalg.norm(u_pred_reshaped, axis=1)
-                
-                color_scalars_gt = gt_mag
-                color_scalars_pred = pred_mag
-                color_label = "Displacement Magnitude"
-                
-                max_mag = max(np.max(gt_mag), np.max(pred_mag), 1e-9)
-                min_mag = min(np.min(gt_mag), np.min(pred_mag))
-                color_range = [min_mag, max_mag]
 
-            # Remove existing actors
-            if self.mesh_actor_gt_wireframe is not None: 
-                self.viz_plotter.remove_actor(self.mesh_actor_gt_wireframe)
-            if self.mesh_actor_prediction_solid is not None: 
-                self.viz_plotter.remove_actor(self.mesh_actor_prediction_solid)
+            # Compute displacements (same as before)
+            with torch.no_grad():
+                linear_contribution = torch.matmul(z, self.linear_modes.T)
+                neural_correction = self.model(z)
+                u_total = linear_contribution + neural_correction
+                linear_only_np = linear_contribution.detach().cpu().numpy()
+                u_total_np = u_total.detach().cpu().numpy()
 
-            # Create ground truth wireframe mesh
-            gt_grid = self.viz_grid.copy()
-            gt_grid.points = self.coordinates_np + u_gt_reshaped  # Apply ground truth displacement
-            gt_grid[color_label] = color_scalars_gt
+            # --- No dolfinx interpolation needed ---
+            # Displacements are already defined on the nodes
+            linear_np = linear_only_np.reshape((-1, 3))
+            total_np = u_total_np.reshape((-1, 3))
 
-            # Add ground truth as wireframe
-            self.mesh_actor_gt_wireframe = self.viz_plotter.add_mesh(
-                gt_grid, 
-                scalars=color_label, 
-                cmap="coolwarm",  # Different colormap for distinction
-                style="wireframe",  # Wireframe style
-                line_width=2,
-                opacity=0.8,
-                clim=color_range, 
-                reset_camera=False,
-                label="Ground Truth"
+            # Compute magnitudes (same as before)
+            linear_mag = np.linalg.norm(linear_np, axis=1)
+            total_mag = np.linalg.norm(total_np, axis=1)
+            max_mag = max(np.max(linear_mag), np.max(total_mag), 1e-9) # Avoid zero max
+            min_mag = min(np.min(linear_mag), np.min(total_mag))
+            color_range = [min_mag, max_mag]
+
+            # --- Update PyVista Plotter ---
+            # Left subplot - Linear
+            self.viz_plotter.subplot(0, 0)
+            if self.mesh_actor_left is not None: self.viz_plotter.remove_actor(self.mesh_actor_left)
+            linear_grid = self.viz_grid.copy()
+            linear_grid.points = self.coordinates_np + linear_np # Apply displacement directly
+            linear_grid["displacement_magnitude"] = linear_mag
+            self.mesh_actor_left = self.viz_plotter.add_mesh(
+                linear_grid, scalars="displacement_magnitude", cmap="viridis",
+                show_edges=False, clim=color_range, reset_camera=False
             )
+            self.viz_plotter.add_text("Linear Modes Only", position="upper_edge", font_size=12, color='black')
 
-            # Create neural network prediction solid mesh
-            pred_grid = self.viz_grid.copy()
-            pred_grid.points = self.coordinates_np + u_pred_reshaped  # Apply predicted displacement
-            pred_grid[color_label] = color_scalars_pred
-
-            # Add prediction as solid mesh
-            self.mesh_actor_prediction_solid = self.viz_plotter.add_mesh(
-                pred_grid, 
-                scalars=color_label, 
-                cmap="viridis",  # Different colormap
-                style="surface",  # Solid surface
-                opacity=0.7,  # Slightly transparent to see wireframe through
-                show_edges=False,
-                clim=color_range, 
-                reset_camera=False,
-                label="Neural Network Prediction"
+            # Right subplot - Neural
+            self.viz_plotter.subplot(0, 1)
+            if self.mesh_actor_right is not None: self.viz_plotter.remove_actor(self.mesh_actor_right)
+            total_grid = self.viz_grid.copy()
+            total_grid.points = self.coordinates_np + total_np # Apply displacement directly
+            total_grid["displacement_magnitude"] = total_mag
+            self.mesh_actor_right = self.viz_plotter.add_mesh(
+                total_grid, scalars="displacement_magnitude", cmap="viridis",
+                show_edges=False, clim=color_range, reset_camera=False
             )
+            self.viz_plotter.add_text("Neural Network Prediction", position="upper_edge", font_size=12, color='black')
 
-            # Add legend
-            legend_labels = [
-                ["Ground Truth (Wireframe)", "red"], 
-                ["NN Prediction (Solid)", "blue"]
-            ]
-            if ground_truth_displacement is not None:
-                legend_labels.append(["Color: RMSE Error", "green"])
-            else:
-                legend_labels.append(["Color: Displacement Mag", "green"])
-                
-            self.viz_plotter.add_legend(legend_labels, loc="upper_right")
-
-            # Add colorbar with appropriate label
-            self.viz_plotter.add_scalar_bar(
-                color_label, 
-                position_x=0.85, position_y=0.1, 
-                width=0.1, height=0.8
-            )
-
-            # Update info text
+            # Update info text (same as before)
+            self.viz_plotter.subplot(0, 0)
             if iteration is not None and loss is not None:
-                if self.info_actor is not None: 
-                    self.viz_plotter.remove_actor(self.info_actor)
-                
-                # Calculate metrics for info display
-                pred_magnitude = np.linalg.norm(predicted_displacement)
-                
-                # Calculate error metrics if ground truth is available
-                if ground_truth_displacement is not None:
-                    mse = np.mean((predicted_displacement - ground_truth_displacement)**2)
-                    rmse = np.sqrt(mse)
-                    relative_error = rmse / (np.linalg.norm(ground_truth_displacement) + 1e-9) * 100
-                    
-                    # Additional RMSE statistics
-                    mean_node_rmse = np.mean(node_rmse)
-                    max_node_rmse = np.max(node_rmse)
-                    
-                    info_text = (f"Iteration: {iteration}\n"
-                            f"Loss: {loss:.6e}\n"
-                            f"Pred Magnitude: {pred_magnitude:.6f}\n"
-                            f"Global RMSE: {rmse:.6f}\n"
-                            f"Mean Node RMSE: {mean_node_rmse:.6f}\n"
-                            f"Max Node RMSE: {max_node_rmse:.6f}\n"
-                            f"Relative Error: {relative_error:.2f}%")
-                else:
-                    info_text = (f"Iteration: {iteration}\n"
-                            f"Loss: {loss:.6e}\n"
-                            f"Pred Magnitude: {pred_magnitude:.6f}\n"
-                            f"(No ground truth provided)")
-                        
-                self.info_actor = self.viz_plotter.add_text(
-                    info_text, 
-                    position=(10, 10), 
-                    font_size=10, 
-                    color='black',
-                    shadow=True
-                )
+                if self.info_actor is not None: self.viz_plotter.remove_actor(self.info_actor)
+                nonlinear_mag = np.linalg.norm(neural_correction.detach().cpu().numpy())
+                total_mag_val = np.linalg.norm(u_total_np)
+                nonlinear_percent = (nonlinear_mag / total_mag_val) * 100 if total_mag_val > 1e-9 else 0
+                info_text = f"Iteration: {iteration}\nLoss: {loss:.6e}\nNonlinear Contribution: {nonlinear_percent:.2f}%"
+                self.info_actor = self.viz_plotter.add_text(info_text, position=(10, 10), font_size=10, color='black')
 
-            # Update render window
+            # Update render window (same as before)
             self.viz_plotter.update()
             self.viz_plotter.render()
 
@@ -1457,8 +1367,10 @@ class Routine:
             print(f"Visualization error (continuing training): {str(e)}")
             import traceback
             print(traceback.format_exc())
-            
-                
+    
+
+    
+    
     def compute_safe_scaling_factor(self):
         """
         Compute appropriate scaling factor for latent variables based on:
@@ -1747,7 +1659,7 @@ class Routine:
                         width=0.5, height=0.02, title_font_size=12, label_font_size=10)
 
         # Add overall title
-        plotter.add_text("Neural Latent Space Mode Atlas", position="upper edge",
+        plotter.add_text("Neural Latent Space Mode Atlas", position="upper_edge",
                     font_size=16, color='black')
 
         print("Showing latent space visualization...")
@@ -2126,8 +2038,8 @@ def main():
         # print("\nVisualizing latent space dimensions...")
         # engine.visualize_latent_dimensions(dim1=1, dim2=0, num_points=3)
         # engine.visualize_latent_dimensions(dim1=3, dim2=4, num_points=3)
-        # print("\nVisualizing latent space modes...")
-        # engine.visualize_latent_space(num_samples=5)
+        print("\nVisualizing latent space modes...")
+        engine.visualize_latent_space(num_samples=5)
 
         print("\nAnalyzing latent space correlations (TOTAL displacement)...")
         correlation_matrix_path_total = os.path.join(analysis_save_dir, 'latent_correlations_total.png')

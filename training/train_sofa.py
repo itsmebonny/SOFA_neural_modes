@@ -704,12 +704,12 @@ class Routine:
         import random
 
         print(f"Generating regularly spaced samples for latent dim {L}")
-        num_samples_per_mode = 6  # Number of samples along each mode
+        num_samples_per_mode = 10  # Number of samples along each mode
         use_different_scales = True  # Set to False to use linear decay, True to use custom scales
 
         if use_different_scales:
             # Custom scales for each mode - EDIT THESE VALUES as needed
-            custom_scales = [500.0, 500.0, 250.0, 200.0, 250.0, 10.0, 10.0, 5.0]  # Example scales
+            custom_scales = [200.0, 200.0, 10.0, 10.0, 150.0, 10.0, 10.0, 5.0]  # Example scales
             
             # Ensure we have enough scales for all modes
             if len(custom_scales) < self.latent_dim:
@@ -866,7 +866,7 @@ class Routine:
                     # raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
                     # Modified loss
-                    loss = energy + 1e8 * ortho + 1e8 * bc_penalty 
+                    loss = (energy) + 1e9 * ortho + 1e9 * bc_penalty 
 
                     loss.backward()
 

@@ -525,8 +525,8 @@ class AnimationStepController(Sofa.Core.Controller):
                     l2_err_lin_sofa, rmse_lin_sofa, mse_lin_sofa
                 ))
                 #print mse between linear modes and real solution
-                if linear_solution_sofa_reshaped is not None:
-                    mse_lin_sofa = np.mean((linear_solution_sofa_reshaped - l_th_reshaped_np)**2)
+                if real_solution_reshaped is not None:
+                    mse_lin_sofa = np.mean((real_solution_reshaped - l_th_reshaped_np)**2)
                     print(f"  MSE between Linear Modes and Real Solution: {mse_lin_sofa:.4e}")
                 else:
                     print("  Linear solution not available for MSE calculation.")
@@ -873,7 +873,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     
     solver = exactSolution.addObject('StaticSolver', name="ODEsolver", 
                                    newton_iterations=20,
-                                   printLog=True)
+                                   printLog=False)
     
     linear_solver = exactSolution.addObject('CGLinearSolver', 
                                           template="CompressedRowSparseMatrixMat3x3d",
@@ -927,7 +927,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            newton_iterations=20,
                            #absolute_residual_tolerance_threshold=1e-5,
                            #relative_residual_tolerance_threshold=1e-5,
-                           printLog=True) # Maybe less logging for this one
+                           printLog=False) # Maybe less logging for this one
 
     linearSolution.addObject('CGLinearSolver',
                            template="CompressedRowSparseMatrixMat3x3d",
