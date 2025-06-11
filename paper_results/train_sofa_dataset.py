@@ -1207,7 +1207,7 @@ class Routine:
                     'loss': loss_val,
                 }
                 patience = 0
-                torch.save(checkpoint, os.path.join('checkpoints', 'best_sofa_dataset.pt'))
+                torch.save(checkpoint, os.path.join('checkpoints', 'bunny_sofa_dataset.pt'))
                 print(f"============ BEST MODEL UPDATED ============")
                 print(f"New best model at iteration {iteration} with loss {loss_val:.6e}")
                 print(f"============================================")
@@ -1422,7 +1422,7 @@ class Routine:
         
         if is_best:
             print(f"Epoch {epoch+1}: New best model with loss {loss:.6e}")
-            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_sofa.pt'))
+            torch.save(checkpoint, os.path.join(checkpoint_dir, 'bunny_sofa_dataset.pt'))
 
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint with robust error handling"""
@@ -1945,7 +1945,7 @@ def main():
 
     # Determine checkpoint path
     checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
-    best_checkpoint_filename = 'best_sofa_bunny.pt' # Specific name for SOFA training
+    best_checkpoint_filename = 'bunny_sofa_dataset.pt' # Specific name for SOFA training
     default_checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint_filename)
 
     # Use specific checkpoint if provided, otherwise default best, handle resume flag

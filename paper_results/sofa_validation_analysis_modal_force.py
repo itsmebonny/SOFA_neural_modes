@@ -157,7 +157,7 @@ class AnimationStepController(Sofa.Core.Controller):
         checkpoint_dir_rel = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
         checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) 
 
-        checkpoint_filename = 'best_sofa_bunny.pt' 
+        checkpoint_filename = 'bunny_sofa_dataset.pt' 
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")

@@ -9,7 +9,7 @@ from sklearn.preprocessing import MinMaxScaler
 from training.train_sofa import Routine, load_config
 # add network path to the python path
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '../network'))
+sys.path.append(os.path.join(os.path.dirname(__file__), "../network"))
 
 import json
 import torch
@@ -87,7 +87,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 1e6
+        self.target_force_magnitude = 10000
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
         self.current_main_step_direction = np.zeros(3) # Initialize direction
@@ -158,7 +158,7 @@ class AnimationStepController(Sofa.Core.Controller):
         checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) # Join with project root
 
         # Define the specific checkpoint file name (e.g., 'best_sofa.pt')
-        checkpoint_filename = 'best_sofa.pt' # Or read from config if specified differently
+        checkpoint_filename = 'best_sofa_dataset.pt' # Or read from config if specified differently
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")
@@ -241,7 +241,7 @@ class AnimationStepController(Sofa.Core.Controller):
         # Initialize F_ext_dof_th to a zero tensor
         self.F_ext_dof_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
         print(f"Initialized F_ext_dof_th with shape {self.F_ext_dof_th.shape}")
-        self.optimization_start_step_in_period = 30
+        self.optimization_start_step_in_period = 100
 
         
         # Store the original positions for mode animation
@@ -281,7 +281,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print(f"\n--- Timestep {self.timestep_counter}: Starting Force Period {self.current_main_step}/{self.max_main_steps} ---")
 
             # Generate a new random direction for this force period
-            random_vec = np.random.randn(3) # Generate random vector
+            random_vec = [0.0, -1.0, 0.0] # Generate random vector
             norm = np.linalg.norm(random_vec)
             if norm < 1e-9: # Avoid division by zero
                 self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction
@@ -306,9 +306,9 @@ class AnimationStepController(Sofa.Core.Controller):
                     else:
                         print(f"Warning: Node index {node_idx} out of bounds for F_ext_dof_np.")
 
-            if self.routine and hasattr(self.routine, 'device'):
                 # This line updates self.F_ext_dof_th when the force changes
                 self.F_ext_dof_th = torch.tensor(F_ext_dof_np, device=self.routine.device, dtype=torch.float64)
+
             # --- End F_ext_dof_th preparation ---
 
 
@@ -414,7 +414,7 @@ class AnimationStepController(Sofa.Core.Controller):
                     u_pred_nn_flat_th = real_solution_disp_th.clone() # NN "output" forced to match real solution for history
 
                     # Project SOFA linear solution to get z_nn_current_th as an estimate
-                    z_from_sofa_linear_np = self.computeModalCoordinates(linear_solution_sofa_disp_np)
+                    z_from_sofa_linear_np = self.computeModalCoordinates(real_solution_disp_np)
                     if z_from_sofa_linear_np is None or np.isnan(z_from_sofa_linear_np).any():
                         # print(f"Warning: Projection of SOFA linear solution for z_nn_current_th resulted in None/NaN at timestep {self.current_period_timestep_counter}. Using zeros.")
                         z_from_sofa_linear_np = np.zeros(self.routine.latent_dim)
@@ -679,10 +679,14 @@ class AnimationStepController(Sofa.Core.Controller):
             u_ddot_nn_flat_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th) / (self.dt**2)
 
         # 3. Calculate Inertial Term: 0.5 * u_ddot^T * M * u_ddot
-        # M_torch is sparse: (num_dofs, num_dofs), u_ddot is dense (num_dofs,)
-        # (M @ u_ddot) is dense (num_dofs,)
-        inertial_force_th = torch.sparse.mm(self.M_torch, u_ddot_nn_flat_th.unsqueeze(1)).squeeze(1)
-        inertial_term = 0.5 * torch.dot(u_ddot_nn_flat_th, inertial_force_th)
+        # Use finite difference scheme with previous displacements
+        # u_ddot = (u_curr - 2*u_prev + u_prev_prev) / dt^2
+        if self.dt == 0:
+            inertial_term = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
+        else:
+            u_ddot_fd_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th) / (self.dt**2)
+            inertial_force_th = torch.sparse.mm(self.M_torch, u_ddot_fd_th.unsqueeze(1)).squeeze(1)
+            inertial_term = torch.dot(u_ddot_fd_th, inertial_force_th) / (2 * self.dt)
 
         # 4. Calculate Elastic Strain Energy: E_elastic(u_nn(z))
         # energy_calculator expects displacement in shape (batch_size, num_nodes, 3) or (num_nodes, 3)
@@ -714,7 +718,7 @@ class AnimationStepController(Sofa.Core.Controller):
         # 7. Total Objective
         total_objective = inertial_term + elastic_energy + work_external_term + damping_term
         
-        # print(f"  Objective: {total_objective.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e}, Damping: {damping_term.item():.3e})")
+        print(f"  Objective: {total_objective.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e}, Damping: {damping_term.item():.3e})")
         return total_objective
     # --- End Objective Function ---
 
@@ -1038,7 +1042,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     
     # Set basic simulation parameters
     rootNode.dt = config['physics'].get('dt', 0.01)
-    rootNode.gravity = config['physics'].get('gravity', [0, 0, 0])
+    rootNode.gravity = [0, 0, 0]
     rootNode.name = 'root'
     rootNode.bbox = "-10 -2 -2 10 2 2"
 

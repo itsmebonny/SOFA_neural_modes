@@ -158,7 +158,7 @@ class AnimationStepController(Sofa.Core.Controller):
         checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) # Join with project root
 
         # Define the specific checkpoint file name (e.g., 'best_sofa.pt')
-        checkpoint_filename = 'best_sofa.pt' # Or read from config if specified differently
+        checkpoint_filename = 'bunny_sofa_dataset.pt' # Or read from config if specified differently
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")
