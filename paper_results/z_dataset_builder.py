@@ -37,21 +37,10 @@ class AnimationStepController(Sofa.Core.Controller):
         self.MO1 = kwargs.get('MO1')
         self.fixed_box = kwargs.get('fixed_box')
         self.exactSolution = kwargs.get('exactSolution')
+        self.cff_exact = None # Will be set later
         # self.cff = kwargs.get('cff') # Controller will manage CFF creation
 
-                # --- Linear Solution Components ---
-        self.linearSolution = kwargs.get('linearSolution')
-        self.MO2 = kwargs.get('MO2') # MechObj for linear
-        self.linearFEM = kwargs.get('linearFEM') # Linear FEM ForceField
-        
-        # CFFs will be created per step
-        self.cff_exact = None 
-        self.cff_linear = None 
-
-        self.MO_LinearModes = kwargs.get('MO_LinearModes') # MechObj for Linear Modes Viz
-        self.MO_NeuralPred = kwargs.get('MO_NeuralPred')   # MechObj for Neural Pred Viz
-        self.visual_LM = kwargs.get('visual_LM') # Visual for Linear Modes
-        self.visual_NP = kwargs.get('visual_NP') # Visual for Neural Pred
+ 
 
         self.key = kwargs.get('key')
         self.iteration = kwargs.get("sample")
@@ -117,7 +106,7 @@ class AnimationStepController(Sofa.Core.Controller):
         # Find the config file relative to this script's location or project root
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(script_dir, '..'))
-        default_config_path = os.path.join(project_root, 'configs', 'default.yaml') # Adjust if your default is elsewhere
+        default_config_path = os.path.join(project_root, 'configs', 'paper.yaml') # Adjust if your default is elsewhere
 
         # Use global args if available (e.g., from __main__), otherwise use a default path
         config_path_from_args = default_config_path # Default
@@ -189,7 +178,6 @@ class AnimationStepController(Sofa.Core.Controller):
         
         # Get ForceROI indices once
         self.force_roi_indices_exact = self.exactSolution.getObject('ForceROI').indices.value
-        self.force_roi_indices_linear = self.linearSolution.getObject('ForceROI').indices.value
 
 
     def onAnimateBeginEvent(self, event):
@@ -203,7 +191,6 @@ class AnimationStepController(Sofa.Core.Controller):
         
         if substep_in_main_step == 0:  # Start of a new main step
             self.MO1.position.value = self.MO1.rest_position.value
-            self.MO2.position.value = self.MO2.rest_position.value
             print(f"\n--- Starting Main Step {self.current_main_step} ---")
             num_modes_to_use = random.randint(1, num_modes)
             self.modes_to_use = random.sample(range(num_modes), num_modes_to_use)
@@ -244,7 +231,6 @@ class AnimationStepController(Sofa.Core.Controller):
         
         # Extract forces for the ROI nodes
         forces_for_roi_exact_nodes = forces_reshaped[self.force_roi_indices_exact]
-        forces_for_roi_linear_nodes = forces_reshaped[self.force_roi_indices_linear]
 
         # Remove previous CFFs
         if self.cff_exact is not None:
@@ -252,10 +238,7 @@ class AnimationStepController(Sofa.Core.Controller):
             except Exception as e: print(f"Warning: Error removing CFF (Exact): {e}")
             finally: self.cff_exact = None
         
-        if self.cff_linear is not None:
-            try: self.linearSolution.removeObject(self.cff_linear)
-            except Exception as e: print(f"Warning: Error removing CFF (Linear): {e}")
-            finally: self.cff_linear = None
+      
 
         # Create and add new CFFs using 'forces' attribute
         try:
@@ -267,19 +250,11 @@ class AnimationStepController(Sofa.Core.Controller):
                             showArrowSize=1, showColor="0.2 0.2 0.8 1")
             if self.cff_exact: self.cff_exact.init()
 
-            # Linear Solution
-            self.cff_linear = self.linearSolution.addObject('ConstantForceField',
-                            name="CFF_Linear_Modal",
-                            indices=self.force_roi_indices_linear.tolist(),
-                            forces=forces_for_roi_linear_nodes.tolist(),
-                            showArrowSize=0.0) 
-            if self.cff_linear: self.cff_linear.init()
-            
+   
         except Exception as e:
             print(f"ERROR: Failed to create/add/init ConstantForceField(s) with modal forces: {e}")
             traceback.print_exc()
             self.cff_exact = None
-            self.cff_linear = None
             if self.root: self.root.animate = False
 
         self.start_time = process_time()
@@ -290,11 +265,9 @@ class AnimationStepController(Sofa.Core.Controller):
         current_main_step_computed = self.current_substep // self.num_substeps
         
         real_solution = self.MO1.position.value.copy() - self.MO1.rest_position.value.copy()
-        linear_solution = self.MO2.position.value.copy() - self.MO2.rest_position.value.copy()
         
         # Compute modal coordinates from the ACTUAL SOFA solutions
         z_nonlinear = self.computeModalCoordinates(real_solution)  # From hyperelastic solution
-        z_linear = self.computeModalCoordinates(linear_solution)   # From linear solution
         
         # Get displacement from the real (hyperelastic) solution
         pos_real_all_dofs = self.MO1.position.value
@@ -331,7 +304,7 @@ class AnimationStepController(Sofa.Core.Controller):
             
             try:
                 num_modes = self.routine.linear_modes.shape[1] 
-                save_folder = os.path.join("z_dataset", f"{num_modes}_modes")
+                save_folder = os.path.join("bunny_dataset", f"{num_modes}_modes")
                 os.makedirs(save_folder, exist_ok=True)
                 
                 # Determine the next index for saving files
@@ -617,53 +590,6 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
 
 
 
-# Add a second model beam with TetrahedronFEMForceField, which is linear
-    # --- Add Linear Solution Node ---
-    linearSolution = rootNode.addChild('LinearSolution', activated=True)
-    linearSolution.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
-    linearSolution.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
-    MO2 = linearSolution.addObject('MechanicalObject', name='MO2', template='Vec3d', src='@grid') # Named MO2
-
-    # Add system components (similar to exactSolution)
-    linearSolution.addObject('StaticSolver', name="ODEsolver",
-                           newton_iterations=20,
-                           printLog=False) # Maybe less logging for this one
-
-    linearSolution.addObject('CGLinearSolver',
-                           template="CompressedRowSparseMatrixMat3x3d",
-                           iterations=config['physics'].get('solver_iterations', 1000),
-                           tolerance=config['physics'].get('solver_tolerance', 1e-6),
-                           threshold=config['physics'].get('solver_threshold', 1e-6),
-                           warmStart=False)
-
-    # Use the linear FEM force field
-    linearFEM = linearSolution.addObject('TetrahedronFEMForceField', # Store reference
-                           name="LinearFEM",
-                           youngModulus=young_modulus,
-                           poissonRatio=poisson_ratio,
-                           method="small") 
-
-    # Add constraints (same as exactSolution)
-    linearSolution.addObject('BoxROI',
-                           name='ROI',
-                           box=" ".join(str(x) for x in fixed_box_coords),
-                           drawBoxes=False) # Maybe hide this box
-    linearSolution.addObject('FixedConstraint', indices="@ROI.indices")
-
-    linearSolution.addObject('BoxROI',
-                           name='ForceROI',
-                           box=" ".join(str(x) for x in force_box_coords),
-                           drawBoxes=False) # Maybe hide this box
-    # Add a CFF to the linear model as well, controlled separately if needed, or linked
-    # For now, just add it so the structure is parallel. It won't be actively controlled by the current controller.
-    linearSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.0)
-
-    # Add visual model for the linear solution (optional, maybe different color)
-    visualLinear = linearSolution.addChild("visualLinear")
-    visualLinear.addObject('OglModel', src='@../MO2', color='0 0 1 1') # Blue color
-    visualLinear.addObject('BarycentricMapping', input='@../MO2', output='@./')
-    # --- End Linear Solution Node ---
-
     # Create and add controller with all components
     controller = AnimationStepController(rootNode,
                                         exactSolution=exactSolution,
@@ -672,9 +598,6 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         surface_topo=surface_topo,
                                         MO1=MO1, # Real SOFA solution
                                         fixed_box=fixed_box,
-                                        linearSolution=linearSolution, # Pass linear node
-                                        MO2=MO2, # SOFA Linear MechObj
-                                        linearFEM=linearFEM, # Pass linear FEM FF
                                         directory=directory,
                                         sample=sample,
                                         key=key,
@@ -703,7 +626,7 @@ if __name__ == "__main__":
 
     # Add argument parser
     parser = argparse.ArgumentParser(description='SOFA Validation with Neural Modes and Substeps')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='Path to config file')
     parser.add_argument('--gui', action='store_true', help='Enable GUI mode')
     parser.add_argument('--steps', type=int, default=None, help='Number of MAIN steps to run (overrides config)') # Renamed from substeps
     parser.add_argument('--num-substeps', type=int, default=None, help='Number of substeps per main step (overrides config)')

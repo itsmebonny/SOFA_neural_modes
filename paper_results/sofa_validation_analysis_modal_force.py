@@ -157,7 +157,7 @@ class AnimationStepController(Sofa.Core.Controller):
         checkpoint_dir_rel = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
         checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) 
 
-        checkpoint_filename = 'best_sofa_dataset.pt' 
+        checkpoint_filename = 'best_sofa_bunny.pt' 
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")
@@ -910,7 +910,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     
     # Add visual model
     visual = exactSolution.addChild("visual")
-    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/bunny.obj')
     visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 1 0 1')
     visual.addObject('BarycentricMapping', input='@../MO1', output='@./visual')
     visual.addObject('VisualModelOBJExporter', filename="neuralModes-groundtruth", exportEveryNumberOfSteps=50) 
@@ -961,7 +961,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     # Add visual model for the linear solution (optional, maybe different color)
     visual = linearSolution.addChild("visual")
     visual.addObject('VisualStyle', displayFlags='showWireframe')
-    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/bunny.obj')
     visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 0.6 0.95 1') # cyan color
     visual.addObject('BarycentricMapping', input='@../MO2', output='@./visual')
     # --- End Linear Solution Node ---
@@ -976,7 +976,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     # Add visual model for the reduced model 
     visualLinearModes = linearModesViz.addChild("visualLinearModes")
     visualLinearModes.addObject('VisualStyle', displayFlags='showWireframe')
-    visual_LM = visualLinearModes.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual_LM = visualLinearModes.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/bunny.obj')
     visualLinearModes.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 0 1') # red color
     visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./visual')
     # --- End Linear Modes Viz Node ---
@@ -989,7 +989,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
     # Add visual model
     visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/bunny.obj')
     visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
     visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
     visualNeuralPred.addObject('VisualModelOBJExporter', filename="neuralModes-prediction", exportEveryNumberOfSteps=50) 
@@ -1025,7 +1025,7 @@ if __name__ == "__main__":
     import time
 
     parser = argparse.ArgumentParser(description='SOFA Validation with Modal Forces')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='Path to config file')
     parser.add_argument('--gui', action='store_true', help='Enable GUI mode')
     parser.add_argument('--steps', type=int, default=None, help='Number of MAIN steps to run (overrides config)')
     parser.add_argument('--num-substeps', type=int, default=None, help='Number of substeps per main step (overrides config)')

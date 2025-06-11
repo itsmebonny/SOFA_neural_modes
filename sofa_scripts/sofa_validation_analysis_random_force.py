@@ -76,7 +76,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
         # --- Define Fixed Force Target Magnitude ---
         # self.target_force_direction = np.array([-1.0, 0.0, 0.0]) # REMOVED
-        self.target_force_magnitude = 50
+        self.target_force_magnitude = 800
         # self.target_force_vector = self.target_force_direction * self.target_force_magnitude # REMOVED
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         print(f"Target Max Force Magnitude: {self.target_force_magnitude}")
@@ -144,7 +144,7 @@ class AnimationStepController(Sofa.Core.Controller):
         checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) # Join with project root
 
         # Define the specific checkpoint file name (e.g., 'best_sofa.pt')
-        checkpoint_filename = 'best_sofa.pt' # Or read from config if specified differently
+        checkpoint_filename = 'best_sofa_dataset.pt' # Or read from config if specified differently
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")
@@ -196,7 +196,7 @@ class AnimationStepController(Sofa.Core.Controller):
         Applies incremental force based on substep, with a random direction per main step.
         """
         # --- Check if starting a new MAIN step ---
-        if self.current_substep == 0:
+        if self.current_substep % self.num_substeps == 0:
             # Reset positions for all models
             rest_pos = self.MO1.rest_position.value
             self.MO1.position.value = rest_pos
@@ -767,9 +767,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     young_modulus = config['material'].get('youngs_modulus', 5000)
     poisson_ratio = config['material'].get('poissons_ratio', 0.25)
     density = config['material'].get('density', 10)
-    volume = config['material'].get('volume', 1)
-    num_modes_to_show = config['model'].get('latent_dim', 5)
-    total_mass = density * volume
+    volume = config['material'].get('volume', 1) # Make sure this is in config or handled
+    num_modes_to_show = config['model'].get('latent_dim', 5) # For controller, not directly used in scene
+    total_mass = density * volume # Ensure volume is correctly sourced
     print(f"Using E={young_modulus}, nu={poisson_ratio}, rho={density}, V={volume}, M={total_mass}")
 
     # Calculate Lamé parameters
@@ -785,7 +785,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     exactSolution = rootNode.addChild('HighResSolution2D', activated=True)
     exactSolution.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
     surface_topo = exactSolution.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
-    MO1 = exactSolution.addObject('MechanicalObject', name='DOFs', template='Vec3d', src='@grid')
+    MO1 = exactSolution.addObject('MechanicalObject', name='MO1', template='Vec3d', src='@grid')
     
     # Add system components
     # mass = exactSolution.addObject('MeshMatrixMass', totalMass=total_mass, name="SparseMass", topology="@triangleTopo")
@@ -796,7 +796,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     
     solver = exactSolution.addObject('StaticSolver', name="ODEsolver", 
                                    newton_iterations=20,
-                                   printLog=True)
+                                   printLog=False)
     
     linear_solver = exactSolution.addObject('CGLinearSolver', 
                                           template="CompressedRowSparseMatrixMat3x3d",
@@ -826,15 +826,17 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
                                         drawBoxes=True)
-    cff = exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
 
     
-
+    #NOTES: plot some relative errors between linear modes and fem divided by the norm of biggest displacement
+    # 
     
     # Add visual model
     visual = exactSolution.addChild("visual")
-    visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
-    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 1 0 1')
+    visual.addObject('BarycentricMapping', input='@../MO1', output='@./visual')
+    visual.addObject('VisualModelOBJExporter', filename="neuralModes-groundtruth", exportEveryNumberOfSteps=50) 
 
     # Add a second model beam with TetrahedronFEMForceField, which is linear
     # --- Add Linear Solution Node ---
@@ -846,7 +848,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     # Add system components (similar to exactSolution)
     linearSolution.addObject('StaticSolver', name="ODEsolver",
                            newton_iterations=20,
-                           printLog=True) # Maybe less logging for this one
+                           #absolute_residual_tolerance_threshold=1e-5,
+                           #relative_residual_tolerance_threshold=1e-5,
+                           printLog=False) # Maybe less logging for this one
 
     linearSolution.addObject('CGLinearSolver',
                            template="CompressedRowSparseMatrixMat3x3d",
@@ -860,7 +864,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            name="LinearFEM",
                            youngModulus=young_modulus,
                            poissonRatio=poisson_ratio,
-                           method="small") 
+                           method="small") # needs to be set to small for true linear solution 
+
 
     # Add constraints (same as exactSolution)
     linearSolution.addObject('BoxROI',
@@ -875,12 +880,13 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            drawBoxes=False) # Maybe hide this box
     # Add a CFF to the linear model as well, controlled separately if needed, or linked
     # For now, just add it so the structure is parallel. It won't be actively controlled by the current controller.
-    linearSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.0)
 
     # Add visual model for the linear solution (optional, maybe different color)
-    visualLinear = linearSolution.addChild("visualLinear")
-    visualLinear.addObject('OglModel', src='@../MO2', color='0 0 1 1') # Blue color
-    visualLinear.addObject('BarycentricMapping', input='@../MO2', output='@./')
+    visual = linearSolution.addChild("visual")
+    visual.addObject('VisualStyle', displayFlags='showWireframe')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 0.6 0.95 1') # cyan color
+    visual.addObject('BarycentricMapping', input='@../MO2', output='@./visual')
     # --- End Linear Solution Node ---
 
 
@@ -889,10 +895,13 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     linearModesViz.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
     linearModesViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
     MO_LinearModes = linearModesViz.addObject('MechanicalObject', name='MO_LinearModes', template='Vec3d', src='@grid')
-    # Add visual model
+
+    # Add visual model for the reduced model 
     visualLinearModes = linearModesViz.addChild("visualLinearModes")
-    visualLinearModes.addObject('OglModel', src='@../MO_LinearModes', color='1 1 0 1') # Yellow color
-    visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./')
+    visualLinearModes.addObject('VisualStyle', displayFlags='showWireframe')
+    visual_LM = visualLinearModes.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visualLinearModes.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 0 1') # red color
+    visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./visual')
     # --- End Linear Modes Viz Node ---
 
 
@@ -903,40 +912,30 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
     # Add visual model
     visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    visualNeuralPred.addObject('OglModel', src='@../MO_NeuralPred', color='1 0 1 1') # Magenta color
-    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./')
+    visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
+    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
+    visualNeuralPred.addObject('VisualModelOBJExporter', filename="neuralModes-prediction", exportEveryNumberOfSteps=50) 
     # --- End Neural Pred Viz Node ---
 
 
     # Create and add controller with all components
-    controller = AnimationStepController(rootNode,
-                                        exactSolution=exactSolution,
-                                        fem=fem, # Hyperelastic FEM
-                                        linear_solver=linear_solver,
-                                        surface_topo=surface_topo,
-                                        MO1=MO1, # Real SOFA solution
-                                        fixed_box=fixed_box,
-                                        linearSolution=linearSolution, # Pass linear node
-                                        MO2=MO2, # SOFA Linear MechObj
-                                        linearFEM=linearFEM, # Pass linear FEM FF
-                                        MO_LinearModes=MO_LinearModes, # Pass Linear Modes Viz MechObj
-                                        MO_NeuralPred=MO_NeuralPred,   # Pass Neural Pred Viz MechObj
-                                        visualLinearModes=visualLinearModes, # Pass Linear Modes Viz
-                                        visualNeuralPred=visualNeuralPred, # Pass Neural Pred Viz
-                                        directory=directory,
-                                        sample=sample,
-                                        key=key,
-                                        young_modulus=young_modulus,
-                                        poisson_ratio=poisson_ratio,
-                                        density=density,
-                                        volume=volume,
-                                        total_mass=total_mass,
-                                        mesh_filename=mesh_filename,
-                                        num_modes_to_show=num_modes_to_show,
-                                        # cff=cff, # REMOVED - Controller manages CFFs
-                                        **kwargs)
-    rootNode.addObject(controller)
+    controller_kwargs = {
+        'exactSolution': exactSolution, 'fem': fem, 'linear_solver': linear_solver,
+        'surface_topo': surface_topo, 'MO1': MO1, 'fixed_box': fixed_box,
+        'linearSolution': linearSolution, 'MO2': MO2, 'linearFEM': linearFEM,
+        'MO_LinearModes': MO_LinearModes, 'MO_NeuralPred': MO_NeuralPred,
+    #    'visual_LM': visual_LM, 'visual_NP': visual_NP, # Corrected visual names
+        'directory': directory, 'sample': sample, 'key': key,
+        'young_modulus': young_modulus, 'poisson_ratio': poisson_ratio,
+        'density': density, 'volume': volume, 'total_mass': total_mass,
+        'mesh_filename': mesh_filename, 'num_modes_to_show': num_modes_to_show,
+        # Pass through kwargs from createScene call, which might include num_substeps, max_main_steps, max_z_amplitude_scale
+    }
+    controller_kwargs.update(kwargs) # Add kwargs passed to createScene
 
+    controller = AnimationStepController(rootNode, **controller_kwargs)
+    rootNode.addObject(controller)
     return rootNode, controller
 
 
@@ -944,106 +943,87 @@ if __name__ == "__main__":
     import Sofa.Gui
     from tqdm import tqdm
     import yaml
-    import argparse
+    import argparse # Keep argparse here
     import traceback
-    import time # Import time for headless loop
+    import time
 
-    # Add argument parser
-    parser = argparse.ArgumentParser(description='SOFA Validation with Neural Modes and Substeps')
+    parser = argparse.ArgumentParser(description='SOFA Validation with Modal Forces')
     parser.add_argument('--config', type=str, default='configs/default.yaml', help='Path to config file')
     parser.add_argument('--gui', action='store_true', help='Enable GUI mode')
-    parser.add_argument('--steps', type=int, default=None, help='Number of MAIN steps to run (overrides config)') # Renamed from substeps
+    parser.add_argument('--steps', type=int, default=None, help='Number of MAIN steps to run (overrides config)')
     parser.add_argument('--num-substeps', type=int, default=None, help='Number of substeps per main step (overrides config)')
+    # Add new argument for max_z_amplitude_scale
+    parser.add_argument('--max-z-scale', type=float, default=None, help='Max amplitude scale for z components (overrides config)')
 
-    args = parser.parse_args()
 
-    # Load configuration
+    args = parser.parse_args() # Define args globally for onSimulationInitDoneEvent
+
     try:
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
         print(f"Loaded configuration from {args.config}")
     except Exception as e:
-        print(f"Error loading config from {args.config}: {str(e)}")
-        print("Using default configuration")
-        config = None # Or define a minimal default config dict here
+        print(f"Error loading config from {args.config}: {str(e)}. Using default configuration values where needed.")
+        config = {} # Initialize empty config, rely on get() defaults
 
-    # Determine number of main steps and substeps
-    # Command line args override config, otherwise use config default or fallback default
     max_main_steps = args.steps if args.steps is not None else config.get('simulation', {}).get('steps', 20)
     num_substeps = args.num_substeps if args.num_substeps is not None else config.get('physics', {}).get('num_substeps', 1)
+    # Get max_z_amplitude_scale from args or config
+    max_z_amplitude_scale_val = args.max_z_scale if args.max_z_scale is not None else config.get('simulation', {}).get('max_z_amplitude_scale', 1.0)
 
-    # Required plugins
     required_plugins = [
-        "Sofa.GL.Component.Rendering3D",
-        "Sofa.GL.Component.Shader",
-        "Sofa.Component.StateContainer",
-        "Sofa.Component.ODESolver.Backward",
-        "Sofa.Component.LinearSolver.Direct",
-        "Sofa.Component.IO.Mesh",
-        "Sofa.Component.MechanicalLoad",
-        "Sofa.Component.Engine.Select",
-        "Sofa.Component.SolidMechanics.FEM.Elastic",
-        "MultiThreading",
-        "SofaMatrix",
-        "Sofa.Component.SolidMechanics.FEM.HyperElastic"
+        "Sofa.GL.Component.Rendering3D", "Sofa.GL.Component.Shader", "Sofa.Component.StateContainer",
+        "Sofa.Component.ODESolver.Backward", "Sofa.Component.LinearSolver.Direct", "Sofa.Component.IO.Mesh",
+        "Sofa.Component.MechanicalLoad", "Sofa.Component.Engine.Select", "Sofa.Component.SolidMechanics.FEM.Elastic",
+        "MultiThreading", "SofaMatrix", "Sofa.Component.SolidMechanics.FEM.HyperElastic"
     ]
+    for plugin in required_plugins: SofaRuntime.importPlugin(plugin)
 
-    # Import all required plugins
-    for plugin in required_plugins:
-        SofaRuntime.importPlugin(plugin)
-
-    # Create simulation directory
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
-    output_dir = os.path.join('modal_data', timestamp)
+    # Ensure output_dir is correctly formed if self.directory is used by controller for saving
+    # The controller forms its own output_subdir based on self.directory.
+    # The timestamp passed to createScene as 'directory' will be used by controller.
 
-    # Setup and run simulation
     root = Sofa.Core.Node("root")
-    # Pass determined steps to createScene kwargs for the controller
+    # Pass determined steps and new scale to createScene kwargs for the controller
     rootNode, controller = createScene(
         root,
         config=config,
-        directory=timestamp,
+        directory=timestamp, # This will be used by controller for its output_subdir
         sample=0,
         key=(0, 0, 0),
-        num_substeps=num_substeps,      # Pass determined value
-        max_main_steps=max_main_steps   # Pass determined value
+        num_substeps=num_substeps,      
+        max_main_steps=max_main_steps,
+        max_z_amplitude_scale=max_z_amplitude_scale_val # Pass the new parameter
     )
 
     # Initialize simulation
     Sofa.Simulation.init(root)
-    controller.save = True # Ensure saving is enabled if needed for plots
+    # controller.save = True # This is already default true in controller
 
-    # --- Run Simulation ---
     if args.gui:
-        print(f"Starting GUI mode. Substeps ({num_substeps}) managed by controller.")
+        print(f"Starting GUI mode. Max Z Scale: {max_z_amplitude_scale_val}, Substeps ({num_substeps}) managed by controller.")
         Sofa.Gui.GUIManager.Init("myscene", "qglviewer")
         Sofa.Gui.GUIManager.createGUI(root, __file__)
         Sofa.Gui.GUIManager.SetDimension(1000, 800)
-        Sofa.Gui.GUIManager.MainLoop(root) # Controller handles substeps internally
+        Sofa.Gui.GUIManager.MainLoop(root) 
         Sofa.Gui.GUIManager.closeGUI()
     else:
-        print(f"Starting headless mode for {max_main_steps} main steps with {num_substeps} substeps each.")
-        # Use root.animate flag controlled by the controller to stop
+        print(f"Starting headless mode. Max Z Scale: {max_z_amplitude_scale_val}, {max_main_steps} main steps with {num_substeps} substeps each.")
         root.animate = True
         step_count = 0
-        # We need a loop that runs until the controller stops it or a max iteration limit
-        max_total_iterations = max_main_steps * num_substeps * 1.1 # Safety limit
+        max_total_iterations = max_main_steps * num_substeps * 1.2 # Safety limit
         pbar = tqdm(total=max_main_steps, desc="Main Steps Progress")
         last_main_step = -1
 
         while root.animate.value and step_count < max_total_iterations:
             Sofa.Simulation.animate(root, root.dt.value)
             step_count += 1
-            # Update progress bar when a main step completes
             if controller.current_main_step > last_main_step:
                  pbar.update(controller.current_main_step - last_main_step)
                  last_main_step = controller.current_main_step
-            # Optional small sleep to prevent 100% CPU if simulation is very fast
-            # time.sleep(0.001)
-
         pbar.close()
         if step_count >= max_total_iterations:
             print("Warning: Reached maximum total iterations safety limit.")
 
-    # Close is called regardless of GUI/headless mode
     controller.close()

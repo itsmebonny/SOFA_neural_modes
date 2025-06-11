@@ -414,7 +414,7 @@ class Routine:
         )
         self.scheduler = LBFGSScheduler(self.optimizer_lbfgs)
 
-        self.load_z_dataset() #         
+        self.load_bunny_dataset() #         
         print("Routine initialized.")
 
 
@@ -652,12 +652,12 @@ class Routine:
             return 1.0 / np.sqrt(np.maximum(1e-8, self.eigenvalues))
 
 
-    def load_z_dataset(self, dataset_base_path="z_dataset"):
+    def load_bunny_dataset(self, dataset_base_path="bunny_dataset"):
         """
         Load z coordinates, ground truth energies, and ground truth displacements
-        from the z_dataset folder. Skips files containing NaN values.
+        from the bunny_dataset folder. Skips files containing NaN values.
         """
-        print(f"Loading z_dataset from base path: {dataset_base_path} for {self.num_modes} modes...")
+        print(f"Loading bunny_dataset from base path: {dataset_base_path} for {self.num_modes} modes...")
         
         # self.num_modes is equivalent to L (latent_dim), which should match the subfolder name
         mode_subfolder_name = f"{self.num_modes}_modes"
@@ -671,8 +671,8 @@ class Routine:
             print(f"Converted mode_subfolder_path to absolute: {mode_subfolder_path}")
 
         if not os.path.exists(mode_subfolder_path):
-            print(f"Error: z_dataset subfolder not found: {mode_subfolder_path}")
-            print("Please ensure you have run the 'sofa_scripts/z_dataset_builder.py' script to generate the dataset.")
+            print(f"Error: bunny_dataset subfolder not found: {mode_subfolder_path}")
+            print("Please ensure you have run the 'sofa_scripts/bunny_dataset_builder.py' script to generate the dataset.")
             self.loaded_z_coords = None
             self.loaded_energies_gt = None
             self.loaded_displacements_gt = None
@@ -683,7 +683,7 @@ class Routine:
 
         if not data_files:
             print(f"No 'data_*.npz' files found in {mode_subfolder_path}")
-            print("Please ensure you have run the 'sofa_scripts/z_dataset_builder.py' script to generate the dataset.")
+            print("Please ensure you have run the 'sofa_scripts/bunny_dataset_builder.py' script to generate the dataset.")
             self.loaded_z_coords = None
             self.loaded_energies_gt = None
             self.loaded_displacements_gt = None
@@ -772,7 +772,7 @@ class Routine:
         print(f"  Success rate: {100 * valid_files / total_files:.1f}%")
         
         if not loaded_z_list:
-            print("No valid data successfully loaded from z_dataset after NaN/Inf filtering.")
+            print("No valid data successfully loaded from bunny_dataset after NaN/Inf filtering.")
             print("Please check your dataset for data quality issues.")
             self.loaded_z_coords = None
             self.loaded_energies_gt = None
@@ -895,7 +895,7 @@ class Routine:
             # --- Load z, (optional) energies_gt, (optional) displacements_gt from dataset ---
             with torch.no_grad():
                 if self.loaded_z_coords is None or len(self.loaded_z_coords) == 0:
-                    raise RuntimeError("z_dataset not loaded or empty. Training cannot continue.")
+                    raise RuntimeError("bunny_dataset not loaded or empty. Training cannot continue.")
                 
                 current_dataset_size = len(self.loaded_z_coords)
                 if current_dataset_size < batch_size:
@@ -1089,7 +1089,7 @@ class Routine:
                     # Define weights for the new loss terms. 
                     # These weights might need tuning.
                     # Using a large weight similar to ortho and bc_penalty.
-                    weight_mse_displacement = 1e3
+                    weight_mse_displacement = 1e6
                     weight_mse_energy = 1
 
                     # Modified loss: includes original energy term, ortho, bc, and new MSE terms
@@ -1920,7 +1920,7 @@ def main():
     print("Starting main function...")
     # Parse arguments
     parser = argparse.ArgumentParser(description='Hybrid Simulation SOFA')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='config file path') # Default to sofa config
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='config file path') # Default to sofa config
     parser.add_argument('--resume', action='store_true', help='resume from best checkpoint')
     parser.add_argument('--skip-training', action='store_true', help='skip training and load best model')
     parser.add_argument('--checkpoint', type=str, default=None, help='specific checkpoint path to load')
@@ -1945,7 +1945,7 @@ def main():
 
     # Determine checkpoint path
     checkpoint_dir = cfg.get('training', {}).get('checkpoint_dir', 'checkpoints')
-    best_checkpoint_filename = 'best_sofa.pt' # Specific name for SOFA training
+    best_checkpoint_filename = 'best_sofa_bunny.pt' # Specific name for SOFA training
     default_checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint_filename)
 
     # Use specific checkpoint if provided, otherwise default best, handle resume flag

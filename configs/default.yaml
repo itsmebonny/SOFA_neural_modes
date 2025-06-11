@@ -5,8 +5,8 @@ mesh:
 
 # Material properties
 material:
-  youngs_modulus: 100000000 # was 1000000
-  poissons_ratio: 0.2 # was 0.4
+  youngs_modulus: 100000 # was 1000000
+  poissons_ratio: 0.45 # was 0.4
   density: 1000
   volume: 10.0
 
@@ -23,7 +23,7 @@ physics:
 
 simulation:
   steps: 1 # Default number of main steps
-  max_z_amplitude_scale: 150 # was 75
+  max_z_amplitude_scale: 10 # was 75
 # Constraint parameters
 constraints:
   fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]
@@ -37,7 +37,7 @@ model:
 
 # Training parameters
 training:
-  num_epochs: 500
+  num_epochs: 5000
   learning_rate: 0.001
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard"

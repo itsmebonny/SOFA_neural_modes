@@ -620,9 +620,9 @@ class Routine:
         print("Starting training...")
         
         # Setup training parameters
-        batch_size = 20  # You can add this to config
+        batch_size = 32  # You can add this to config
         rest_idx = 0    # Index for rest shape in batch
-        print_every = 10
+        print_every = 1
         checkpoint_every = 5
         
         # Get rest shape (undeformed configuration)
@@ -709,7 +709,7 @@ class Routine:
 
         if use_different_scales:
             # Custom scales for each mode - EDIT THESE VALUES as needed
-            custom_scales = [200.0, 200.0, 10.0, 10.0, 150.0, 10.0, 10.0, 5.0]  # Example scales
+            custom_scales = [250.0, 250.0, 20.0, 20.0, 150.0, 80.0, 10.0, 10.0]  # Example scales
             
             # Ensure we have enough scales for all modes
             if len(custom_scales) < self.latent_dim:
@@ -730,7 +730,7 @@ class Routine:
         num_samples = len(combo)
         print(f"Number of samples: {num_samples}")
         z_all = combo * mode_scale
-        np.savetxt('z.txt', z_all, fmt='%.2f') 
+        #np.savetxt('z.txt', z_all, fmt='%.2f') 
         random_indices = random.sample(range(num_samples), num_samples) #random list of indices in the full sample set (z_all)
       
 
@@ -866,7 +866,7 @@ class Routine:
                     # raw_div_p = self.energy_calculator.compute_div_p(u_total_batch)
 
                     # Modified loss
-                    loss = (energy) + 1e9 * ortho + 1e9 * bc_penalty 
+                    loss = (energy) + 1e12 * ortho + 1e9 * bc_penalty 
 
                     loss.backward()
 
@@ -1311,7 +1311,7 @@ class Routine:
 
         Args:
             num_samples: Number of samples to take for each mode (-scale to +scale).
-            scale: Range of latent values to sample, auto-computed if None.
+            scale: Range of latent values to sample, auto-computed if None. Can be a scalar or a vector.
             modes_to_show: List of specific mode indices to visualize, visualize all if None.
         """
         print("Visualizing latent space modes...")
@@ -1326,10 +1326,23 @@ class Routine:
 
         # Compute scale for latent vectors if not provided
         if scale is None:
-            scale = self.compute_safe_scaling_factor() * 2.0 # Larger scale to see clear deformations
+            scale = 300  # Larger scale to see clear deformations
+
+        # Handle scalar vs. vector scale
+        if isinstance(scale, (int, float)):
+            scale_vector = torch.full((self.latent_dim,), float(scale), device=self.device)
+        else:
+            scale_vector = [300, 300, 20, 20, 250, 10, 10, 5]
+            if scale_vector.shape[0] < self.latent_dim:
+                print(f"Warning: Scale vector has fewer elements ({scale_vector.shape[0]}) than latent dimension ({self.latent_dim}). Padding with last value.")
+                padding = torch.full((self.latent_dim - scale_vector.shape[0],), scale_vector[-1], device=self.device)
+                scale_vector = torch.cat((scale_vector, padding))
+            elif scale_vector.shape[0] > self.latent_dim:
+                 print(f"Warning: Scale vector has more elements ({scale_vector.shape[0]}) than latent dimension ({self.latent_dim}). Truncating.")
+                 scale_vector = scale_vector[:self.latent_dim]
 
         # Create values to sample for each mode
-        values = np.linspace(-scale, scale, num_samples)
+        values = np.linspace(-1, 1, num_samples)
 
         # Create base PyVista grid directly from loaded NumPy arrays
         num_elements = self.elements_np.shape[0]
@@ -1374,12 +1387,12 @@ class Routine:
             for j, val in enumerate(values):
                 # Create a zero latent vector
                 z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
-                # Set only the current mode to the current value
-                z[mode_idx] = val
+                # Set only the current mode to the current value, scaled by the mode-specific scale
+                z[mode_idx] = val * scale_vector[mode_idx]
 
                 # Compute total displacement
                 with torch.no_grad():
-                    linear_contribution = self.linear_modes[:, mode_idx] * val # Assumes linear_modes columns match latent dims
+                    linear_contribution = self.linear_modes[:, mode_idx] * z[mode_idx] # Assumes linear_modes columns match latent dims
                     y = self.model(z)
                     u_total = y + linear_contribution
                     u_total_np = u_total.detach().cpu().numpy().reshape((-1, 3))
@@ -1400,7 +1413,7 @@ class Routine:
                              cmap="viridis", show_edges=False, clim=color_range, reset_camera=False)
             # Add value label
             mode_idx = modes_to_show[item['row']]
-            val = values[item['col']]
+            val = values[item['col']] * scale_vector[mode_idx].cpu().numpy()
             plotter.add_text(f"z{mode_idx}={val:.2f}", position="lower_right", font_size=8, color='white')
             plotter.view_isometric() # Set consistent view
 
