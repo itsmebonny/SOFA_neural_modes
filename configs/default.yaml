@@ -23,7 +23,7 @@ physics:
 
 simulation:
   steps: 1 # Default number of main steps
-  max_z_amplitude_scale: 10 # was 75
+  max_z_amplitude_scale: 100 # was 75
 # Constraint parameters
 constraints:
   fixed_box: [-0.01, -0.01, -0.01, 0.01, 1.01, 1.01]  # [xmin, ymin, zmin, xmax, ymax, zmax]

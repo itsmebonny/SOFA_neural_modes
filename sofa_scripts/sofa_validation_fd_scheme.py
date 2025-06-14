@@ -87,7 +87,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 10000
+        self.target_force_magnitude = 1000
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
         self.current_main_step_direction = np.zeros(3) # Initialize direction
@@ -414,7 +414,7 @@ class AnimationStepController(Sofa.Core.Controller):
                     u_pred_nn_flat_th = real_solution_disp_th.clone() # NN "output" forced to match real solution for history
 
                     # Project SOFA linear solution to get z_nn_current_th as an estimate
-                    z_from_sofa_linear_np = self.computeModalCoordinates(real_solution_disp_np)
+                    z_from_sofa_linear_np = self.computeModalCoordinates(linear_solution_sofa_disp_np)
                     if z_from_sofa_linear_np is None or np.isnan(z_from_sofa_linear_np).any():
                         # print(f"Warning: Projection of SOFA linear solution for z_nn_current_th resulted in None/NaN at timestep {self.current_period_timestep_counter}. Using zeros.")
                         z_from_sofa_linear_np = np.zeros(self.routine.latent_dim)
@@ -668,15 +668,7 @@ class AnimationStepController(Sofa.Core.Controller):
         
         u_curr_nn_flat_th = l_th_flat + y_th_flat # Shape: (num_dofs,)
 
-        # 2. Calculate acceleration u_ddot_nn_flat_th (using Newmark-beta like terms for an implicit scheme)
-        # Simplified: (u_curr - 2*u_prev + u_prev_prev) / dt^2
-        # This is a common explicit finite difference for acceleration.
-        # For an implicit objective, one might formulate it differently, e.g., based on Newmark's velocity/position updates.
-        # Let's use the simple explicit form for now for u_ddot.
-        if self.dt == 0: # Avoid division by zero if dt not set
-            u_ddot_nn_flat_th = torch.zeros_like(u_curr_nn_flat_th)
-        else:
-            u_ddot_nn_flat_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th) / (self.dt**2)
+   
 
         # 3. Calculate Inertial Term: 0.5 * u_ddot^T * M * u_ddot
         # Use finite difference scheme with previous displacements
@@ -684,9 +676,9 @@ class AnimationStepController(Sofa.Core.Controller):
         if self.dt == 0:
             inertial_term = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
         else:
-            u_ddot_fd_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th) / (self.dt**2)
+            u_ddot_fd_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th)
             inertial_force_th = torch.sparse.mm(self.M_torch, u_ddot_fd_th.unsqueeze(1)).squeeze(1)
-            inertial_term = torch.dot(u_ddot_fd_th, inertial_force_th) / (2 * self.dt)
+            inertial_term = torch.dot(u_ddot_fd_th, inertial_force_th) / (2 * self.dt**2)
 
         # 4. Calculate Elastic Strain Energy: E_elastic(u_nn(z))
         # energy_calculator expects displacement in shape (batch_size, num_nodes, 3) or (num_nodes, 3)
@@ -1041,7 +1033,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
         }
     
     # Set basic simulation parameters
-    rootNode.dt = config['physics'].get('dt', 0.01)
+    rootNode.dt = config['physics'].get('dt', 0.001)
     rootNode.gravity = [0, 0, 0]
     rootNode.name = 'root'
     rootNode.bbox = "-10 -2 -2 10 2 2"
@@ -1129,7 +1121,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       drawBoxes=True)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box', [0.01, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box_coords = config['constraints'].get('force_box_1', [9.91, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
