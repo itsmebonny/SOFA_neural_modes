@@ -120,7 +120,7 @@ class AnimationStepController(Sofa.Core.Controller):
         # Example: Apply force for 50 timesteps. Get from kwargs or set a default.
         self.initial_force_duration_timesteps = kwargs.get('initial_force_duration_timesteps', 50)
         # Example: Force vector [Fx, Fy, Fz]. Get from kwargs or set a default.
-        self.initial_force_vector_total_np = np.array(kwargs.get('initial_force_vector_total', [0.0, -10000.0, 0.0]))
+        self.initial_force_vector_total_np = np.array(kwargs.get('initial_force_vector_total', [0.0, 10000.0, 0.0]))
         
         if self.apply_initial_constant_force:
             print(f"Controller will apply initial constant total force: {self.initial_force_vector_total_np} for {self.initial_force_duration_timesteps} timesteps.")
@@ -889,7 +889,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       drawBoxes=True)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box', [0.01, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box_coords = config['constraints'].get('force_box_1', [7.91, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 

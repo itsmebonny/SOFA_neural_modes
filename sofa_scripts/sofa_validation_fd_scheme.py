@@ -447,7 +447,7 @@ class AnimationStepController(Sofa.Core.Controller):
                         new_z_guess[:common_dim] = z_guess_th[:common_dim]
                         z_guess_th = new_z_guess.requires_grad_(True)
 
-                    optimizer = optim.LBFGS([z_guess_th], lr=1.0, max_iter=15, line_search_fn="strong_wolfe")
+                    optimizer = optim.LBFGS([z_guess_th], lr=1.0, max_iter=100, line_search_fn="strong_wolfe")
 
                     # History terms for the objective function come from self.u_nn_prev_flat_th and self.u_nn_prev_prev_flat_th
                     u_prev_for_opt = self.u_nn_prev_flat_th.clone().detach()
@@ -708,7 +708,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
 
         # 7. Total Objective
-        total_objective = inertial_term + elastic_energy + work_external_term + damping_term
+        total_objective = 0.1 * inertial_term + elastic_energy + work_external_term #+ damping_term
         
         print(f"  Objective: {total_objective.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e}, Damping: {damping_term.item():.3e})")
         return total_objective
@@ -1033,7 +1033,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
         }
     
     # Set basic simulation parameters
-    rootNode.dt = config['physics'].get('dt', 0.001)
+    rootNode.dt = config['physics'].get('dt', 0.01)
     rootNode.gravity = [0, 0, 0]
     rootNode.name = 'root'
     rootNode.bbox = "-10 -2 -2 10 2 2"
@@ -1069,9 +1069,9 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     young_modulus = config['material'].get('youngs_modulus', 5000)
     poisson_ratio = config['material'].get('poissons_ratio', 0.25)
     density = config['material'].get('density', 10)
-    volume = config['material'].get('volume', 1)
-    num_modes_to_show = config['model'].get('latent_dim', 5)
-    total_mass = density * volume
+    volume = config['material'].get('volume', 1) # Make sure this is in config or handled
+    num_modes_to_show = config['model'].get('latent_dim', 5) # For controller, not directly used in scene
+    total_mass = density * volume # Ensure volume is correctly sourced
     print(f"Using E={young_modulus}, nu={poisson_ratio}, rho={density}, V={volume}, M={total_mass}")
 
     # Calculate Lamé parameters
@@ -1087,7 +1087,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     exactSolution = rootNode.addChild('HighResSolution2D', activated=True)
     exactSolution.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
     surface_topo = exactSolution.addObject('TetrahedronSetTopologyContainer', name='triangleTopo', src='@grid')
-    MO1 = exactSolution.addObject('MechanicalObject', name='DOFs', template='Vec3d', src='@grid')
+    MO1 = exactSolution.addObject('MechanicalObject', name='MO1', template='Vec3d', src='@grid')
     
     # Add system components
     mass = exactSolution.addObject('MeshMatrixMass', totalMass=total_mass, name="SparseMass", topology="@triangleTopo")
@@ -1096,8 +1096,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     rayleighStiffness = config['physics'].get('rayleigh_stiffness', 0.1)
     rayleighMass = config['physics'].get('rayleigh_mass', 0.1)
     
-    exactSolution.addObject('EulerImplicitSolver', name="ODEsolver", rayleighStiffness=rayleighStiffness, rayleighMass=rayleighMass)
-
+    solver = exactSolution.addObject('EulerImplicitSolver', name="ODEsolver", rayleighStiffness=rayleighStiffness, rayleighMass=rayleighMass)
+    
     linear_solver = exactSolution.addObject('CGLinearSolver', 
                                           template="CompressedRowSparseMatrixMat3x3d",
                                           iterations=config['physics'].get('solver_iterations', 1000), 
@@ -1121,20 +1121,22 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       drawBoxes=True)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box_1', [9.91, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box_coords = config['constraints'].get('force_box_1', [7.91, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
                                         drawBoxes=True)
-    cff = exactSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
 
     
-
+    #NOTES: plot some relative errors between linear modes and fem divided by the norm of biggest displacement
+    # 
     
     # Add visual model
     visual = exactSolution.addChild("visual")
-    visual.addObject('OglModel', src='@../DOFs', color='0 1 0 1')
-    visual.addObject('BarycentricMapping', input='@../DOFs', output='@./')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 1 0 1')
+    visual.addObject('BarycentricMapping', input='@../MO1', output='@./visual')
+    visual.addObject('VisualModelOBJExporter', filename="neuralModes-groundtruth", exportEveryNumberOfSteps=50) 
 
     # Add a second model beam with TetrahedronFEMForceField, which is linear
     # --- Add Linear Solution Node ---
@@ -1144,7 +1146,6 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO2 = linearSolution.addObject('MechanicalObject', name='MO2', template='Vec3d', src='@grid') # Named MO2
 
     linearSolution.addObject('MeshMatrixMass', totalMass=total_mass, name="SparseMass", topology="@triangleTopo")
-
 
     # Add system components (similar to exactSolution)
     linearSolution.addObject('EulerImplicitSolver', name="ODEsolver", rayleighStiffness=rayleighStiffness, rayleighMass=rayleighMass)
@@ -1160,7 +1161,8 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            name="LinearFEM",
                            youngModulus=young_modulus,
                            poissonRatio=poisson_ratio,
-                           method="small") 
+                           method="small") # needs to be set to small for true linear solution 
+
 
     # Add constraints (same as exactSolution)
     linearSolution.addObject('BoxROI',
@@ -1175,12 +1177,13 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                            drawBoxes=False) # Maybe hide this box
     # Add a CFF to the linear model as well, controlled separately if needed, or linked
     # For now, just add it so the structure is parallel. It won't be actively controlled by the current controller.
-    linearSolution.addObject('ConstantForceField', indices="@ForceROI.indices", totalForce=[0, 0, 0], showArrowSize=0.0)
 
     # Add visual model for the linear solution (optional, maybe different color)
-    visualLinear = linearSolution.addChild("visualLinear")
-    visualLinear.addObject('OglModel', src='@../MO2', color='0 0 1 1') # Blue color
-    visualLinear.addObject('BarycentricMapping', input='@../MO2', output='@./')
+    visual = linearSolution.addChild("visual")
+    visual.addObject('VisualStyle', displayFlags='showWireframe')
+    visual.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual.addObject('OglModel', name='visual', src='@surface_mesh', color='0 0.6 0.95 1') # cyan color
+    visual.addObject('BarycentricMapping', input='@../MO2', output='@./visual')
     # --- End Linear Solution Node ---
 
 
@@ -1189,10 +1192,13 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     linearModesViz.addObject('MeshGmshLoader', name='grid', filename=mesh_filename)
     linearModesViz.addObject('TetrahedronSetTopologyContainer', name='topo', src='@grid')
     MO_LinearModes = linearModesViz.addObject('MechanicalObject', name='MO_LinearModes', template='Vec3d', src='@grid')
-    # Add visual model
+
+    # Add visual model for the reduced model 
     visualLinearModes = linearModesViz.addChild("visualLinearModes")
-    visualLinearModes.addObject('OglModel', src='@../MO_LinearModes', color='1 1 0 1') # Yellow color
-    visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./')
+    visualLinearModes.addObject('VisualStyle', displayFlags='showWireframe')
+    visual_LM = visualLinearModes.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visualLinearModes.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 0 1') # red color
+    visualLinearModes.addObject('BarycentricMapping', input='@../MO_LinearModes', output='@./visual')
     # --- End Linear Modes Viz Node ---
 
 
@@ -1203,42 +1209,31 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     MO_NeuralPred = neuralPredViz.addObject('MechanicalObject', name='MO_NeuralPred', template='Vec3d', src='@grid')
     # Add visual model
     visualNeuralPred = neuralPredViz.addChild("visualNeuralPred")
-    visualNeuralPred.addObject('OglModel', src='@../MO_NeuralPred', color='1 0 1 1') # Magenta color
-    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./')
+    visualNeuralPred.addObject('MeshOBJLoader', name='surface_mesh', filename='mesh/beam_732.obj')
+    visual_NP = visualNeuralPred.addObject('OglModel', name='visual', src='@surface_mesh', color='1 0 1 1') # Magenta color
+    visualNeuralPred.addObject('BarycentricMapping', input='@../MO_NeuralPred', output='@./visual')
+    visualNeuralPred.addObject('VisualModelOBJExporter', filename="neuralModes-prediction", exportEveryNumberOfSteps=50) 
     # --- End Neural Pred Viz Node ---
 
 
     # Create and add controller with all components
-    controller = AnimationStepController(rootNode,
-                                        exactSolution=exactSolution,
-                                        fem=fem, # Hyperelastic FEM
-                                        linear_solver=linear_solver,
-                                        surface_topo=surface_topo,
-                                        MO1=MO1, # Real SOFA solution
-                                        fixed_box=fixed_box,
-                                        linearSolution=linearSolution, # Pass linear node
-                                        MO2=MO2, # SOFA Linear MechObj
-                                        linearFEM=linearFEM, # Pass linear FEM FF
-                                        MO_LinearModes=MO_LinearModes, # Pass Linear Modes Viz MechObj
-                                        MO_NeuralPred=MO_NeuralPred,   # Pass Neural Pred Viz MechObj
-                                        visualLinearModes=visualLinearModes, # Pass Linear Modes Viz
-                                        visualNeuralPred=visualNeuralPred, # Pass Neural Pred Viz
-                                        directory=directory,
-                                        sample=sample,
-                                        key=key,
-                                        young_modulus=young_modulus,
-                                        poisson_ratio=poisson_ratio,
-                                        density=density,
-                                        volume=volume,
-                                        total_mass=total_mass,
-                                        mesh_filename=mesh_filename,
-                                        num_modes_to_show=num_modes_to_show,
-                                        # cff=cff, # REMOVED - Controller manages CFFs
-                                        **kwargs)
+    controller_kwargs = {
+        'exactSolution': exactSolution, 'fem': fem, 'linear_solver': linear_solver,
+        'surface_topo': surface_topo, 'MO1': MO1, 'fixed_box': fixed_box,
+        'linearSolution': linearSolution, 'MO2': MO2, 'linearFEM': linearFEM,
+        'MO_LinearModes': MO_LinearModes, 'MO_NeuralPred': MO_NeuralPred,
+    #    'visual_LM': visual_LM, 'visual_NP': visual_NP, # Corrected visual names
+        'directory': directory, 'sample': sample, 'key': key,
+        'young_modulus': young_modulus, 'poisson_ratio': poisson_ratio,
+        'density': density, 'volume': volume, 'total_mass': total_mass,
+        'mesh_filename': mesh_filename, 'num_modes_to_show': num_modes_to_show,
+        # Pass through kwargs from createScene call, which might include num_substeps, max_main_steps, max_z_amplitude_scale
+    }
+    controller_kwargs.update(kwargs) # Add kwargs passed to createScene
+
+    controller = AnimationStepController(rootNode, **controller_kwargs)
     rootNode.addObject(controller)
-
     return rootNode, controller
-
 
 if __name__ == "__main__":
     import Sofa.Gui
