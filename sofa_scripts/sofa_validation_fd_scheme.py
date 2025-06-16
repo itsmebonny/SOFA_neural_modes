@@ -87,7 +87,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 1000
+        self.target_force_magnitude = 10000
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
         self.current_main_step_direction = np.zeros(3) # Initialize direction
@@ -414,7 +414,7 @@ class AnimationStepController(Sofa.Core.Controller):
                     u_pred_nn_flat_th = real_solution_disp_th.clone() # NN "output" forced to match real solution for history
 
                     # Project SOFA linear solution to get z_nn_current_th as an estimate
-                    z_from_sofa_linear_np = self.computeModalCoordinates(linear_solution_sofa_disp_np)
+                    z_from_sofa_linear_np = self.computeModalCoordinates(real_solution_disp_th)
                     if z_from_sofa_linear_np is None or np.isnan(z_from_sofa_linear_np).any():
                         # print(f"Warning: Projection of SOFA linear solution for z_nn_current_th resulted in None/NaN at timestep {self.current_period_timestep_counter}. Using zeros.")
                         z_from_sofa_linear_np = np.zeros(self.routine.latent_dim)
@@ -708,7 +708,7 @@ class AnimationStepController(Sofa.Core.Controller):
 
 
         # 7. Total Objective
-        total_objective = 0.1 * inertial_term + elastic_energy + work_external_term #+ damping_term
+        total_objective = 0.8 * inertial_term + elastic_energy + work_external_term #+ damping_term
         
         print(f"  Objective: {total_objective.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e}, Damping: {damping_term.item():.3e})")
         return total_objective
@@ -917,23 +917,24 @@ class AnimationStepController(Sofa.Core.Controller):
             print("-------------------------------------------\n")
 
             # --- Data for plotting against timesteps ---
-            timesteps_plot = df.index.values # Use DataFrame index for timesteps
+            start_plot_index = self.optimization_start_step_in_period
+            timesteps_plot = df.index.values[start_plot_index:] # Use DataFrame index for timesteps
 
-            real_e_ts = df['RealE'].values
-            pred_e_ts = df['PredE'].values
-            linear_modes_e_ts = df['LinearModesE'].values
-            sofa_linear_e_ts = df['SOFALinearE'].values
+            real_e_ts = df['RealE'].values[start_plot_index:]
+            pred_e_ts = df['PredE'].values[start_plot_index:]
+            linear_modes_e_ts = df['LinearModesE'].values[start_plot_index:]
+            sofa_linear_e_ts = df['SOFALinearE'].values[start_plot_index:]
 
-            rmse_pred_real_ts = df['RMSE_Pred_Real'].values
-            mse_pred_real_ts = df['MSE_Pred_Real'].values
-            rmse_lin_real_ts = df['RMSE_Lin_Real'].values
-            mse_lin_real_ts = df['MSE_Lin_Real'].values
-            rmse_sofa_lin_real_ts = df['RMSE_SOFALin_Real'].values
-            mse_sofa_lin_real_ts = df['MSE_SOFALin_Real'].values
+            rmse_pred_real_ts = df['RMSE_Pred_Real'].values[start_plot_index:]
+            mse_pred_real_ts = df['MSE_Pred_Real'].values[start_plot_index:]
+            rmse_lin_real_ts = df['RMSE_Lin_Real'].values[start_plot_index:]
+            mse_lin_real_ts = df['MSE_Lin_Real'].values[start_plot_index:]
+            rmse_sofa_lin_real_ts = df['RMSE_SOFALin_Real'].values[start_plot_index:]
+            mse_sofa_lin_real_ts = df['MSE_SOFALin_Real'].values[start_plot_index:]
             
-            grad_diff_lm_ts = df['GradDiff_LM'].values if 'GradDiff_LM' in df.columns else np.full_like(timesteps_plot, float('nan'), dtype=float)
-            grad_diff_nn_ts = df['GradDiff_NN'].values if 'GradDiff_NN' in df.columns else np.full_like(timesteps_plot, float('nan'), dtype=float)
-            grad_diff_sl_ts = df['GradDiff_SL'].values if 'GradDiff_SL' in df.columns else np.full_like(timesteps_plot, float('nan'), dtype=float)
+            grad_diff_lm_ts = df['GradDiff_LM'].values[start_plot_index:] if 'GradDiff_LM' in df.columns else np.full_like(timesteps_plot, float('nan'), dtype=float)
+            grad_diff_nn_ts = df['GradDiff_NN'].values[start_plot_index:] if 'GradDiff_NN' in df.columns else np.full_like(timesteps_plot, float('nan'), dtype=float)
+            grad_diff_sl_ts = df['GradDiff_SL'].values[start_plot_index:] if 'GradDiff_SL' in df.columns else np.full_like(timesteps_plot, float('nan'), dtype=float)
 
             plot_dir = self.output_subdir if self.save else "."
             if self.save and not os.path.exists(plot_dir):
@@ -1121,7 +1122,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                       drawBoxes=True)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
-    force_box_coords = config['constraints'].get('force_box_1', [7.91, -0.01, -0.02, 10.1, 1.01, 1.02])
+    force_box_coords = config['constraints'].get('force_box_1', [5.01, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
