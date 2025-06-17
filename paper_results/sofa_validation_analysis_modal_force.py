@@ -895,14 +895,14 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
     fixed_box = exactSolution.addObject('BoxROI', 
                                       name='ROI',
                                       box=" ".join(str(x) for x in fixed_box_coords), 
-                                      drawBoxes=True)
+                                      drawBoxes=False)
     exactSolution.addObject('FixedConstraint', indices="@ROI.indices")
 
     force_box_coords = config['constraints'].get('force_box', [0.01, -0.01, -0.02, 10.1, 1.01, 1.02])
     force_box = exactSolution.addObject('BoxROI',
                                         name='ForceROI',
                                         box=" ".join(str(x) for x in force_box_coords), 
-                                        drawBoxes=True)
+                                        drawBoxes=False)
 
     
     #NOTES: plot some relative errors between linear modes and fem divided by the norm of biggest displacement

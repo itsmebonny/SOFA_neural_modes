@@ -1552,31 +1552,75 @@ class Routine:
         print("Visualization complete.")
 
 
-    def visualize_latent_space(self, num_samples=5, scale=None, modes_to_show=None):
+    def visualize_latent_space(self, num_samples=5, modes_to_show=None, fallback_scale_factor=0.5):
         """
-        Visualize the effect of each latent dimension independently using loaded mesh data.
+        Visualize the effect of each latent dimension independently.
+        The scale for each mode is derived from its min/max range in self.loaded_z_coords.
 
         Args:
-            num_samples: Number of samples to take for each mode (-scale to +scale).
-            scale: Range of latent values to sample, auto-computed if None.
+            num_samples: Number of samples to take for each mode across its range.
             modes_to_show: List of specific mode indices to visualize, visualize all if None.
+            fallback_scale_factor: Multiplier for compute_safe_scaling_factor() if a mode's data is unavailable
+                                   or its range in the dataset is too small.
         """
-        print("Visualizing latent space modes...")
+        print("Visualizing latent space modes (using data-derived scales)...")
+
+        if not hasattr(self, 'loaded_z_coords') or self.loaded_z_coords is None or self.loaded_z_coords.numel() == 0:
+            print("Warning: z_dataset not loaded or empty. Cannot use data-derived scales. Visualization might be limited or use defaults.")
+            # Optionally, you could call a version that uses a fixed scale or return early
+            # For now, we'll proceed and let mode_ranges use fallbacks.
 
         # Determine which modes to show
         if modes_to_show is None:
             modes_to_show = list(range(self.latent_dim))
-        num_modes = len(modes_to_show)
-        if num_modes == 0:
+        
+        if not modes_to_show: # Handle empty list
             print("No modes selected to visualize.")
             return
 
-        # Compute scale for latent vectors if not provided
-        if scale is None:
-            scale = self.compute_safe_scaling_factor() * 2.0 # Larger scale to see clear deformations
+        num_modes_to_visualize = len(modes_to_show)
 
-        # Create values to sample for each mode
-        values = np.linspace(-scale, scale, num_samples)
+        # Determine the sampling range for each mode
+        mode_sampling_ranges = {}
+        default_half_range_fallback = self.compute_safe_scaling_factor() * fallback_scale_factor
+
+        for mode_idx in modes_to_show:
+            if mode_idx >= self.latent_dim:
+                print(f"Warning: Mode index {mode_idx} exceeds model's latent dimension {self.latent_dim}. Skipping.")
+                continue
+
+            min_val, max_val = -default_half_range_fallback, default_half_range_fallback # Default range
+
+            if hasattr(self, 'loaded_z_coords') and self.loaded_z_coords is not None and self.loaded_z_coords.numel() > 0:
+                if mode_idx < self.loaded_z_coords.shape[1]:
+                    mode_data = self.loaded_z_coords[:, mode_idx]
+                    current_min = mode_data.min().item()
+                    current_max = mode_data.max().item()
+
+                    if current_max - current_min < 1e-6: # If data range is too small
+                        center = (current_min + current_max) / 2.0
+                        min_val = center - default_half_range_fallback
+                        max_val = center + default_half_range_fallback
+                        print(f"Mode {mode_idx}: Data range too small ({current_min:.2e} to {current_max:.2e}). Using expanded range: {min_val:.2e} to {max_val:.2e}.")
+                    else:
+                        min_val = current_min * 0.5
+                        max_val = current_max * 0.5
+                        print(f"Mode {mode_idx}: Using data range: {min_val:.2e} to {max_val:.2e}.")
+                else:
+                    print(f"Mode {mode_idx}: Not found in loaded_z_coords (shape {self.loaded_z_coords.shape}). Using default range: {-default_half_range_fallback:.2e} to {default_half_range_fallback:.2e}.")
+            else:
+                 print(f"Mode {mode_idx}: z_dataset not available. Using default range: {-default_half_range_fallback:.2e} to {default_half_range_fallback:.2e}.")
+            
+            mode_sampling_ranges[mode_idx] = np.linspace(min_val, max_val, num_samples)
+
+        # Filter out modes that were skipped
+        valid_modes_to_show = [m for m in modes_to_show if m in mode_sampling_ranges]
+        if not valid_modes_to_show:
+            print("No valid modes left to visualize after checking ranges.")
+            return
+        
+        num_modes_to_visualize = len(valid_modes_to_show)
+
 
         # Create base PyVista grid directly from loaded NumPy arrays
         num_elements = self.elements_np.shape[0]
@@ -1603,30 +1647,33 @@ class Routine:
             return
 
         # Create plotter with mode rows and sample columns
-        plotter = pyvista.Plotter(shape=(num_modes, num_samples), border=False,
-                                window_size=[1600, 200 * num_modes])
+        plotter = pyvista.Plotter(shape=(num_modes_to_visualize, num_samples), border=False,
+                                window_size=[1600, 200 * num_modes_to_visualize])
 
         # Visualize each mode with varying values
         max_overall_disp = 0.0
         grids_to_plot = []
 
-        for i, mode_idx in enumerate(modes_to_show):
-            if mode_idx >= self.latent_dim:
-                print(f"Warning: Skipping mode index {mode_idx} as it exceeds latent dimension {self.latent_dim}.")
-                continue
+        for i, mode_idx in enumerate(valid_modes_to_show): # Use filtered list
+            current_mode_values = mode_sampling_ranges[mode_idx]
             if mode_idx >= self.linear_modes.shape[1]:
-                 print(f"Warning: Skipping mode index {mode_idx} as it exceeds available linear modes {self.linear_modes.shape[1]}.")
+                 print(f"Warning: Skipping visualization for mode index {mode_idx} as it exceeds available linear modes columns {self.linear_modes.shape[1]}.")
+                 # Add empty plots or skip row
+                 for j_skip in range(num_samples):
+                    plotter.subplot(i, j_skip)
+                    plotter.add_text(f"Mode {mode_idx}\n(Lin.Mode N/A)", color='red', font_size=8)
                  continue
 
-            for j, val in enumerate(values):
+
+            for j, val in enumerate(current_mode_values):
                 # Create a zero latent vector
                 z = torch.zeros(self.latent_dim, device=self.device, dtype=torch.float64)
                 # Set only the current mode to the current value
-                z[mode_idx] = val
+                z[mode_idx] = val 
 
                 # Compute total displacement
                 with torch.no_grad():
-                    linear_contribution = self.linear_modes[:, mode_idx] * val # Assumes linear_modes columns match latent dims
+                    linear_contribution = self.linear_modes[:, mode_idx] * val 
                     y = self.model(z)
                     u_total = y + linear_contribution
                     u_total_np = u_total.detach().cpu().numpy().reshape((-1, 3))
@@ -1636,37 +1683,35 @@ class Routine:
                 local_grid.points = self.coordinates_np + u_total_np # Apply displacement directly
                 local_grid["displacement_magnitude"] = np.linalg.norm(u_total_np, axis=1)
                 max_overall_disp = max(max_overall_disp, np.max(local_grid["displacement_magnitude"]))
-                grids_to_plot.append({'grid': local_grid, 'row': i, 'col': j})
+                grids_to_plot.append({'grid': local_grid, 'row': i, 'col': j, 'mode_idx': mode_idx, 'val': val})
+
 
         # Plot with consistent color range
         color_range = [0, max(max_overall_disp, 1e-9)] # Avoid zero range
         for item in grids_to_plot:
             plotter.subplot(item['row'], item['col'])
             # Use show_edges=False for potentially cleaner visualization
-            plotter.add_mesh(item['grid'], scalars="displacement_magnitude",
-                             cmap="viridis", show_edges=False, clim=color_range, reset_camera=False)
+            plotter.add_mesh(item['grid'], scalars="displacement_magnitude", cmap="viridis", show_edges=False, clim=color_range, reset_camera=False, show_scalar_bar=False)
             # Add value label
-            mode_idx = modes_to_show[item['row']]
-            val = values[item['col']]
-            plotter.add_text(f"z{mode_idx}={val:.2f}", position="lower_right", font_size=8, color='white')
+            plotter.add_text(f"z{item['mode_idx']}={item['val']:.2e}", position="lower_right", font_size=8, color='black')
             plotter.view_isometric() # Set consistent view
 
         # Add row labels for modes
-        for i, mode_idx in enumerate(modes_to_show):
+        for i, mode_idx in enumerate(valid_modes_to_show): # Use filtered list
             plotter.subplot(i, 0) # Left edge
             plotter.add_text(f"Mode {mode_idx}", position="left_edge", font_size=12, color='white')
 
         # Link all camera views
         plotter.link_views()
 
-        # Add a unified colorbar
-        plotter.subplot(0, 0) # Place relative to a subplot
-        plotter.add_scalar_bar("Displacement Magnitude", position_x=0.4, position_y=0.05,
-                        width=0.5, height=0.02, title_font_size=12, label_font_size=10)
+        # # Add a unified colorbar
+        # plotter.subplot(0, 0) # Place relative to a subplot
+        # # plotter.add_scalar_bar("Displacement Magnitude", position_x=0.4, position_y=0.05,
+        # #                 width=0.5, height=0.02, title_font_size=12, label_font_size=10)
 
-        # Add overall title
-        plotter.add_text("Neural Latent Space Mode Atlas", position="upper_edge",
-                    font_size=16, color='black')
+        # # Add overall title
+        # plotter.add_text("Neural Latent Space Mode Atlas (Data-Derived Scales)", position="upper_edge",
+        #             font_size=5, color='black')
 
         print("Showing latent space visualization...")
         plotter.show()
