@@ -87,7 +87,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 10000
+        self.target_force_magnitude = 500
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
         self.current_main_step_direction = np.zeros(3) # Initialize direction
@@ -102,6 +102,8 @@ class AnimationStepController(Sofa.Core.Controller):
         self.volume = kwargs.get('volume', 1)
         self.total_mass = kwargs.get('total_mass', 10)
         self.mesh_filename = kwargs.get('mesh_filename', 'unknown')
+        self.rayleigh_mass = kwargs.get('rayleighMass', 0.0)
+        self.rayleigh_stiffness = kwargs.get('rayleighStiffness', 0.0)
         print(f"Using directory: {self.directory}")
         print(f"Material properties: E={self.young_modulus}, nu={self.poisson_ratio}, rho={self.density}")
         
@@ -126,7 +128,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.grad_diff_nn_pred_list = []
         self.grad_diff_sofa_linear_list = []
         # --- End lists for Deformation Gradient Differences ---
-        self.force_change_interval = 500 # Number of timesteps for each force period
+        self.force_change_interval = 5000 # Number of timesteps for each force period
       
 
 
@@ -344,25 +346,29 @@ class AnimationStepController(Sofa.Core.Controller):
         # --- Create and add new CFFs with the current period's force vector ---
         # This force vector remains constant for `self.force_change_interval` timesteps.
         try:
-            # Exact Solution
-            force_roi_exact = self.exactSolution.getObject('ForceROI')
-            if force_roi_exact is None: raise ValueError("ForceROI (Exact) not found in exactSolution node.")
-            self.cff = self.exactSolution.addObject('ConstantForceField',
-                               name="CFF_Exact_Managed", # Use a distinct name
-                               indices="@ForceROI.indices", # Reference the ROI in the same node
-                               totalForce=self.current_period_force_vector.tolist(),
-                               showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
-            if self.cff: self.cff.init() # Initialize the newly added component
+            if self.timestep_counter < self.optimization_start_step_in_period - 3:
+                # Exact Solution
+                force_roi_exact = self.exactSolution.getObject('ForceROI')
+                if force_roi_exact is None: raise ValueError("ForceROI (Exact) not found in exactSolution node.")
+                self.cff = self.exactSolution.addObject('ConstantForceField',
+                                name="CFF_Exact_Managed", # Use a distinct name
+                                indices="@ForceROI.indices", # Reference the ROI in the same node
+                                totalForce=self.current_period_force_vector.tolist(),
+                                showArrowSize=0.1, showColor="0.2 0.2 0.8 1")
+                if self.cff: self.cff.init() # Initialize the newly added component
 
-            # Linear Solution
-            force_roi_linear = self.linearSolution.getObject('ForceROI')
-            if force_roi_linear is None: raise ValueError("ForceROI (Linear) not found in linearSolution node.")
-            self.cff_linear = self.linearSolution.addObject('ConstantForceField',
-                               name="CFF_Linear_Managed", # Use a distinct name
-                               indices="@ForceROI.indices", # Reference the ROI in the same node
-                               totalForce=self.current_period_force_vector.tolist(),
-                               showArrowSize=0.0) # Hide arrow for linear model
-            if self.cff_linear: self.cff_linear.init() # Initialize
+                # Linear Solution
+                force_roi_linear = self.linearSolution.getObject('ForceROI')
+                if force_roi_linear is None: raise ValueError("ForceROI (Linear) not found in linearSolution node.")
+                self.cff_linear = self.linearSolution.addObject('ConstantForceField',
+                                name="CFF_Linear_Managed", # Use a distinct name
+                                indices="@ForceROI.indices", # Reference the ROI in the same node
+                                totalForce=self.current_period_force_vector.tolist(),
+                                showArrowSize=0.0) # Hide arrow for linear model
+                if self.cff_linear: self.cff_linear.init() # Initialize
+            else:
+                # After optimization starts, use the neural network prediction
+                self.F_ext_dof_th = torch.zeros_like(self.F_ext_dof_th) # Reset to zero
 
         except Exception as e:
             print(f"ERROR: Failed to create/add/init ConstantForceField(s): {e}")
@@ -646,73 +652,164 @@ class AnimationStepController(Sofa.Core.Controller):
 
         
     # --- Full new method for the Neural Network Objective Function ---
-    def objective_function(self, z_th_opt, u_nn_prev_flat_th, u_nn_prev_prev_flat_th, F_ext_dof_th):
+    def objective_function(self, z_th_opt, u_prev_for_opt, u_prev_prev_for_opt, F_ext_for_opt):
         """
-        Objective function for optimizing the latent coordinates z_th.
-        J(z) = InertialTerm(u_nn(z)) + ElasticEnergy(u_nn(z)) - Work_ExternalForce(u_nn(z)) (+ DampingTerm(u_nn(z)))
+        Objective function including Rayleigh damping terms.
         """
-        # Ensure z_th_opt requires gradients for the optimizer
-        z_th_opt.requires_grad_(True)
+        # Get current displacement from z
+        linear_displacement = torch.matmul(z_th_opt, self.routine.linear_modes[:, :self.routine.latent_dim].T)
+        y = self.routine.model(z_th_opt)
+        u_curr_nn_flat_th = linear_displacement + y
 
-        # 1. Predict current displacement u_curr_nn_flat_th from z_th_opt
-        # Ensure modes_to_use matches the dimension of z_th_opt
-        latent_dim_current = z_th_opt.shape[0]
-        modes_to_use = self.routine.linear_modes[:, :latent_dim_current].to(self.routine.device, dtype=torch.float64)
+        # Compute velocity using finite differences
+        # v = (u_curr - u_prev) / dt
+        u_dot_nn_flat_th = (u_curr_nn_flat_th - u_prev_for_opt) / self.dt
 
-        # l_th is (num_dofs,)
-        l_th_flat = torch.matmul(modes_to_use, z_th_opt)
+        # Compute acceleration using finite differences 
+        # a = (u_curr - 2*u_prev + u_prev_prev) / dt^2
+        u_ddot_nn_flat_th = (u_curr_nn_flat_th - 2.0 * u_prev_for_opt + u_prev_prev_for_opt) / (self.dt**2)
 
-        # y_th is (num_dofs,)
-        # Model input z_th_opt needs to be (batch_size, latent_dim) = (1, latent_dim_current)
-        y_th_flat = self.routine.model(z_th_opt.unsqueeze(0)).squeeze(0)
-        
-        u_curr_nn_flat_th = l_th_flat + y_th_flat # Shape: (num_dofs,)
+        # --- EXISTING TERMS ---
+        # Inertial term: M * a
+        inertial_term = torch.dot(u_ddot_nn_flat_th, torch.matmul(self.M_torch, u_ddot_nn_flat_th))
 
-   
+        # Elastic energy term
+        elastic_term = self.routine.energy_calculator(u_curr_nn_flat_th.unsqueeze(0)).squeeze()
 
-        # 3. Calculate Inertial Term: 0.5 * u_ddot^T * M * u_ddot
-        # Use finite difference scheme with previous displacements
-        # u_ddot = (u_curr - 2*u_prev + u_prev_prev) / dt^2
-        if self.dt == 0:
-            inertial_term = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
+        # External work term: F_ext · u
+        work_external_term = torch.dot(F_ext_for_opt, u_curr_nn_flat_th)
+
+        # --- NEW: RAYLEIGH DAMPING TERMS ---
+        # Mass-proportional damping: α_M * M * v
+        if hasattr(self, 'rayleigh_mass') and self.rayleigh_mass > 0:
+            mass_damping_force = self.rayleigh_mass * torch.matmul(self.M_torch, u_dot_nn_flat_th)
+            mass_damping_term = torch.dot(u_dot_nn_flat_th, mass_damping_force)
         else:
-            u_ddot_fd_th = (u_curr_nn_flat_th - 2 * u_nn_prev_flat_th + u_nn_prev_prev_flat_th)
-            inertial_force_th = torch.sparse.mm(self.M_torch, u_ddot_fd_th.unsqueeze(1)).squeeze(1)
-            inertial_term = torch.dot(u_ddot_fd_th, inertial_force_th) / (2 * self.dt**2)
+            mass_damping_term = torch.tensor(0.0, device=z_th_opt.device, dtype=z_th_opt.dtype)
 
-        # 4. Calculate Elastic Strain Energy: E_elastic(u_nn(z))
-        # energy_calculator expects displacement in shape (batch_size, num_nodes, 3) or (num_nodes, 3)
-        # u_curr_nn_flat_th is (num_dofs,). Reshape it.
-        num_nodes = self.MO1.rest_position.value.shape[0] # Or from self.routine.num_nodes
-        try:
-            u_curr_nn_reshaped_th = u_curr_nn_flat_th.view(1, num_nodes, 3) # Add batch dim
-            elastic_energy = self.routine.energy_calculator(u_curr_nn_reshaped_th).squeeze()
-        except Exception as e:
-            print(f"Error in energy_calculator with u_curr_nn: {e}")
-            elastic_energy = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
-
-
-        # 5. Calculate External Force Work Term: - F_ext_dof · u_curr_nn
-        # F_ext_dof_th is (num_dofs,), u_curr_nn_flat_th is (num_dofs,)
-        work_external_term = -torch.dot(F_ext_dof_th, u_curr_nn_flat_th)
-
-        # 6. Damping Term (Placeholder - can be mass-proportional, stiffness-proportional, etc.)
-        # Example: Mass-proportional damping: 0.5 * alpha_damping * v_curr^T * M * v_curr
-        # v_curr = (u_curr - u_prev) / dt
-        damping_term = torch.tensor(0.0, device=self.routine.device, dtype=torch.float64)
-        # if self.dt > 0:
-        #     alpha_damping = 0.01 # Example damping coefficient
-        #     v_curr_nn_flat_th = (u_curr_nn_flat_th - u_nn_prev_flat_th) / self.dt
-        #     damping_force_th = torch.sparse.mm(self.M_torch, v_curr_nn_flat_th.unsqueeze(1)).squeeze(1)
-        #     damping_term = 0.5 * alpha_damping * torch.dot(v_curr_nn_flat_th, damping_force_th)
-
-
-        # 7. Total Objective
-        total_objective = 0.8 * inertial_term + elastic_energy + work_external_term #+ damping_term
+        # Stiffness-proportional damping: α_K * K * v
+        if hasattr(self, 'rayleigh_stiffness') and self.rayleigh_stiffness > 0:
+            # Approximate K*v using energy calculator gradients
+            stiffness_damping_term = self.compute_stiffness_damping(u_curr_nn_flat_th, u_dot_nn_flat_th)
+        else:
+            stiffness_damping_term = torch.tensor(0.0, device=z_th_opt.device, dtype=z_th_opt.dtype)
         
-        print(f"  Objective: {total_objective.item():.4e} (Inertial: {inertial_term.item():.3e}, Elastic: {elastic_energy.item():.3e}, Work: {work_external_term.item():.3e}, Damping: {damping_term.item():.3e})")
-        return total_objective
-    # --- End Objective Function ---
+        volume_penalty_term = self.compute_volume_penalty(u_curr_nn_flat_th)
+
+        # --- COMBINED OBJECTIVE ---
+        objective = inertial_term + elastic_term - work_external_term - mass_damping_term - stiffness_damping_term + volume_penalty_term * 1e2
+
+        #debug printing
+        print(
+            f"Objective Function at step: {self.timestep_counter}\n"
+            f"  Inertial:         {inertial_term.item():.3e}\n"
+            f"  Elastic:          {elastic_term.item():.3e}\n"
+            f"  External Work:    {work_external_term.item():.3e}\n"
+            f"  Mass Damping:     {mass_damping_term.item():.3e}\n"
+            f"  Stiffness Damping:{stiffness_damping_term.item():.3e}\n"
+            f"  Volume Penalty:   {volume_penalty_term.item():.3e}\n"
+            f"  Total Objective:  {objective.item():.3e}"
+        )
+
+        # Optional: Print damping contributions for debugging
+        if hasattr(self, 'debug_damping') and self.debug_damping:
+            print(f"  Damping - Mass: {mass_damping_term.item():.3e}, Stiffness: {stiffness_damping_term.item():.3e}")
+
+        return objective
+
+    def compute_stiffness_damping(self, u_curr, u_dot):
+        """
+        Compute stiffness-proportional damping term: α_K * v^T * K * v
+        where K*v is approximated using the gradient of elastic energy.
+        """
+        # Enable gradients for u_curr to compute K*v = ∂E/∂u
+        u_curr_grad = u_curr.clone().detach().requires_grad_(True)
+        
+        # Compute elastic energy
+        energy = self.routine.energy_calculator(u_curr_grad.unsqueeze(0)).squeeze()
+        
+        # Compute gradient: ∂E/∂u ≈ K*u (internal forces)
+        grad_energy = torch.autograd.grad(energy, u_curr_grad, create_graph=True)[0]
+        
+        # Stiffness damping force: α_K * K * v ≈ α_K * (∂E/∂u) * (v/u) * u = α_K * grad_energy * (v/u)
+        # Simplified: α_K * v^T * K * v ≈ α_K * v^T * grad_energy * (||v||/||u||)
+        
+        # More direct approach: assume K*v ≈ K*u * (v/u)
+        velocity_magnitude = torch.norm(u_dot)
+        displacement_magnitude = torch.norm(u_curr)
+        
+        if displacement_magnitude > 1e-12:
+            # Scale the force by velocity/displacement ratio
+            velocity_ratio = velocity_magnitude / displacement_magnitude
+            stiffness_damping_force = self.rayleigh_stiffness * grad_energy * velocity_ratio
+            stiffness_damping_term = torch.dot(u_dot, stiffness_damping_force)
+        else:
+            stiffness_damping_term = torch.tensor(0.0, device=u_curr.device, dtype=u_curr.dtype)
+        
+        return stiffness_damping_term
+    
+    def compute_volume_penalty(self, u_curr_flat):
+        """
+        Compute penalty for volume changes exceeding 5% of original volume.
+        """
+        try:
+            # Ensure correct shape for the energy calculator
+            num_nodes = self.routine.energy_calculator.num_nodes
+            if u_curr_flat.dim() == 2 and u_curr_flat.shape[0] == 1 and u_curr_flat.shape[1] == num_nodes * 3:
+                # Input is [1, num_nodes*3], reshape to [num_nodes, 3]
+                displacement = u_curr_flat.view(num_nodes, 3)
+            elif u_curr_flat.dim() == 1 and u_curr_flat.shape[0] == num_nodes * 3:
+                # Input is [num_nodes*3], reshape to [num_nodes, 3]
+                displacement = u_curr_flat.view(num_nodes, 3)
+            elif u_curr_flat.dim() == 2 and u_curr_flat.shape[0] == num_nodes and u_curr_flat.shape[1] == 3:
+                # Input is already [num_nodes, 3]
+                displacement = u_curr_flat
+            else:
+                raise ValueError(f"Invalid displacement shape: {u_curr_flat.shape}")
+
+            # Use the existing _compute_deformed_volume method
+            current_volume = self.routine.energy_calculator._compute_deformed_volume(displacement)
+
+            # Get reference volume (computed once and cached)
+            if not hasattr(self, 'reference_volume'):
+                self.reference_volume = self.routine.energy_calculator._compute_mesh_volume()
+                print(f"Reference volume computed: {self.reference_volume.item():.6f}")
+
+            # Compute volume change ratio
+            volume_ratio = current_volume / self.reference_volume
+
+            # Define penalty parameters
+            volume_tolerance = getattr(self, 'volume_tolerance', 0.05)  # 5% tolerance
+            penalty_weight = getattr(self, 'volume_penalty_weight', 1e6)
+
+            # Penalty function: quadratic penalty for exceeding tolerance
+            if volume_ratio > (1.0 + volume_tolerance):
+                # Volume increased by more than 5%
+                excess = volume_ratio - (1.0 + volume_tolerance)
+                volume_penalty = penalty_weight * excess**2
+                print(f"  Volume penalty (expansion): {volume_penalty.item():.3e} (ratio: {volume_ratio:.3f})")
+            elif volume_ratio < (1.0 - volume_tolerance):
+                # Volume decreased by more than 5%
+                deficit = (1.0 - volume_tolerance) - volume_ratio
+                volume_penalty = penalty_weight * deficit**2
+                print(f"  Volume penalty (compression): {volume_penalty.item():.3e} (ratio: {volume_ratio:.3f})")
+            else:
+                # Volume change within acceptable range
+                volume_penalty = torch.tensor(0.0, device=u_curr_flat.device, dtype=u_curr_flat.dtype)
+
+            return volume_penalty
+
+        except Exception as e:
+            print(f"Error computing volume penalty: {e}")
+            # Print debug info
+            print(f"  Input shape: {u_curr_flat.shape}")
+            if hasattr(self.routine, 'energy_calculator'):
+                print(f"  Energy calc num_nodes: {getattr(self.routine.energy_calculator, 'num_nodes', 'unknown')}")
+                print(f"  Energy calc dim: {getattr(self.routine.energy_calculator, 'dim', 'unknown')}")
+
+            return torch.tensor(0.0, device=u_curr_flat.device, dtype=u_curr_flat.dtype)
+        
+
 
     def objective_function_linear_modes(self, z_lm_th_opt, u_lm_prev_flat_th, u_lm_prev_prev_flat_th, F_ext_dof_th):
         """
@@ -788,6 +885,8 @@ class AnimationStepController(Sofa.Core.Controller):
             Modal coordinates as a 1D numpy array (shape (num_modes,)).
         """
         # Ensure displacement is a flattened 1D NumPy array
+        if torch.is_tensor(displacement):
+            displacement = displacement.cpu().numpy()
         if displacement.ndim > 1:
             displacement_flat = displacement.flatten()
         else:
@@ -1034,7 +1133,7 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
         }
     
     # Set basic simulation parameters
-    rootNode.dt = config['physics'].get('dt', 0.01)
+    rootNode.dt = config['physics'].get('dt', 0.001)
     rootNode.gravity = [0, 0, 0]
     rootNode.name = 'root'
     rootNode.bbox = "-10 -2 -2 10 2 2"
@@ -1219,15 +1318,30 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
 
     # Create and add controller with all components
     controller_kwargs = {
-        'exactSolution': exactSolution, 'fem': fem, 'linear_solver': linear_solver,
-        'surface_topo': surface_topo, 'MO1': MO1, 'fixed_box': fixed_box,
-        'linearSolution': linearSolution, 'MO2': MO2, 'linearFEM': linearFEM,
-        'MO_LinearModes': MO_LinearModes, 'MO_NeuralPred': MO_NeuralPred,
-    #    'visual_LM': visual_LM, 'visual_NP': visual_NP, # Corrected visual names
-        'directory': directory, 'sample': sample, 'key': key,
-        'young_modulus': young_modulus, 'poisson_ratio': poisson_ratio,
-        'density': density, 'volume': volume, 'total_mass': total_mass,
-        'mesh_filename': mesh_filename, 'num_modes_to_show': num_modes_to_show,
+        'exactSolution': exactSolution, 
+        'fem': fem, 'linear_solver': linear_solver,
+        'surface_topo': surface_topo, 
+        'MO1': MO1, 
+        'fixed_box': fixed_box,
+        'linearSolution': linearSolution, 
+        'MO2': MO2, 
+        'linearFEM': linearFEM,
+        'MO_LinearModes': MO_LinearModes, 
+        'MO_NeuralPred': MO_NeuralPred,
+        'visual_LM': visual_LM, 
+        'visual_NP': visual_NP, # Corrected visual names
+        'directory': directory, ''
+        'sample': sample, 'key': key,
+        'young_modulus': young_modulus, 
+        'poisson_ratio': poisson_ratio,
+        'density': density, 
+        'volume': volume, ''
+        'total_mass': total_mass,
+        'mesh_filename': mesh_filename, 
+        'num_modes_to_show': num_modes_to_show,
+        'rayleighStiffness': rayleighStiffness,
+        'rayleighMass': rayleighMass,
+        'mu': mu, 'lam': lam, # Added Lamé parameters
         # Pass through kwargs from createScene call, which might include num_substeps, max_main_steps, max_z_amplitude_scale
     }
     controller_kwargs.update(kwargs) # Add kwargs passed to createScene

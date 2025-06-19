@@ -7,15 +7,15 @@ mesh:
 material:
   youngs_modulus: 100000 # was 1000000
   poissons_ratio: 0.45 # was 0.4
-  density: 1000
+  density: 1
   volume: 10.0
 
 # Physics simulation parameters
 physics:
   gravity: [0, 0, 0]  # Format as array for proper SOFA integration
   dt: 0.01
-  rayleigh_stiffness: 0.1
-  rayleigh_mass: 0.1
+  rayleigh_stiffness: 0.7
+  rayleigh_mass: 0.7
   solver_iterations: 1000
   solver_tolerance: 1e-6
   solver_threshold: 1e-6

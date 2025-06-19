@@ -709,7 +709,7 @@ class Routine:
 
         if use_different_scales:
             # Custom scales for each mode - EDIT THESE VALUES as needed
-            custom_scales = [250.0, 250.0, 20.0, 20.0, 150.0, 80.0, 10.0, 10.0]  # Example scales
+            custom_scales = [225, 170, 20.0, 15.0, 5.0, 80.0, 170.0, 5.0]  # Example scales
             
             # Ensure we have enough scales for all modes
             if len(custom_scales) < self.latent_dim:
