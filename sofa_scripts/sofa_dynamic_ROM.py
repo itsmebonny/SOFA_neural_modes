@@ -1231,8 +1231,23 @@ def createScene(rootNode, config=None, directory=None, sample=0, key=(0, 0, 0), 
                                         drawBoxes=True)
 
     
-    #NOTES: plot some relative errors between linear modes and fem divided by the norm of biggest displacement
-    # 
+    modalSolution = rootNode.addChild('modalSolution', activated=True)
+    ModalCoords = modalSolution.addObject('MechanicalObject', name='ModalCoords', template='Vec1d', position='0 0 0 0 0 0', rest_position='0 0 0 0 0 0' )  
+
+    # Add system components (similar to exactSolution)
+    modalSolution.addObject('StaticSolver', name="ODEsolver",
+                           newton_iterations=2,
+                           #absolute_residual_tolerance_threshold=1e-5,
+                           #relative_residual_tolerance_threshold=1e-5,
+                           printLog=True) # Maybe less logging for this one
+
+    modalSolution.addObject('CGLinearSolver',
+                           iterations=config['physics'].get('solver_iterations', 100),
+                           tolerance=config['physics'].get('solver_tolerance', 1e-7),
+                           threshold=config['physics'].get('solver_threshold', 1e-7),
+                           warmStart=True)
+    
+    mass = modalSolution.addObject('UniformMass', vertexMass="1", name="DiagonalMass")
     
     # Add visual model
     visual = exactSolution.addChild("visual")
