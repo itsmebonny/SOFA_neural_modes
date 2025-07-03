@@ -7,7 +7,7 @@ mesh:
 material:
   youngs_modulus: 100000 # was 1000000
   poissons_ratio: 0.45 # was 0.4
-  density: 1
+  density: 1000
   volume: 10.0
 
 # Physics simulation parameters

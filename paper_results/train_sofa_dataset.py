@@ -1691,9 +1691,8 @@ class Routine:
         for item in grids_to_plot:
             plotter.subplot(item['row'], item['col'])
             # Use show_edges=False for potentially cleaner visualization
-            plotter.add_mesh(item['grid'], scalars="displacement_magnitude", cmap="viridis", show_edges=False, clim=color_range, reset_camera=False, show_scalar_bar=False)
-            # Add value label
-            plotter.add_text(f"z{item['mode_idx']}={item['val']:.2e}", position="lower_right", font_size=8, color='black')
+            plotter.add_mesh(item['grid'], scalars="displacement_magnitude", cmap="magma_r", show_edges=False, clim=color_range, reset_camera=False, show_scalar_bar=False,)     # Add value label
+            plotter.add_text(f"z{item['mode_idx']}={item['val']:.2f}", position="lower_right", font_size=12, color='black')
             plotter.view_isometric() # Set consistent view
 
         # Add row labels for modes

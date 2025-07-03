@@ -144,7 +144,7 @@ class AnimationStepController(Sofa.Core.Controller):
         checkpoint_dir_abs = os.path.join(project_root, checkpoint_dir_rel) # Join with project root
 
         # Define the specific checkpoint file name (e.g., 'best_sofa.pt')
-        checkpoint_filename = 'best_sofa_dataset.pt' # Or read from config if specified differently
+        checkpoint_filename = 'best_sofa.pt' # Or read from config if specified differently
         best_checkpoint_path = os.path.join(checkpoint_dir_abs, checkpoint_filename)
 
         print(f"Attempting to load best checkpoint from: {best_checkpoint_path}")
@@ -207,7 +207,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print(f"\n--- Starting Main Step {self.current_main_step + 1} ---")
 
             # --- Generate a new random direction for this main step ---
-            random_vec = [0, -1, 0] # Generate random vector from normal distribution
+            random_vec = np.random.randn(3)  # Generate a random vector in 3D
             norm = np.linalg.norm(random_vec)
             if norm < 1e-9: # Avoid division by zero if vector is near zero
                 self.current_main_step_direction = np.array([1.0, 0.0, 0.0]) # Default direction
@@ -638,10 +638,13 @@ class AnimationStepController(Sofa.Core.Controller):
             # ... (Existing Energy, RMSE, MSE plots remain the same) ...
             # 1. Average Energy vs. Force Magnitude Plot (Linear Scale)
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
             plt.plot(force_mags_plot, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
             plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
-            plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            # Changed label here
+            plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg Linear FEM Energy', marker='d', linestyle='-.')
+            # Changed label here
+            plt.plot(force_mags_plot, avg_real_e, label='Avg Nonlinear FEM Energy', marker='o', linestyle='-')
+
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy')
             plt.title('Average Energy vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force.png")); plt.close()
@@ -650,31 +653,36 @@ class AnimationStepController(Sofa.Core.Controller):
             plt.figure(figsize=(10, 6))
             valid_indices_real = avg_real_e > 0; valid_indices_pred = avg_pred_e > 0
             valid_indices_linear_modes = avg_linear_modes_e > 0; valid_indices_sofa_linear = avg_sofa_linear_e > 0
-            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
+
             if np.any(valid_indices_pred): plt.plot(force_mags_plot[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy', marker='x', linestyle='--')
             if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
-            if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            # Changed label here
+            if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg Linear FEM Energy', marker='d', linestyle='-.')
+            # Changed label here
+            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Nonlinear FEM Energy', marker='o')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy (log scale)')
             plt.title('Average Energy vs. Applied Force Magnitude (Log Scale)'); plt.yscale('log')
             plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_log.png")); plt.close()
 
+
             # 2. RMSE Errors vs Force Magnitude
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^')
-            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: SOFALin (MO2) vs Real (MO1)', marker='<', linestyle=':')
+            plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: NN vs Nonlinear FEM', marker='^')
+            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: Linear Modes vs Nonlinear FEM', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: SOFA Linear FEM vs Nonlinear FEM', marker='<', linestyle=':')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average RMSE')
             plt.title('Average RMSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png")); plt.close()
 
             # 3. MSE Errors vs Force Magnitude
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE: Pred (l+y) vs Real (MO1)', marker='^')
-            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: SOFALin (MO2) vs Real (MO1)', marker='<', linestyle=':')
+            plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE:  NN  vs Nonlinear FEM', marker='^')
+            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: Linear Modes vs Nonlinear FEM', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: SOFA Linear FEM vs Nonlinear FEM', marker='<', linestyle=':')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average MSE')
             plt.title('Average MSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+
             plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force.png")); plt.close()
 
             # --- New Plot for Deformation Gradient Differences ---

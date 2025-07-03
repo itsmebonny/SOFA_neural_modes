@@ -19,7 +19,7 @@ physics:
   solver_iterations: 1000
   solver_tolerance: 1e-4
   solver_threshold: 1e-4
-  num_substeps: 25 # Added for substep logic
+  num_substeps: 20 # Added for substep logic
 
 simulation:
   steps: 1 # Default number of main steps

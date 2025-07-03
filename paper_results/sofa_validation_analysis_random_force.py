@@ -592,12 +592,7 @@ class AnimationStepController(Sofa.Core.Controller):
             import pandas as pd
             df = pd.DataFrame(self.substep_results, columns=result_columns)
 
-            # Add new columns for gradient differences
-            # Ensure lengths match, especially if simulation ended early or with errors
-            num_entries_df = len(df)
-            df['GradDiff_LM'] = pd.Series(self.grad_diff_lin_modes_list[:num_entries_df])
-            df['GradDiff_NN'] = pd.Series(self.grad_diff_nn_pred_list[:num_entries_df])
-            df['GradDiff_SL'] = pd.Series(self.grad_diff_sofa_linear_list[:num_entries_df])
+
             
             avg_results = df.groupby('ForceMag').mean().reset_index()
             avg_results = avg_results.sort_values(by='ForceMag')
@@ -606,8 +601,7 @@ class AnimationStepController(Sofa.Core.Controller):
             cols_to_print = ['ForceMag', 'RealE', 'PredE', 'LinearModesE', 'SOFALinearE',
                              'RMSE_Pred_Real', 'MSE_Pred_Real',
                              'RMSE_Lin_Real', 'MSE_Lin_Real',
-                             'RMSE_SOFALin_Real', 'MSE_SOFALin_Real',
-                             'GradDiff_LM', 'GradDiff_NN', 'GradDiff_SL'] # Added new cols
+                             'RMSE_SOFALin_Real', 'MSE_SOFALin_Real'] # Added new cols
             
             # Filter out columns that might not exist if all values were NaN (though groupby().mean() should handle NaNs)
             cols_to_print_existing = [col for col in cols_to_print if col in avg_results.columns]
@@ -626,10 +620,7 @@ class AnimationStepController(Sofa.Core.Controller):
             avg_rmse_lin_sofa = avg_results['RMSE_SOFALin_Real'].values
             avg_mse_lin_sofa = avg_results['MSE_SOFALin_Real'].values
             
-            # Extract new averaged gradient differences
-            avg_grad_diff_lm = avg_results['GradDiff_LM'].values if 'GradDiff_LM' in avg_results else np.full_like(force_mags_plot, float('nan'))
-            avg_grad_diff_nn = avg_results['GradDiff_NN'].values if 'GradDiff_NN' in avg_results else np.full_like(force_mags_plot, float('nan'))
-            avg_grad_diff_sl = avg_results['GradDiff_SL'].values if 'GradDiff_SL' in avg_results else np.full_like(force_mags_plot, float('nan'))
+
 
             plot_dir = self.output_subdir if self.save else "."
             if self.save and not os.path.exists(plot_dir):
@@ -638,10 +629,13 @@ class AnimationStepController(Sofa.Core.Controller):
             # ... (Existing Energy, RMSE, MSE plots remain the same) ...
             # 1. Average Energy vs. Force Magnitude Plot (Linear Scale)
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
             plt.plot(force_mags_plot, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
             plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
-            plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            # Changed label here
+            plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg Linear FEM Energy', marker='d', linestyle='-.')
+            # Changed label here
+            plt.plot(force_mags_plot, avg_real_e, label='Avg Nonlinear FEM Energy', marker='o', linestyle='-')
+
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy')
             plt.title('Average Energy vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force.png")); plt.close()
@@ -650,53 +644,39 @@ class AnimationStepController(Sofa.Core.Controller):
             plt.figure(figsize=(10, 6))
             valid_indices_real = avg_real_e > 0; valid_indices_pred = avg_pred_e > 0
             valid_indices_linear_modes = avg_linear_modes_e > 0; valid_indices_sofa_linear = avg_sofa_linear_e > 0
-            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
+
             if np.any(valid_indices_pred): plt.plot(force_mags_plot[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy', marker='x', linestyle='--')
             if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
-            if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            # Changed label here
+            if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg Linear FEM Energy', marker='d', linestyle='-.')
+            # Changed label here
+            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Nonlinear FEM Energy', marker='o')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average Internal Energy (log scale)')
             plt.title('Average Energy vs. Applied Force Magnitude (Log Scale)'); plt.yscale('log')
             plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_energy_vs_force_log.png")); plt.close()
 
+
             # 2. RMSE Errors vs Force Magnitude
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: Pred (l+y) vs Real (MO1)', marker='^')
-            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: SOFALin (MO2) vs Real (MO1)', marker='<', linestyle=':')
+            plt.plot(force_mags_plot, avg_rmse_pred_real, label='RMSE: NN vs Nonlinear FEM', marker='^')
+            plt.plot(force_mags_plot, avg_rmse_lin_real, label='RMSE: Linear Modes vs Nonlinear FEM', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_rmse_lin_sofa, label='RMSE: SOFA Linear FEM vs Nonlinear FEM', marker='<', linestyle=':')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average RMSE')
             plt.title('Average RMSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "avg_rmse_vs_force.png")); plt.close()
 
             # 3. MSE Errors vs Force Magnitude
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE: Pred (l+y) vs Real (MO1)', marker='^')
-            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: LinModes (l) vs Real (MO1)', marker='v', linestyle='--')
-            plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: SOFALin (MO2) vs Real (MO1)', marker='<', linestyle=':')
+            plt.plot(force_mags_plot, avg_mse_pred_real, label='MSE:  NN  vs Nonlinear FEM', marker='^')
+            plt.plot(force_mags_plot, avg_mse_lin_real, label='MSE: Linear Modes vs Nonlinear FEM', marker='v', linestyle='--')
+            plt.plot(force_mags_plot, avg_mse_lin_sofa, label='MSE: SOFA Linear FEM vs Nonlinear FEM', marker='<', linestyle=':')
             plt.xlabel('Applied Force Magnitude'); plt.ylabel('Average MSE')
             plt.title('Average MSE vs. Applied Force Magnitude'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
+
             plt.savefig(os.path.join(plot_dir, "avg_mse_vs_force.png")); plt.close()
 
-            # --- New Plot for Deformation Gradient Differences ---
-            plt.figure(figsize=(12, 7))
-            if not np.all(np.isnan(avg_grad_diff_lm)): # Check if there's any valid data to plot
-                 plt.plot(force_mags_plot, avg_grad_diff_lm, label='Avg ||F_real - F_LMpred||', marker='o', linestyle='-')
-            if not np.all(np.isnan(avg_grad_diff_nn)):
-                 plt.plot(force_mags_plot, avg_grad_diff_nn, label='Avg ||F_real - F_NNpred||', marker='x', linestyle='--')
-            if not np.all(np.isnan(avg_grad_diff_sl)):
-                 plt.plot(force_mags_plot, avg_grad_diff_sl, label='Avg ||F_real - F_SOFALinear||', marker='s', linestyle=':')
-            
-            plt.xlabel('Applied Force Magnitude (N)')
-            plt.ylabel('Avg. Frobenius Norm Diff. of Def. Gradients')
-            plt.title('Average Deformation Gradient Difference vs. Applied Force')
-            plt.legend()
-            plt.grid(True, which="both", ls="--")
-            plt.yscale('log') # Log scale often useful for error metrics
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, "avg_grad_diff_vs_force_magnitude.png"))
-            plt.close()
-            print(f"Deformation gradient difference plot saved to {os.path.join(plot_dir, 'avg_grad_diff_vs_force_magnitude.png')}")
-            # --- End New Plot ---
+
 
             print(f"All plots saved to {plot_dir}")
 
@@ -707,6 +687,7 @@ class AnimationStepController(Sofa.Core.Controller):
             traceback.print_exc()
         finally:
             print("Closing simulation")
+
 
 
 
@@ -948,7 +929,7 @@ if __name__ == "__main__":
     import time
 
     parser = argparse.ArgumentParser(description='SOFA Validation with Modal Forces')
-    parser.add_argument('--config', type=str, default='configs/default.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/paper.yaml', help='Path to config file')
     parser.add_argument('--gui', action='store_true', help='Enable GUI mode')
     parser.add_argument('--steps', type=int, default=None, help='Number of MAIN steps to run (overrides config)')
     parser.add_argument('--num-substeps', type=int, default=None, help='Number of substeps per main step (overrides config)')

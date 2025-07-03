@@ -87,7 +87,7 @@ class AnimationStepController(Sofa.Core.Controller):
         self.max_main_steps = kwargs.get('max_main_steps', 20)
 
         # --- Define Fixed Force Target Magnitude ---
-        self.target_force_magnitude = 500
+        self.target_force_magnitude = 10000
         self.current_main_step_direction = np.zeros(3) # Initialize direction
         self.last_applied_force_magnitude = 0.0 # Initialize the attribute here
         self.current_main_step_direction = np.zeros(3) # Initialize direction
@@ -243,7 +243,7 @@ class AnimationStepController(Sofa.Core.Controller):
         # Initialize F_ext_dof_th to a zero tensor
         self.F_ext_dof_th = torch.zeros(num_dofs, dtype=torch.float64, device=self.routine.device)
         print(f"Initialized F_ext_dof_th with shape {self.F_ext_dof_th.shape}")
-        self.optimization_start_step_in_period = 100
+        self.optimization_start_step_in_period = 60
 
         
         # Store the original positions for mode animation
@@ -349,7 +349,7 @@ class AnimationStepController(Sofa.Core.Controller):
         # --- Create and add new CFFs with the current period's force vector ---
         # This force vector remains constant for `self.force_change_interval` timesteps.
         try:
-            if self.timestep_counter < self.optimization_start_step_in_period -10:
+            if self.timestep_counter < self.optimization_start_step_in_period +500:
                 # Exact Solution
                 force_roi_exact = self.exactSolution.getObject('ForceROI')
                 if force_roi_exact is None: raise ValueError("ForceROI (Exact) not found in exactSolution node.")
@@ -700,7 +700,7 @@ class AnimationStepController(Sofa.Core.Controller):
         volume_penalty_term = self.compute_volume_penalty(u_curr_nn_flat_th)
 
         # --- COMBINED OBJECTIVE ---
-        objective = inertial_term + elastic_term - work_external_term - mass_damping_term - stiffness_damping_term + volume_penalty_term * 1e2
+        objective = inertial_term + elastic_term - work_external_term# - mass_damping_term - stiffness_damping_term #+ volume_penalty_term * 1e2
 
         #debug printing
         print(
@@ -1019,7 +1019,7 @@ class AnimationStepController(Sofa.Core.Controller):
             print("-------------------------------------------\n")
 
             # --- Data for plotting against timesteps ---
-            start_plot_index = 0#self.optimization_start_step_in_period
+            start_plot_index = self.optimization_start_step_in_period
             timesteps_plot = df.index.values[start_plot_index:] # Use DataFrame index for timesteps
 
             real_e_ts = df['RealE'].values[start_plot_index:]
@@ -1044,10 +1044,12 @@ class AnimationStepController(Sofa.Core.Controller):
 
             # 1. Energy vs. Timestep Plot (Linear Scale)
             plt.figure(figsize=(10, 6))
-            plt.plot(timesteps_plot, real_e_ts, label='Real Energy (SOFA Hyperelastic)', linestyle='-')
-            plt.plot(timesteps_plot, pred_e_ts, label='Predicted Energy (l+y)', linestyle='--')
+            # Updated labels
+            plt.plot(timesteps_plot, pred_e_ts, label='NN Predicted Energy (l+y)', linestyle='--')
             plt.plot(timesteps_plot, linear_modes_e_ts, label='Linear Modes Energy (l)', linestyle=':')
-            plt.plot(timesteps_plot, sofa_linear_e_ts, label='SOFA Linear Energy', linestyle='-.')
+            plt.plot(timesteps_plot, sofa_linear_e_ts, label='Linear FEM Energy', linestyle='-.')
+            plt.plot(timesteps_plot, real_e_ts, label='Nonlinear FEM Energy', linestyle='-')
+
             plt.xlabel('Timestep'); plt.ylabel('Internal Energy')
             plt.title('Energy vs. Timestep'); plt.legend(); plt.grid(True); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "energy_vs_timestep.png")); plt.close()
@@ -1056,10 +1058,12 @@ class AnimationStepController(Sofa.Core.Controller):
             plt.figure(figsize=(10, 6))
             valid_indices_real = real_e_ts > 0; valid_indices_pred = pred_e_ts > 0
             valid_indices_linear_modes = linear_modes_e_ts > 0; valid_indices_sofa_linear = sofa_linear_e_ts > 0
-            if np.any(valid_indices_real): plt.plot(timesteps_plot[valid_indices_real], real_e_ts[valid_indices_real], label='Real Energy', linestyle='-')
-            if np.any(valid_indices_pred): plt.plot(timesteps_plot[valid_indices_pred], pred_e_ts[valid_indices_pred], label='Predicted Energy', linestyle='--')
+            # Updated labels
+            
+            if np.any(valid_indices_pred): plt.plot(timesteps_plot[valid_indices_pred], pred_e_ts[valid_indices_pred], label='NN Predicted Energy', linestyle='--')
             if np.any(valid_indices_linear_modes): plt.plot(timesteps_plot[valid_indices_linear_modes], linear_modes_e_ts[valid_indices_linear_modes], label='Linear Modes Energy', linestyle=':')
-            if np.any(valid_indices_sofa_linear): plt.plot(timesteps_plot[valid_indices_sofa_linear], sofa_linear_e_ts[valid_indices_sofa_linear], label='SOFA Linear Energy', linestyle='-.')
+            if np.any(valid_indices_sofa_linear): plt.plot(timesteps_plot[valid_indices_sofa_linear], sofa_linear_e_ts[valid_indices_sofa_linear], label='Linear FEM Energy', linestyle='-.')
+            if np.any(valid_indices_real): plt.plot(timesteps_plot[valid_indices_real], real_e_ts[valid_indices_real], label='Nonlinear FEM Energy', linestyle='-')
             plt.xlabel('Timestep'); plt.ylabel('Internal Energy (log scale)')
             plt.title('Energy vs. Timestep (Log Scale)'); plt.yscale('log')
             plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
@@ -1067,18 +1071,20 @@ class AnimationStepController(Sofa.Core.Controller):
 
             # 2. RMSE Errors vs Timestep
             plt.figure(figsize=(10, 6))
-            plt.plot(timesteps_plot, rmse_pred_real_ts, label='RMSE: Pred (l+y) vs Real (MO1)')
-            plt.plot(timesteps_plot, rmse_lin_real_ts, label='RMSE: LinModes (l) vs Real (MO1)', linestyle='--')
-            plt.plot(timesteps_plot, rmse_sofa_lin_real_ts, label='RMSE: SOFALin (MO2) vs Real (MO1)', linestyle=':')
+            # Updated labels
+            plt.plot(timesteps_plot, rmse_pred_real_ts, label='RMSE: NN vs Nonlinear FEM')
+            plt.plot(timesteps_plot, rmse_lin_real_ts, label='RMSE: Linear Modes vs Nonlinear FEM', linestyle='--')
+            plt.plot(timesteps_plot, rmse_sofa_lin_real_ts, label='RMSE: SOFA Linear FEM vs Nonlinear FEM', linestyle=':')
             plt.xlabel('Timestep'); plt.ylabel('RMSE')
             plt.title('RMSE vs. Timestep'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "rmse_vs_timestep.png")); plt.close()
 
             # 3. MSE Errors vs Timestep
             plt.figure(figsize=(10, 6))
-            plt.plot(timesteps_plot, mse_pred_real_ts, label='MSE: Pred (l+y) vs Real (MO1)')
-            plt.plot(timesteps_plot, mse_lin_real_ts, label='MSE: LinModes (l) vs Real (MO1)', linestyle='--')
-            plt.plot(timesteps_plot, mse_sofa_lin_real_ts, label='MSE: SOFALin (MO2) vs Real (MO1)', linestyle=':')
+            # Updated labels
+            plt.plot(timesteps_plot, mse_pred_real_ts, label='MSE: NN vs Nonlinear FEM')
+            plt.plot(timesteps_plot, mse_lin_real_ts, label='MSE: Linear Modes vs Nonlinear FEM', linestyle='--')
+            plt.plot(timesteps_plot, mse_sofa_lin_real_ts, label='MSE: SOFA Linear FEM vs Nonlinear FEM', linestyle=':')
             plt.xlabel('Timestep'); plt.ylabel('MSE')
             plt.title('MSE vs. Timestep'); plt.legend(); plt.grid(True); plt.yscale('log'); plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "mse_vs_timestep.png")); plt.close()
@@ -1086,11 +1092,11 @@ class AnimationStepController(Sofa.Core.Controller):
             # --- Plot for Deformation Gradient Differences vs Timestep ---
             plt.figure(figsize=(12, 7))
             if not np.all(np.isnan(grad_diff_lm_ts)):
-                 plt.plot(timesteps_plot, grad_diff_lm_ts, label='||F_real - F_LMpred||', linestyle='-')
+                 plt.plot(timesteps_plot, grad_diff_lm_ts, label='||F_Nonlinear - F_LMpred||', linestyle='-') # Updated label
             if not np.all(np.isnan(grad_diff_nn_ts)):
-                 plt.plot(timesteps_plot, grad_diff_nn_ts, label='||F_real - F_NNpred||', linestyle='--')
+                 plt.plot(timesteps_plot, grad_diff_nn_ts, label='||F_Nonlinear - F_NNpred||', linestyle='--') # Updated label
             if not np.all(np.isnan(grad_diff_sl_ts)):
-                 plt.plot(timesteps_plot, grad_diff_sl_ts, label='||F_real - F_SOFALinear||', linestyle=':')
+                 plt.plot(timesteps_plot, grad_diff_sl_ts, label='||F_Nonlinear - F_SOFALinear||', linestyle=':') # Updated label
             
             plt.xlabel('Timestep')
             plt.ylabel('Frobenius Norm Diff. of Def. Gradients')
@@ -1105,6 +1111,7 @@ class AnimationStepController(Sofa.Core.Controller):
             # --- End Plot ---
 
             print(f"All plots saved to {plot_dir}")
+
 
         except ImportError:
             print("Warning: pandas not found. Cannot compute average results or plot.")

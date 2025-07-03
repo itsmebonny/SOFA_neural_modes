@@ -713,10 +713,11 @@ class AnimationStepController(Sofa.Core.Controller):
                 os.makedirs(plot_dir)
 
             plt.figure(figsize=(10, 6))
-            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
+
             plt.plot(force_mags_plot, avg_pred_e, label='Avg Predicted Energy (l+y)', marker='x', linestyle='--')
             plt.plot(force_mags_plot, avg_linear_modes_e, label='Avg Linear Modes Energy (l)', marker='s', linestyle=':')
             plt.plot(force_mags_plot, avg_sofa_linear_e, label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            plt.plot(force_mags_plot, avg_real_e, label='Avg Real Energy (SOFA Hyperelastic)', marker='o', linestyle='-')
             plt.xlabel('Applied Force Magnitude (N)')  # Updated X-axis label
             plt.ylabel('Average Internal Energy')
             plt.title('Average Energy vs. Applied Force Magnitude')
@@ -734,10 +735,11 @@ class AnimationStepController(Sofa.Core.Controller):
             # ... (log scale energy plot, ensure valid_indices use correct arrays) ...
             valid_indices_real = avg_real_e > 0; valid_indices_pred = avg_pred_e > 0
             valid_indices_linear_modes = avg_linear_modes_e > 0; valid_indices_sofa_linear = avg_sofa_linear_e > 0
-            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
             if np.any(valid_indices_pred): plt.plot(force_mags_plot[valid_indices_pred], avg_pred_e[valid_indices_pred], label='Avg Predicted Energy', marker='x', linestyle='--')
             if np.any(valid_indices_linear_modes): plt.plot(force_mags_plot[valid_indices_linear_modes], avg_linear_modes_e[valid_indices_linear_modes], label='Avg Linear Modes Energy', marker='s', linestyle=':')
             if np.any(valid_indices_sofa_linear): plt.plot(force_mags_plot[valid_indices_sofa_linear], avg_sofa_linear_e[valid_indices_sofa_linear], label='Avg SOFA Linear Energy', marker='d', linestyle='-.')
+            if np.any(valid_indices_real): plt.plot(force_mags_plot[valid_indices_real], avg_real_e[valid_indices_real], label='Avg Real Energy', marker='o')
+
             plt.xlabel('Applied Force Magnitude (N)'); plt.ylabel('Average Internal Energy (log scale)')
             plt.title('Average Energy vs. Applied Force Norm (Log Scale)'); plt.yscale('log')
             plt.legend(); plt.grid(True, which="both", ls="--"); plt.tight_layout()
